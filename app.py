@@ -12,7 +12,7 @@ warnings.filterwarnings("ignore")
 st.set_page_config(page_title="GM Terminal Final", layout="wide")
 
 st.title("🏛️ Grand Master: Multi-Axis Final")
-st.caption("Ver 8.9 | BTC 차트 가시성 대폭 개선 (선형 스케일 + 강조)")
+st.caption("Ver 9.1 | BTC Y축 동적 범위 적용 → 상단 잘림 영구 해결")
 
 @st.cache_data(ttl=3600)
 def fetch_data_final():
@@ -125,33 +125,41 @@ if not raw['btc'].empty and isinstance(raw['btc'].index, pd.DatetimeIndex):
     nd_v = safe_filter(nasdaq_s, start_viz_dt)
     dg_v = safe_filter(doge_s, start_viz_dt)
 
+    # === 동적 BTC Y축 범위 계산 ===
+    if not btc_v.empty:
+        btc_max = btc_v.max()
+        btc_min_dynamic = max(btc_max * 0.05, 20_000_000)  # 최소 2천만 원 보장
+        btc_max_dynamic = btc_max * 1.2  # 상단에 20% 여유
+    else:
+        btc_min_dynamic = 20_000_000
+        btc_max_dynamic = 200_000_000
+
     fig = go.Figure(
         layout=go.Layout(
             template="plotly_dark",
-            height=760,
+            height=780,
             xaxis=dict(domain=[0.0, 0.85], showgrid=False),
             
-            # 왼쪽: Liquidity YoY
             yaxis=dict(
                 title=dict(text="Liquidity YoY %", font=dict(color="#FFD700", size=14)),
                 tickfont=dict(color="#FFD700"),
-                range=[-35, 55],
+                range=[-40, 60],
                 side="left"
             ),
             
-            # 오른쪽 첫 번째: BTC (선형 스케일 + 강조)
+            # BTC 축: 동적으로 범위 설정
             yaxis2=dict(
                 title=dict(text="BTC Price (KRW)", font=dict(color="#00FFEE", size=15)),
                 tickfont=dict(color="#00FFEE"),
                 overlaying="y",
                 side="right",
-                position=0.85,          # 가장 안쪽에 배치 → 가장 선명하게 보임
-                type="linear",          # 로그 → 선형으로 변경 (상승 추세 명확)
-                range=[20000000, 150000000],  # 2천만 ~ 1.5억 원 정도로 고정 (2026년 기준 적절)
-                showgrid=False
+                position=0.85,
+                type="linear",
+                range=[btc_min_dynamic, btc_max_dynamic],  # ← 동적 적용!
+                showgrid=False,
+                tickformat="," 
             ),
             
-            # 오른쪽 두 번째: Nasdaq
             yaxis3=dict(
                 title=dict(text="Nasdaq", font=dict(color="#D62780")),
                 tickfont=dict(color="#D62780"),
@@ -161,7 +169,6 @@ if not raw['btc'].empty and isinstance(raw['btc'].index, pd.DatetimeIndex):
                 position=0.94
             ),
             
-            # 오른쪽 세 번째: DOGE (로그 유지)
             yaxis4=dict(
                 title=dict(text="DOGE (Log)", font=dict(color="orange")),
                 tickfont=dict(color="orange"),
@@ -172,40 +179,34 @@ if not raw['btc'].empty and isinstance(raw['btc'].index, pd.DatetimeIndex):
                 type="log"
             ),
             
-            legend=dict(orientation="h", y=1.12, x=0.01, bgcolor="rgba(0,0,0,0)"),
+            legend=dict(orientation="h", y=1.15, x=0.01, bgcolor="rgba(0,0,0,0)"),
             hovermode="x unified",
-            margin=dict(l=60, r=140, t=80, b=60)
+            margin=dict(l=60, r=160, t=100, b=60)
         )
     )
 
-    # Liquidity
     fig.add_trace(go.Scatter(x=liq_v.index, y=liq_v, name="Liquidity YoY %",
                              line=dict(color='#FFD700', width=3), fill='tozeroy',
                              fillcolor='rgba(255, 215, 0, 0.15)', yaxis='y'))
 
-    # BTC (-90d) - 가장 강조
     if not btc_v.empty:
         fig.add_trace(go.Scatter(x=btc_v.index, y=btc_v, name="BTC (-90d)",
-                                 line=dict(color='#00FFEE', width=4),  # 밝은 청록색 + 두껍게
-                                 yaxis='y2'))
+                                 line=dict(color='#00FFEE', width=4.5), yaxis='y2'))
 
-    # Mining Floor
     if not fl_v.empty:
         fig.add_trace(go.Scatter(x=fl_v.index, y=fl_v, name="Mining Cost Floor",
                                  line=dict(color='red', width=2, dash='dot'), yaxis='y2'))
 
-    # Nasdaq
     if not nd_v.empty:
         fig.add_trace(go.Scatter(x=nd_v.index, y=nd_v, name="Nasdaq (-90d)",
                                  line=dict(color='#D62780', width=2), yaxis='y3'))
 
-    # DOGE
     if not dg_v.empty:
         fig.add_trace(go.Scatter(x=dg_v.index, y=dg_v, name="DOGE (-90d)",
                                  line=dict(color='orange', width=2), yaxis='y4'))
 
     st.plotly_chart(fig, use_container_width=True)
-    st.success("✅ BTC 차트 가시성 대폭 개선 완료: 선형 스케일 + 강조 색상 + 전용 범위 적용")
+    st.success(f"✅ BTC Y축 동적 조정 완료: 현재 고점 약 ₩{btc_max:,.0f} 기준 상단 여유 20% 확보")
 
 else:
     st.error("❌ 주요 데이터 로드 실패. 네트워크 확인 후 재시도해주세요.")
