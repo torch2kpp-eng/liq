@@ -13,11 +13,11 @@ warnings.filterwarnings("ignore")
 st.set_page_config(page_title="GM Terminal Final", layout="wide")
 
 st.title("🏛️ Grand Master: Multi-Axis Final")
-st.caption("Ver 8.5 | Layout 구조 재설계 및 안정화 패치 완료")
+st.caption("Ver 8.6 | Plotly 문법 최적화 및 레이아웃 무결성 확보")
 
 # 2. 데이터 수집 (캐시 적용)
 @st.cache_data(ttl=3600)
-def fetch_data_ver85():
+def fetch_data_final():
     d = {}
     
     # [A] Upbit
@@ -62,7 +62,7 @@ def fetch_data_ver85():
     
     return d
 
-raw = fetch_data_ver85()
+raw = fetch_data_final()
 
 # 3. 데이터 가공
 if not raw['btc'].empty:
@@ -97,38 +97,34 @@ if not raw['btc'].empty:
     nasdaq_s = shift_90(raw['nasdaq'])
     doge_s = shift_90(raw['doge'])
 
-    # 4. [수정된 핵심] 안전한 Layout 생성 방식
+    # 4. 차트 생성 (안전한 문법 적용)
     st.subheader("📊 Grand Master Integrated Strategy Chart")
     
     start_viz = '2023-01-01'
     
-    # Trace 데이터 준비
     liq_v = df_liq[df_liq.index >= start_viz]
     btc_v = btc_s[btc_s.index >= start_viz]
     fl_v = floor_s[floor_s.index >= start_viz] if not floor_s.empty else pd.Series(dtype=float)
     nd_v = nasdaq_s[nasdaq_s.index >= start_viz] if not nasdaq_s.empty else pd.Series(dtype=float)
     dg_v = doge_s[doge_s.index >= start_viz] if not doge_s.empty else pd.Series(dtype=float)
 
-    # Figure 생성 (Layout을 명시적으로 주입)
+    # [수정 포인트] title과 font를 분리하지 않고 dict 안에 통합
     fig = go.Figure(
         layout=go.Layout(
             template="plotly_dark",
             height=700,
-            # [X축] 우측에 3개의 축이 들어갈 공간(15%) 확보
             xaxis=dict(domain=[0.0, 0.85], showgrid=False),
             
-            # [Y축 1: 유동성] 왼쪽
+            # Y축 1: 유동성
             yaxis=dict(
-                title="Liquidity YoY %",
-                titlefont=dict(color="#FFD700"),
+                title=dict(text="Liquidity YoY %", font=dict(color="#FFD700")),
                 tickfont=dict(color="#FFD700"),
                 range=[-20, 40]
             ),
             
-            # [Y축 2: BTC] 오른쪽 1번
+            # Y축 2: BTC (오른쪽 1)
             yaxis2=dict(
-                title="BTC (Log)",
-                titlefont=dict(color="white"),
+                title=dict(text="BTC (Log)", font=dict(color="white")),
                 tickfont=dict(color="white"),
                 anchor="x",
                 overlaying="y",
@@ -136,64 +132,56 @@ if not raw['btc'].empty:
                 type="log"
             ),
             
-            # [Y축 3: Nasdaq] 오른쪽 2번 (위치 지정)
+            # Y축 3: Nasdaq (오른쪽 2)
             yaxis3=dict(
-                title="Nasdaq",
-                titlefont=dict(color="#D62780"),
+                title=dict(text="Nasdaq", font=dict(color="#D62780")),
                 tickfont=dict(color="#D62780"),
                 anchor="free",
                 overlaying="y",
                 side="right",
-                position=0.92  # BTC 축보다 약간 오른쪽
+                position=0.92
             ),
             
-            # [Y축 4: DOGE] 오른쪽 3번 (가장 오른쪽)
+            # Y축 4: Doge (오른쪽 3)
             yaxis4=dict(
-                title="DOGE (Log)",
-                titlefont=dict(color="orange"),
+                title=dict(text="DOGE (Log)", font=dict(color="orange")),
                 tickfont=dict(color="orange"),
                 anchor="free",
                 overlaying="y",
                 side="right",
-                position=1.0,  # 가장 끝
+                position=1.0,
                 type="log"
             ),
             
             legend=dict(orientation="h", y=1.1, x=0),
             hovermode="x unified",
-            margin=dict(r=100) # 우측 여백 추가 확보
+            margin=dict(r=100)
         )
     )
 
-    # Trace 추가 (정의된 축에 매핑)
-    # 1. Liquidity -> y
+    # Trace 추가
     fig.add_trace(go.Scatter(x=liq_v.index, y=liq_v['YoY'], name="Liquidity YoY",
                              line=dict(color='#FFD700', width=2), fill='tozeroy', 
                              fillcolor='rgba(255, 215, 0, 0.1)', yaxis='y'))
 
-    # 2. BTC -> y2
     fig.add_trace(go.Scatter(x=btc_v.index, y=btc_v, name="BTC (-90d)",
                              line=dict(color='white', width=2.5), yaxis='y2'))
 
-    # 3. Cost Floor -> y2 (BTC와 공유)
     if not fl_v.empty:
         fig.add_trace(go.Scatter(x=fl_v.index, y=fl_v, name="Cost Floor",
                                  line=dict(color='red', width=1.5, dash='dot'), yaxis='y2'))
 
-    # 4. Nasdaq -> y3
     if not nd_v.empty:
         fig.add_trace(go.Scatter(x=nd_v.index, y=nd_v, name="Nasdaq (-90d)",
                                  line=dict(color='#D62780', width=1.5), yaxis='y3'))
 
-    # 5. Doge -> y4
     if not dg_v.empty:
         fig.add_trace(go.Scatter(x=dg_v.index, y=dg_v, name="DOGE (-90d)",
                                  line=dict(color='orange', width=1.5), yaxis='y4'))
 
     st.plotly_chart(fig, use_container_width=True)
 
-    # 하단 정보
-    st.success("데이터 로드 및 4중 축 차트 생성 완료")
+    st.success("시스템 정상 가동: 모든 차트 로딩 완료")
 
 else:
-    st.error("데이터 동기화 대기 중...")
+    st.error("데이터 동기화 실패. 잠시 후 다시 시도해주세요.")
