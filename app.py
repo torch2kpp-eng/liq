@@ -3,18 +3,18 @@ import pandas as pd
 import requests
 import warnings
 
-# 1. 설정
+# 1. 설정 (수정됨: layout="mobile" -> "wide")
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="GM Mobile", layout="mobile")
+# [수정 포인트] layout은 반드시 "wide" 또는 "centered"여야 합니다.
+st.set_page_config(page_title="GM Mobile", layout="wide") 
 
 # [중요] 버전 확인용 제목
-st.title("Ver 7.0 : Mobile Final") 
-st.caption("이 제목이 보여야 최신 버전입니다.")
+st.title("Ver 7.1 : Mobile Fix") 
+st.caption("이 화면이 보이면 성공입니다. 에러가 해결되었습니다.")
 
-# 2. 데이터 가져오기 (가장 단순한 구조)
+# 2. 데이터 가져오기 (바이낸스 - 가장 단순한 구조)
 @st.cache_data(ttl=300)
 def get_data():
-    # 바이낸스 비트코인
     try:
         url = "https://api.binance.com/api/v3/klines"
         params = {"symbol": "BTCUSDT", "interval": "1d", "limit": 1000}
@@ -28,10 +28,10 @@ def get_data():
 
 df = get_data()
 
-# 3. 차트 그리기 (Streamlit 내장 차트)
+# 3. 차트 그리기
 if df is not None and not df.empty:
     st.subheader("비트코인 가격 차트")
-    # 내장 라인 차트 (무조건 나옴)
+    # Streamlit 내장 차트 (무조건 그려짐)
     st.line_chart(df["Price"]) 
     
     # 현재가 표시
