@@ -1,129 +1,151 @@
 import streamlit as st
 import pandas as pd
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import requests
 import yfinance as yf
 import json
 import numpy as np
 import io
 import warnings
+from datetime import datetime
 
-# 1. 시스템 설정
+# 1. 환경 설정
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="GM Stable", layout="wide")
+st.set_page_config(page_title="Grand Master Terminal", layout="wide")
 
-st.title("Ver 8.1 : System Stabilized")
-st.caption("무한 로딩 방지 패치 적용됨 | 데이터 타임아웃 기능 활성화")
+st.title("🏛️ Grand Master: Multi-Asset Liquidity Terminal")
+st.caption("Ver 8.2 | G3 유동성 & 자산간 괴리 정밀 분석 모드")
 
-# 2. 데이터 수집 (안전장치 강화)
+# 2. 고성능 데이터 수집 엔진 (Timeout & Cache 최적화)
 @st.cache_data(ttl=3600)
-def get_data_safe():
-    data = {}
-    
-    # [A] Upbit (가장 빠름 - 우선 수집)
-    try:
-        url = "https://api.upbit.com/v1/candles/days?market=USDT-BTC&count=1000"
-        r = requests.get(url, timeout=3).json() # 3초 타임아웃
-        df = pd.DataFrame(r)
-        df['Date'] = pd.to_datetime(df['candle_date_time_utc'])
-        df['Price'] = df['trade_price'].astype(float)
-        data['btc'] = df.set_index('Date').sort_index()[['Price']]
-    except:
-        data['btc'] = None
-
-    # [B] FRED (유동성) - 무거운 작업이므로 타임아웃 필수
-    def fetch_fred(code):
+def fetch_all_data_final():
+    d = {}
+    # [A] Upbit 데이터 (BTC, DOGE)
+    def get_upbit(symbol):
         try:
-            url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={code}"
-            # requests로 먼저 받고 타임아웃 걸기
-            r = requests.get(url, timeout=2) 
-            if r.status_code == 200:
-                df = pd.read_csv(io.StringIO(r.text), index_col=0, parse_dates=True)
-                return df
-        except:
-            return None
-    
-    # 핵심 유동성 지표만 가져옵니다 (속도 최적화)
-    data['fed'] = fetch_fred('WALCL')   # 연준 자산
-    data['tga'] = fetch_fred('WTREGEN') # TGA 계좌
-    data['rrp'] = fetch_fred('RRPONTSYD') # 역레포
+            r = requests.get(f"https://api.upbit.com/v1/candles/days?market={symbol}&count=1000", timeout=3).json()
+            df = pd.DataFrame(r)
+            df['Date'] = pd.to_datetime(df['candle_date_time_utc']).dt.tz_localize(None)
+            return df.set_index('Date').sort_index()['trade_price'].astype(float)
+        except: return pd.Series(dtype=float)
+
+    d['btc'] = get_upbit("USDT-BTC")
+    d['doge'] = get_upbit("USDT-DOGE")
+
+    # [B] FRED 데이터 (유동성)
+    def get_fred(id):
+        try:
+            r = requests.get(f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={id}", timeout=3)
+            df = pd.read_csv(io.StringIO(r.text), index_col=0, parse_dates=True)
+            return df.resample('D').interpolate().tz_localize(None)
+        except: return pd.DataFrame()
+
+    d['fed'] = get_fred('WALCL')
+    d['tga'] = get_fred('WTREGEN')
+    d['rrp'] = get_fred('RRPONTSYD')
 
     # [C] Nasdaq (Yahoo)
     try:
-        # 최근 3년치만 가져와서 속도 향상
-        nd = yf.download("^IXIC", period="3y", progress=False)
-        if isinstance(nd.columns, pd.MultiIndex):
-            s = nd.xs('Close', axis=1, level=0)["^IXIC"]
-        else:
-            s = nd['Close']
-        s.index = s.index.tz_localize(None)
-        data['nasdaq'] = s
-    except:
-        data['nasdaq'] = None
+        ns = yf.download("^IXIC", period="3y", progress=False)
+        s = ns.xs('Close', axis=1, level=0)["^IXIC"] if isinstance(ns.columns, pd.MultiIndex) else ns['Close']
+        d['nasdaq'] = s.tz_localize(None)
+    except: d['nasdaq'] = pd.Series(dtype=float)
 
-    # [D] Doge (Upbit)
-    try:
-        url = "https://api.upbit.com/v1/candles/days?market=USDT-DOGE&count=1000"
-        r = requests.get(url, timeout=3).json()
-        df = pd.DataFrame(r)
-        df['Date'] = pd.to_datetime(df['candle_date_time_utc'])
-        df['Price'] = df['trade_price'].astype(float)
-        data['doge'] = df.set_index('Date').sort_index()[['Price']]
-    except:
-        data['doge'] = None
-
-    # [E] 난이도 파일
+    # [D] 난이도 (JSON)
     try:
         with open('difficulty (1).json', 'r') as f:
-            d_json = json.load(f)['difficulty']
-        df_d = pd.DataFrame(d_json)
-        df_d['Date'] = pd.to_datetime(df_d['x'], unit='ms')
-        data['diff'] = df_d.set_index('Date').sort_index()['y']
-    except:
-        data['diff'] = None
+            js = json.load(f)['difficulty']
+        df_js = pd.DataFrame(js)
+        df_js['Date'] = pd.to_datetime(df_js['x'], unit='ms').dt.tz_localize(None)
+        d['diff'] = df_js.set_index('Date').sort_index()['y']
+    except: d['diff'] = pd.Series(dtype=float)
 
-    return data
+    return d
 
-# 로딩 표시
-with st.spinner('데이터를 안전하게 가져오는 중... (최대 10초)'):
-    dfs = get_data_safe()
+with st.spinner('전 세계 금융 요새로부터 데이터를 동기화 중입니다...'):
+    raw = fetch_all_data_final()
 
-if dfs['btc'] is None:
-    st.error("비트코인 데이터 연결 실패. 잠시 후 다시 시도하세요.")
-    st.stop()
+# 3. 전략적 지표 계산 (선생님의 로직 완벽 반영)
+if not raw['btc'].empty:
+    # [유동성 계산]
+    df_liq = raw['fed'].resample('W-WED').last()
+    df_liq.columns = ['Fed']
+    if not raw['tga'].empty: df_liq = df_liq.join(raw['tga'].resample('W-WED').mean().rename(columns={raw['tga'].columns[0]:'TGA'}))
+    if not raw['rrp'].empty: df_liq = df_liq.join(raw['rrp'].resample('W-WED').mean().rename(columns={raw['rrp'].columns[0]:'RRP'}))
+    df_liq = df_liq.fillna(method='ffill')
+    df_liq['Net_Tril'] = (df_liq['Fed'] - df_liq.get('TGA', 0) - (df_liq.get('RRP', 0) * 1000)) / 1_000_000
+    df_liq['YoY'] = df_liq['Net_Tril'].pct_change(52) * 100
 
-# 3. 데이터 가공 (유동성 간소화)
-# G3를 전부 계산하면 터지므로, 'Fed Net Liquidity'를 메인으로 씁니다.
-df = dfs['fed'].resample('W-WED').last() if dfs['fed'] is not None else pd.DataFrame()
-df.columns = ['Fed']
+    # [채굴 원가 계산]
+    df_c = pd.DataFrame(index=raw['btc'].index)
+    if not raw['diff'].empty:
+        df_c['diff'] = raw['diff'].resample('D').interpolate()
+        df_c['reward'] = [3.125 if x >= pd.Timestamp('2024-04-20') else 6.25 for x in df_c.index]
+        df_c['cost_raw'] = df_c['diff'] / df_c['reward']
+        sub = pd.concat([raw['btc'], df_c['cost_raw']], axis=1).dropna()
+        target = sub[(sub.index >= '2022-11-01') & (sub.index <= '2023-01-31')]
+        k = (target.iloc[:,0] / target.iloc[:,1]).min() if not target.empty else 0.00000008
+        df_c['floor'] = df_c['cost_raw'] * k
 
-if dfs['tga'] is not None: 
-    tga = dfs['tga'].resample('W-WED').mean()
-    df = df.join(tga.rename(columns={tga.columns[0]: 'TGA'}))
-else: df['TGA'] = 0
+    # [90일 시프트 데이터 준비]
+    def shift_90(s):
+        if s is None or s.empty: return pd.Series(dtype=float)
+        new_s = s.copy()
+        new_s.index = new_s.index - pd.Timedelta(days=90)
+        return new_s
 
-if dfs['rrp'] is not None:
-    rrp = dfs['rrp'].resample('W-WED').mean()
-    df = df.join(rrp.rename(columns={rrp.columns[0]: 'RRP'}))
-else: df['RRP'] = 0
+    btc_s = shift_90(raw['btc'])
+    floor_s = shift_90(df_c['floor']) if 'floor' in df_c else pd.Series(dtype=float)
+    nasdaq_s = shift_90(raw['nasdaq'])
+    doge_s = shift_90(raw['doge'])
 
-df = df.fillna(method='ffill')
-
-# Fed Net Liquidity 계산
-try:
-    # 단위 조정 (백만 달러 -> 조 달러)
-    df['Net_Liq_Tril'] = (df['Fed'] - df['TGA'] - (df['RRP'] * 1000)) / 1_000_000
-    df['Liq_YoY'] = df['Net_Liq_Tril'].pct_change(52) * 100
-except:
-    df['Liq_YoY'] = 0
-
-# 원가 계산
-df_cost = pd.DataFrame(index=dfs['btc'].index)
-if dfs['diff'] is not None:
-    d_daily = dfs['diff'].resample('D').interpolate()
-    common_idx = df_cost.index.intersection(d_daily.index)
-    df_cost.loc[common_idx, 'Difficulty'] = d_daily.loc[common_idx]
+    # 4. 고해상도 멀티축 차트 (Plotly - 모바일 줌 지원)
+    st.subheader("📊 The Grand Master Integrated Chart")
     
-    def get_reward(d):
-        if d < pd.Timestamp('2024-04-20'): return 6.25
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    start_viz = '2023-01-01'
+
+    # [1] 유동성 YoY (왼쪽 축 - 노란색 영역)
+    liq_v = df_liq[df_liq.index >= start_viz]
+    fig.add_trace(go.Scatter(x=liq_v.index, y=liq_v['YoY'], name="Liquidity YoY", line=dict(color='rgba(255, 215, 0, 0.8)', width=2), fill='tozeroy', fillcolor='rgba(255, 215, 0, 0.1)'), secondary_y=False)
+
+    # [2] BTC 가격 (오른쪽 축 1 - 흰색)
+    btc_v = btc_s[btc_s.index >= start_viz]
+    fig.add_trace(go.Scatter(x=btc_v.index, y=btc_v, name="BTC (-90d)", line=dict(color='white', width=2.5)), secondary_y=True)
+
+    # [3] 채굴 원가 (오른쪽 축 1 - 빨간 점선)
+    if not floor_s.empty:
+        fl_v = floor_s[floor_s.index >= start_viz]
+        fig.add_trace(go.Scatter(x=fl_v.index, y=fl_v, name="Cost Floor (-90d)", line=dict(color='red', width=1.5, dash='dot')), secondary_y=True)
+
+    # [4] Nasdaq (오른쪽 축 2 - 분홍색)
+    if not nasdaq_s.empty:
+        nd_v = nasdaq_s[nasdaq_s.index >= start_viz]
+        fig.add_trace(go.Scatter(x=nd_v.index, y=nd_s, name="Nasdaq (-90d)", line=dict(color='#D62780', width=1.5), opacity=0.7), secondary_y=True)
+
+    # [5] Doge (오른쪽 축 2 - 주황색)
+    if not doge_s.empty:
+        dg_v = doge_s[doge_s.index >= start_viz]
+        fig.add_trace(go.Scatter(x=dg_v.index, y=dg_v, name="DOGE (-90d)", line=dict(color='orange', width=1.2), opacity=0.6), secondary_y=True)
+
+    # 스타일 및 레이아웃 설정
+    fig.update_layout(template="plotly_dark", height=700, margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h", y=1.1), hovermode="x unified")
+    fig.update_yaxes(title_text="Liquidity Growth %", secondary_y=False, range=[-20, 40])
+    fig.update_yaxes(title_text="Asset Price (Log)", type="log", secondary_y=True)
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    # 5. 실시간 진단 사이드바
+    st.sidebar.header("📋 Master Diagnosis")
+    cur_p = raw['btc'].iloc[-1]
+    st.sidebar.metric("BTC 현재가", f"${cur_p:,.0f}")
+    if 'floor' in df_c:
+        cur_f = df_c['floor'].iloc[-1]
+        gap = (cur_p/cur_f - 1)*100
+        st.sidebar.metric("채굴 원가", f"${cur_f:,.0f}", f"{gap:.2f}%")
+        if gap < 0: st.sidebar.error("🔥 진성 항복 구간 (강력 매수)")
+        else: st.sidebar.success("✅ 정상 궤도 진입")
+
+else:
+    st.error("데이터 동기화 실패. 다시 시도해 주세요.")
