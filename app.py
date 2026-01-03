@@ -1,80 +1,100 @@
 import streamlit as st
 import pandas as pd
 import requests
-import numpy as np
+import plotly.graph_objects as go
+from datetime import datetime
 import warnings
 
-# 1. 설정
+# 1. 고도의 시각적 경험을 위한 설정
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="GM Final", layout="wide")
+st.set_page_config(page_title="Grand Master Terminal", layout="wide")
 
-st.title("Ver 7.2 : Connectivity Test") 
+# 지적인 비서로서의 서문
+st.title("🏛️ Grand Master Strategic Terminal")
+st.markdown("---")
 
-# 2. 데이터 가져오기 (3중 안전장치)
-@st.cache_data(ttl=60)
-def get_data_survivor():
-    # [시도 1] 업비트 (Upbit) - USDT 마켓
-    try:
-        url = "https://api.upbit.com/v1/candles/days"
-        params = {"market": "USDT-BTC", "count": 200}
-        headers = {"accept": "application/json"}
-        response = requests.get(url, params=params, headers=headers, timeout=5)
-        
-        if response.status_code == 200:
-            data = response.json()
-            df = pd.DataFrame(data)
+# 2. 데이터 수집 엔진 (성공한 Upbit 로직 기반)
+@st.cache_data(ttl=300)
+def fetch_strategic_data():
+    def get_upbit_price(market, count=200):
+        try:
+            url = f"https://api.upbit.com/v1/candles/days?market={market}&count={count}"
+            r = requests.get(url, timeout=5).json()
+            df = pd.DataFrame(r)
             df['Date'] = pd.to_datetime(df['candle_date_time_utc'])
             df['Price'] = df['trade_price'].astype(float)
-            df = df.sort_values('Date') # 날짜 오름차순 정렬
-            return df[["Date", "Price"]].set_index("Date"), "Upbit (USDT)"
-    except Exception as e:
-        pass # 실패하면 다음으로
+            return df.sort_values('Date')[['Date', 'Price']]
+        except:
+            return pd.DataFrame()
 
-    # [시도 2] 코인게코 (CoinGecko)
-    try:
-        url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
-        params = {"vs_currency": "usd", "days": "100"}
-        headers = {"User-Agent": "Mozilla/5.0"} # 브라우저인 척 속이기
-        response = requests.get(url, params=params, headers=headers, timeout=5)
-        
-        if response.status_code == 200:
-            data = response.json()
-            prices = data['prices'] # [timestamp, price] 리스트
-            df = pd.DataFrame(prices, columns=['timestamp', 'Price'])
-            df['Date'] = pd.to_datetime(df['timestamp'], unit='ms')
-            return df[["Date", "Price"]].set_index("Date"), "CoinGecko"
-    except Exception as e:
-        pass
+    # 비트코인 및 도지코인(시장 심리 지표) 수집
+    btc = get_upbit_price("USDT-BTC", 500)
+    doge = get_upbit_price("USDT-DOGE", 500)
+    return btc, doge
 
-    # [시도 3] 최후의 보루: 랜덤 테스트 데이터 (차트 기능 확인용)
-    # 이게 나온다면 서버 인터넷이 완전히 막힌 것입니다.
-    dates = pd.date_range(end=pd.Timestamp.now(), periods=100)
-    prices = np.linspace(90000, 100000, 100) + np.random.randn(100) * 1000
-    df = pd.DataFrame({'Date': dates, 'Price': prices})
-    return df.set_index('Date'), "⚠️ TEST DATA (Network Blocked)"
+with st.spinner('시장 데이터를 정밀 분석 중입니다...'):
+    btc_df, doge_df = fetch_strategic_data()
 
-# 데이터 로드
-df, source_name = get_data_survivor()
+if btc_df.empty:
+    st.error("데이터 동기화에 일시적인 장애가 발생했습니다. 잠시 후 다시 시도해 주십시오.")
+    st.stop()
 
-# 3. 결과 출력
-st.subheader(f"데이터 소스: {source_name}")
+# 3. 전략적 분석 레이아웃
+col1, col2 = st.columns([3, 1])
 
-if "TEST DATA" in source_name:
-    st.error("모든 외부 접속이 차단되어 '테스트 데이터'를 표시합니다. 하지만 차트는 보일 겁니다.")
-else:
-    st.success(f"연결 성공! {source_name} 데이터를 불러왔습니다.")
-
-# 4. 차트 그리기
-if df is not None and not df.empty:
-    # 1) Streamlit 내장 라인 차트 (가장 안전)
-    st.line_chart(df["Price"])
+with col2:
+    st.subheader("📌 Market Status")
+    current_btc = btc_df['Price'].iloc[-1]
+    st.metric("Bitcoin (USDT)", f"${current_btc:,.0f}")
     
-    # 2) 현재가 표시
-    last_p = df["Price"].iloc[-1]
-    st.metric("Bitcoin Price", f"${last_p:,.0f}")
+    if not doge_df.empty:
+        current_doge = doge_df['Price'].iloc[-1]
+        st.metric("Doge (Sentiment Index)", f"${current_doge:.4f}")
     
-    # 3) 데이터 표 확인
-    with st.expander("데이터 원본 보기"):
-        st.dataframe(df.tail())
-else:
-    st.error("치명적 오류: 데이터를 생성할 수 없습니다.")
+    st.info("💡 모바일 팁: 차트 영역을 두 손가락으로 벌리면 특정 구간을 정밀하게 탐색할 수 있습니다.")
+
+with col1:
+    # 4. 고성능 인터랙티브 차트 (Plotly)
+    fig = go.Figure()
+
+    # 비트코인 주력 선 (Log Scale 적용 권장)
+    fig.add_trace(go.Scatter(
+        x=btc_df['Date'], 
+        y=btc_df['Price'],
+        mode='lines',
+        name='Bitcoin',
+        line=dict(color='#00FFA3', width=2.5),
+        fill='toself',
+        fillcolor='rgba(0, 255, 163, 0.05)'
+    ))
+
+    # 차트 레이아웃 최적화 (모바일 줌 기능 활성화)
+    fig.update_layout(
+        template="plotly_dark",
+        height=600,
+        margin=dict(l=10, r=10, t=10, b=10),
+        xaxis=dict(
+            rangeslider=dict(visible=True), # 하단 기간 조절 슬라이더
+            type="date",
+            showgrid=False
+        ),
+        yaxis=dict(
+            title="Price (USDT)",
+            side="right",
+            showgrid=True,
+            gridcolor='rgba(255, 255, 255, 0.1)',
+            exponentformat="none"
+        ),
+        hovermode="x unified",
+        dragmode="zoom" # 기본 드래그 모드를 줌으로 설정
+    )
+
+    # 차트 출력
+    st.plotly_chart(fig, use_container_width=True, config={
+        'scrollZoom': True, # 마우스 휠 및 터치 줌 활성화
+        'displayModeBar': False
+    })
+
+# 5. 지적 성찰을 위한 하단부
+st.markdown("---")
+st.caption(f"Last Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} KST | 데이터 제공: Upbit")
