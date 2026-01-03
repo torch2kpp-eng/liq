@@ -8,17 +8,19 @@ import numpy as np
 import io
 import warnings
 
-# 1. 환경 설정 및 인터페이스 최적화
+# 1. 환경 설정
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="Grand Master Terminal", layout="wide")
+st.set_page_config(page_title="GM Terminal Final", layout="wide")
 
-st.title("🏛️ Grand Master: Strategic Multi-Axis Terminal")
-st.caption("Ver 8.4 | 개별 자산별 독립 척도 시스템 완비")
+st.title("🏛️ Grand Master: Multi-Axis Final")
+st.caption("Ver 8.5 | Layout 구조 재설계 및 안정화 패치 완료")
 
-# 2. 데이터 수집 엔진 (안정성 강화)
+# 2. 데이터 수집 (캐시 적용)
 @st.cache_data(ttl=3600)
-def fetch_master_data():
+def fetch_data_ver85():
     d = {}
+    
+    # [A] Upbit
     def get_upbit(symbol):
         try:
             r = requests.get(f"https://api.upbit.com/v1/candles/days?market={symbol}&count=1000", timeout=5).json()
@@ -30,6 +32,7 @@ def fetch_master_data():
     d['btc'] = get_upbit("USDT-BTC")
     d['doge'] = get_upbit("USDT-DOGE")
 
+    # [B] FRED
     def get_fred(id):
         try:
             r = requests.get(f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={id}", timeout=5)
@@ -41,12 +44,14 @@ def fetch_master_data():
     d['tga'] = get_fred('WTREGEN')
     d['rrp'] = get_fred('RRPONTSYD')
 
+    # [C] Nasdaq
     try:
         ns = yf.download("^IXIC", period="3y", progress=False)
         s = ns.xs('Close', axis=1, level=0)["^IXIC"] if isinstance(ns.columns, pd.MultiIndex) else ns['Close']
         d['nasdaq'] = s.tz_localize(None)
     except: d['nasdaq'] = pd.Series(dtype=float)
 
+    # [D] Difficulty
     try:
         with open('difficulty (1).json', 'r') as f:
             js = json.load(f)['difficulty']
@@ -54,13 +59,14 @@ def fetch_master_data():
         df_js['Date'] = pd.to_datetime(df_js['x'], unit='ms').dt.tz_localize(None)
         d['diff'] = df_js.set_index('Date').sort_index()['y']
     except: d['diff'] = pd.Series(dtype=float)
+    
     return d
 
-raw = fetch_master_data()
+raw = fetch_data_ver85()
 
-# 3. 로직 처리 (유동성 및 시프트 계산)
+# 3. 데이터 가공
 if not raw['btc'].empty:
-    # G3 유동성 모사 (Fed Net Liquidity)
+    # Liquidity
     df_liq = raw['fed'].resample('W-WED').last()
     df_liq.columns = ['Fed']
     if not raw['tga'].empty: df_liq = df_liq.join(raw['tga'].resample('W-WED').mean().rename(columns={raw['tga'].columns[0]:'TGA'}))
@@ -69,7 +75,7 @@ if not raw['btc'].empty:
     df_liq['Net_Tril'] = (df_liq['Fed'] - df_liq.get('TGA', 0) - (df_liq.get('RRP', 0) * 1000)) / 1_000_000
     df_liq['YoY'] = df_liq['Net_Tril'].pct_change(52) * 100
 
-    # 채굴 원가
+    # Mining Cost
     df_c = pd.DataFrame(index=raw['btc'].index)
     if not raw['diff'].empty:
         df_c['diff'] = raw['diff'].resample('D').interpolate()
@@ -80,7 +86,7 @@ if not raw['btc'].empty:
         k = (target.iloc[:,0] / target.iloc[:,1]).min() if not target.empty else 0.00000008
         df_c['floor'] = df_c['cost_raw'] * k
 
-    # 90일 시프트 함수
+    # Shift -90d
     def shift_90(s):
         if s is None or s.empty: return pd.Series(dtype=float)
         new_s = s.copy(); new_s.index = new_s.index - pd.Timedelta(days=90)
@@ -91,57 +97,103 @@ if not raw['btc'].empty:
     nasdaq_s = shift_90(raw['nasdaq'])
     doge_s = shift_90(raw['doge'])
 
-    # 4. [핵심] 다중 축 차트 생성 (골조 확보)
-    st.subheader("📊 Grand Master Multi-Asset Convergence")
+    # 4. [수정된 핵심] 안전한 Layout 생성 방식
+    st.subheader("📊 Grand Master Integrated Strategy Chart")
     
-    fig = go.Figure()
     start_viz = '2023-01-01'
-
-    # [Trace 1] 유동성 YoY (Y1 - Left)
-    liq_v = df_liq[df_liq.index >= start_viz]
-    fig.add_trace(go.Scatter(x=liq_v.index, y=liq_v['YoY'], name="Liquidity YoY", 
-                             line=dict(color='gold', width=2), fill='tozeroy', 
-                             fillcolor='rgba(255, 215, 0, 0.1)', yaxis="y1"))
-
-    # [Trace 2] BTC (Y2 - Right 1)
-    btc_v = btc_s[btc_s.index >= start_viz]
-    fig.add_trace(go.Scatter(x=btc_v.index, y=btc_v, name="BTC (-90d)", 
-                             line=dict(color='white', width=2.5), yaxis="y2"))
     
-    # [Trace 3] Cost Floor (Y2 - Right 1 공유)
-    if not floor_s.empty:
-        fl_v = floor_s[floor_s.index >= start_viz]
-        fig.add_trace(go.Scatter(x=fl_v.index, y=fl_v, name="Cost Floor", 
-                                 line=dict(color='red', width=1.5, dash='dot'), yaxis="y2"))
+    # Trace 데이터 준비
+    liq_v = df_liq[df_liq.index >= start_viz]
+    btc_v = btc_s[btc_s.index >= start_viz]
+    fl_v = floor_s[floor_s.index >= start_viz] if not floor_s.empty else pd.Series(dtype=float)
+    nd_v = nasdaq_s[nasdaq_s.index >= start_viz] if not nasdaq_s.empty else pd.Series(dtype=float)
+    dg_v = doge_s[doge_s.index >= start_viz] if not doge_s.empty else pd.Series(dtype=float)
 
-    # [Trace 4] Nasdaq (Y3 - Right 2)
-    if not nasdaq_s.empty:
-        nd_v = nasdaq_s[nasdaq_s.index >= start_viz]
-        fig.add_trace(go.Scatter(x=nd_v.index, y=nd_v, name="Nasdaq (-90d)", 
-                                 line=dict(color='#D62780', width=1.5), yaxis="y3"))
-
-    # [Trace 5] Doge (Y4 - Right 3)
-    if not doge_s.empty:
-        dg_v = doge_s[doge_s.index >= start_viz]
-        fig.add_trace(go.Scatter(x=dg_v.index, y=dg_v, name="DOGE (-90d)", 
-                                 line=dict(color='orange', width=1.2), yaxis="y4"))
-
-    # 레이아웃 최종 정렬 (축 정의 포함)
-    fig.update_layout(
-        template="plotly_dark",
-        height=750,
-        xaxis=dict(domain=[0.05, 0.8], showgrid=False), # 왼쪽 여백 및 우측 축 공간
-        yaxis=dict(title="Liquidity YoY %", titlefont=dict(color="gold"), tickfont=dict(color="gold")),
-        yaxis2=dict(title="BTC (Log)", type="log", overlaying="y", side="right", 
-                    titlefont=dict(color="white"), tickfont=dict(color="white"), anchor="x"),
-        yaxis3=dict(title="Nasdaq", overlaying="y", side="right", anchor="free", 
-                    position=0.87, titlefont=dict(color="#D62780"), tickfont=dict(color="#D62780")),
-        yaxis4=dict(title="Doge (Log)", type="log", overlaying="y", side="right", anchor="free", 
-                    position=0.95, titlefont=dict(color="orange"), tickfont=dict(color="orange")),
-        legend=dict(orientation="h", y=1.1, x=0),
-        hovermode="x unified"
+    # Figure 생성 (Layout을 명시적으로 주입)
+    fig = go.Figure(
+        layout=go.Layout(
+            template="plotly_dark",
+            height=700,
+            # [X축] 우측에 3개의 축이 들어갈 공간(15%) 확보
+            xaxis=dict(domain=[0.0, 0.85], showgrid=False),
+            
+            # [Y축 1: 유동성] 왼쪽
+            yaxis=dict(
+                title="Liquidity YoY %",
+                titlefont=dict(color="#FFD700"),
+                tickfont=dict(color="#FFD700"),
+                range=[-20, 40]
+            ),
+            
+            # [Y축 2: BTC] 오른쪽 1번
+            yaxis2=dict(
+                title="BTC (Log)",
+                titlefont=dict(color="white"),
+                tickfont=dict(color="white"),
+                anchor="x",
+                overlaying="y",
+                side="right",
+                type="log"
+            ),
+            
+            # [Y축 3: Nasdaq] 오른쪽 2번 (위치 지정)
+            yaxis3=dict(
+                title="Nasdaq",
+                titlefont=dict(color="#D62780"),
+                tickfont=dict(color="#D62780"),
+                anchor="free",
+                overlaying="y",
+                side="right",
+                position=0.92  # BTC 축보다 약간 오른쪽
+            ),
+            
+            # [Y축 4: DOGE] 오른쪽 3번 (가장 오른쪽)
+            yaxis4=dict(
+                title="DOGE (Log)",
+                titlefont=dict(color="orange"),
+                tickfont=dict(color="orange"),
+                anchor="free",
+                overlaying="y",
+                side="right",
+                position=1.0,  # 가장 끝
+                type="log"
+            ),
+            
+            legend=dict(orientation="h", y=1.1, x=0),
+            hovermode="x unified",
+            margin=dict(r=100) # 우측 여백 추가 확보
+        )
     )
 
+    # Trace 추가 (정의된 축에 매핑)
+    # 1. Liquidity -> y
+    fig.add_trace(go.Scatter(x=liq_v.index, y=liq_v['YoY'], name="Liquidity YoY",
+                             line=dict(color='#FFD700', width=2), fill='tozeroy', 
+                             fillcolor='rgba(255, 215, 0, 0.1)', yaxis='y'))
+
+    # 2. BTC -> y2
+    fig.add_trace(go.Scatter(x=btc_v.index, y=btc_v, name="BTC (-90d)",
+                             line=dict(color='white', width=2.5), yaxis='y2'))
+
+    # 3. Cost Floor -> y2 (BTC와 공유)
+    if not fl_v.empty:
+        fig.add_trace(go.Scatter(x=fl_v.index, y=fl_v, name="Cost Floor",
+                                 line=dict(color='red', width=1.5, dash='dot'), yaxis='y2'))
+
+    # 4. Nasdaq -> y3
+    if not nd_v.empty:
+        fig.add_trace(go.Scatter(x=nd_v.index, y=nd_v, name="Nasdaq (-90d)",
+                                 line=dict(color='#D62780', width=1.5), yaxis='y3'))
+
+    # 5. Doge -> y4
+    if not dg_v.empty:
+        fig.add_trace(go.Scatter(x=dg_v.index, y=dg_v, name="DOGE (-90d)",
+                                 line=dict(color='orange', width=1.5), yaxis='y4'))
+
     st.plotly_chart(fig, use_container_width=True)
+
+    # 하단 정보
+    st.success("데이터 로드 및 4중 축 차트 생성 완료")
+
 else:
-    st.info("시장의 맥박을 동기화 중입니다. 잠시만 기다려 주십시오.")
+    st.error("데이터 동기화 대기 중...")
