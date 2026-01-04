@@ -12,10 +12,10 @@ from datetime import date, timedelta
 
 # 1. 환경 설정
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="GM Z-Gap Trend", layout="wide")
+st.set_page_config(page_title="GM Sync Master", layout="wide")
 
 st.title("🏛️ Grand Master: Analytics Engine")
-st.caption("Ver 19.6 | Z-Gap Trend Chart 탑재 | 4대 자산(BTC, DOGE, ETH, LINK) 심리 궤적 추적")
+st.caption("Ver 19.8 | Z-Gap Shift 동기화 | 사이드바 설정 실시간 반영 | 정밀 퀀트 연산")
 
 # -----------------------------------------------------------
 # [사이드바 설정]
@@ -54,7 +54,7 @@ st.sidebar.markdown("---")
 st.sidebar.write("2. Time Shift (Days)")
 shift_days = st.sidebar.number_input(
     "자산/지표 이동 (일)", min_value=-365, max_value=365, value=112, step=7,
-    help="최적 시차(Optimal Lag)인 112일을 기본값으로 설정했습니다."
+    help="설정한 일수만큼 유동성 지표를 이동시켜 Z-Gap을 계산합니다."
 )
 
 st.sidebar.markdown("---")
@@ -85,7 +85,7 @@ def fetch_master_data_logic():
     meta_info = {}
     GLOBAL_START = time.time()
     MAX_EXECUTION_TIME = 30 
-    START_YEAR = 2018 
+    START_YEAR = 2016 
     headers = {'User-Agent': 'Mozilla/5.0'}
 
     def check_timeout(): return (time.time() - GLOBAL_START > MAX_EXECUTION_TIME)
@@ -129,7 +129,7 @@ def fetch_master_data_logic():
         all_data = []
         try:
             since = bithumb.parse8601(f'{START_YEAR}-01-01T00:00:00Z')
-            for _ in range(12): 
+            for _ in range(20): 
                 if check_timeout(): break
                 ohlcv = bithumb.fetch_ohlcv(symbol_code, '1d', since=since, limit=1000)
                 if not ohlcv: break
@@ -145,7 +145,7 @@ def fetch_master_data_logic():
         return df.drop_duplicates('timestamp').set_index('timestamp')['close'].tz_localize(None)
 
     status_text = st.empty()
-    status_text.text("📡 Initializing Data...")
+    status_text.text("📡 Initializing Data (2016~)...")
 
     fred_ids = {
         'fed': 'WALCL', 'tga': 'WTREGEN', 'rrp': 'RRPONTSYD',
@@ -203,7 +203,7 @@ def check_risk_radar(hy_series):
 # -----------------------------------------------------------
 # [FUNC 2] Quant Engine
 # -----------------------------------------------------------
-def run_quant_analysis_pure(liq_series, asset_series_daily):
+def run_quant_analysis_pure(liq_series, asset_series_daily, manual_lag_days):
     try:
         asset_weekly = asset_series_daily.resample('W-WED').last()
         asset_yoy = asset_weekly.pct_change(52) * 100
@@ -219,16 +219,19 @@ def run_quant_analysis_pure(liq_series, asset_series_daily):
         df['L_Z'] = (df['L_Smooth'] - df['L_Smooth'].mean()) / (df['L_Smooth'].std() + 1e-9)
         df['P_Z'] = (df['P_Smooth'] - df['P_Smooth'].mean()) / (df['P_Smooth'].std() + 1e-9)
 
+        # 1. Optimal Lag 찾기
         best_lag_weeks, best_corr = 0, -1.0
         for lag in range(0, 53): 
             corr = df['P_Z'].corr(df['L_Z'].shift(lag))
             if corr > best_corr: best_corr, best_lag_weeks = corr, lag
         
-        best_lag_days = best_lag_weeks * 7
-        recent_window = 4 
-        df['L_Z_Shifted'] = df['L_Z'].shift(best_lag_weeks)
-        df_recent = df.iloc[-recent_window:]
-        if len(df_recent) < recent_window: return None
+        # 2. Z-Gap 계산은 사용자가 설정한 manual_lag_days를 따름 (일관성)
+        # 단, manual_lag가 0이면 best_lag를 씀
+        calc_lag_weeks = int(manual_lag_days / 7) if manual_lag_days > 0 else best_lag_weeks
+        
+        df['L_Z_Shifted'] = df['L_Z'].shift(calc_lag_weeks)
+        df_recent = df.iloc[-4:]
+        if len(df_recent) < 4: return None
         
         recent_corr = df_recent['P_Z'].corr(df_recent['L_Z_Shifted'])
         last_val = df.iloc[-1]
@@ -240,8 +243,12 @@ def run_quant_analysis_pure(liq_series, asset_series_daily):
         else: regime = "Weak"
 
         return {
-            "optimal_lag": best_lag_days, "global_corr": best_corr,
-            "recent_corr": recent_corr, "gap_z": gap_z, "regime": regime
+            "optimal_lag": best_lag_weeks * 7, # 최적 시차는 정보로 제공
+            "calc_lag": calc_lag_weeks * 7,    # 실제 계산에 쓴 시차
+            "global_corr": best_corr,
+            "recent_corr": recent_corr,
+            "gap_z": gap_z, 
+            "regime": regime
         }
     except Exception: return None
 
@@ -334,7 +341,8 @@ try:
 
     # [Radar 2] M2 Divergence
     if 'btc' in raw and not raw['btc'].empty and not df_m['Global_M2_YoY'].empty:
-        m2_res = run_quant_analysis_pure(df_m['Global_M2_YoY'], raw['btc'])
+        # manual_lag_days를 전달하여 계산
+        m2_res = run_quant_analysis_pure(df_m['Global_M2_YoY'], raw['btc'], shift_days)
         if m2_res:
             with r_cols[1]:
                 st.markdown("#### 🌊 Liquidity Divergence (BTC vs M2)")
@@ -349,23 +357,25 @@ try:
                     elif "Inverse" in regime: st.error(f"📉 역상관 (Inverse)")
                     else: st.info(f"⚪ 약세 (Weak)")
     
-    # [NEW] Z-Gap Trend Chart
-    st.markdown("#### 🌊 Z-Gap Trend Monitor (BTC, ETH, DOGE, LINK)")
+    # [NEW] Z-Gap Trend Chart (Synced with Shift Days)
+    st.markdown("#### 🌊 Z-Gap Trend Monitor (All Selected Assets)")
+    st.caption(f"※ 계산 기준: **{shift_days}일 (Shift)** 시차 적용")
     
-    target_z_assets = ['btc', 'eth', 'doge', 'link']
+    target_z_assets = [a['id'] for a in ASSETS_CONFIG if selected_assets[a['id']] and a['id'] != 'hy_spread']
     z_chart_data = {}
     
-    # 4개 종목에 대해 Z-Gap 시리즈 계산
+    # Z-Gap 계산용 Lag (주 단위)
+    calc_lag_weeks_chart = int(shift_days / 7) if shift_days > 0 else 0
+
     for t_asset in target_z_assets:
         if t_asset in raw and not raw[t_asset].empty and not df_m['Global_M2_YoY'].empty:
-            # 로컬 계산 (시리즈 확보용)
             asset_series_daily = raw[t_asset]
             asset_weekly = asset_series_daily.resample('W-WED').last()
             asset_yoy = asset_weekly.pct_change(52) * 100
             df_z = pd.concat([df_m['Global_M2_YoY'], asset_yoy], axis=1).dropna()
             df_z.columns = ['Liquidity_YoY', 'Price_YoY']
             
-            if len(df_z) > 20:
+            if len(df_z) > 10:
                 df_z['L_Smooth'] = df_z['Liquidity_YoY'].rolling(4).mean()
                 df_z['P_Smooth'] = df_z['Price_YoY'].rolling(4).mean()
                 df_z = df_z.dropna()
@@ -373,36 +383,38 @@ try:
                 df_z['L_Z'] = (df_z['L_Smooth'] - df_z['L_Smooth'].mean()) / (df_z['L_Smooth'].std() + 1e-9)
                 df_z['P_Z'] = (df_z['P_Smooth'] - df_z['P_Smooth'].mean()) / (df_z['P_Smooth'].std() + 1e-9)
                 
-                # [Shift 112 Days = 16 Weeks]
-                df_z['L_Z_Shifted'] = df_z['L_Z'].shift(16)
+                # [Shift Synced] 사용자가 설정한 Shift Days 적용
+                df_z['L_Z_Shifted'] = df_z['L_Z'].shift(calc_lag_weeks_chart)
                 df_z['Gap_Z'] = df_z['P_Z'] - df_z['L_Z_Shifted']
                 z_chart_data[t_asset] = df_z['Gap_Z'].dropna()
 
     if z_chart_data:
-        # 차트 그리기
         fig_z = go.Figure()
         
-        # 기준선 (Zones)
         x_min = min([s.index.min() for s in z_chart_data.values()])
         x_max = max([s.index.max() for s in z_chart_data.values()])
         
-        fig_z.add_shape(type="rect", x0=x_min, x1=x_max, y0=-2.0, y1=-5.0, fillcolor="rgba(0, 255, 127, 0.1)", line=dict(width=0), layer="below") # Green Zone
-        fig_z.add_shape(type="rect", x0=x_min, x1=x_max, y0=1.5, y1=5.0, fillcolor="rgba(255, 69, 0, 0.1)", line=dict(width=0), layer="below")   # Red Zone
+        fig_z.add_shape(type="rect", x0=x_min, x1=x_max, y0=-2.0, y1=-6.0, fillcolor="rgba(0, 255, 127, 0.1)", line=dict(width=0), layer="below")
+        fig_z.add_shape(type="rect", x0=x_min, x1=x_max, y0=1.5, y1=6.0, fillcolor="rgba(255, 69, 0, 0.1)", line=dict(width=0), layer="below")
         
         fig_z.add_hline(y=0, line_dash="dot", line_color="gray", opacity=0.5)
-        fig_z.add_hline(y=1.5, line_dash="dash", line_color="red", annotation_text="Overheat (+1.5σ)", annotation_position="top right")
-        fig_z.add_hline(y=-2.0, line_dash="dash", line_color="#00FF7F", annotation_text="Deep Value (-2.0σ)", annotation_position="bottom right")
+        fig_z.add_hline(y=1.5, line_dash="dash", line_color="red", annotation_text="Overheat (+1.5σ)", annotation_position="top left")
+        fig_z.add_hline(y=-2.0, line_dash="dash", line_color="#00FF7F", annotation_text="Deep Value (-2.0σ)", annotation_position="bottom left")
 
-        # 자산별 라인 추가
-        colors = {'btc': '#00FFEE', 'eth': '#627EEA', 'doge': '#FFA500', 'link': '#2A5ADA'}
-        names = {'btc': 'BTC', 'eth': 'ETH', 'doge': 'DOGE', 'link': 'LINK'}
+        colors = {
+            'btc': '#00FFEE', 'eth': '#627EEA', 'doge': '#FFA500', 'link': '#2A5ADA',
+            'nasdaq': '#D62780', 'gold': '#FFD700', 'silver': '#C0C0C0',
+            'ada': '#0033AD', 'xrp': '#00AAE4'
+        }
         
         for t_asset, series in z_chart_data.items():
-            fig_z.add_trace(go.Scatter(x=series.index, y=series, name=names[t_asset], line=dict(color=colors[t_asset], width=2)))
+            c = colors.get(t_asset, '#FFFFFF')
+            name = next((a['name'] for a in ASSETS_CONFIG if a['id'] == t_asset), t_asset.upper())
+            fig_z.add_trace(go.Scatter(x=series.index, y=series, name=name, line=dict(color=c, width=2)))
 
         fig_z.update_layout(
             template="plotly_dark", height=350, margin=dict(l=20, r=20, t=30, b=20),
-            yaxis=dict(title="Z-Gap (Sigma)", range=[-3.5, 3.5]),
+            yaxis=dict(title="Z-Gap (Sigma)", range=[-4.0, 4.0]),
             xaxis=dict(showgrid=True, gridcolor='rgba(128,128,128,0.2)'),
             legend=dict(orientation="h", y=1.1, x=0.5, xanchor="center")
         )
@@ -413,10 +425,10 @@ try:
         st.markdown("""
         | 구간 (Sigma) | 상태 | 의미 (Meaning) | 행동 요령 (Action) |
         | :--- | :--- | :--- | :--- |
-        | **+1.5 이상** | 🔴 **High (과열)** | 유동성 대비 가격이 너무 높음. 고무줄이 팽팽함. | **매도/관망** (조정 가능성 높음) |
+        | **+1.5 이상** | 🔴 **High (과열)** | 유동성 대비 가격이 너무 높음. | **매도/관망** |
         | **+1.0 ~ +1.5** | 🟠 **Warn (주의)** | 가격이 유동성을 앞서가기 시작함. | 추격 매수 자제 |
         | **-1.0 ~ +1.0** | ⚪ **Fair (적정)** | 가격과 유동성이 **비슷한 속도**로 동행 중. | **추세 추종 (Hold)** |
-        | **-1.5 ~ -1.0** | 🔵 **Low (기회)** | 돈은 풀렸는데 가격이 아직 덜 오름. (저평가) | **분할 매수 (Buy)** |
+        | **-1.5 ~ -1.0** | 🔵 **Low (기회)** | 돈은 풀렸는데 가격이 아직 덜 오름. | **분할 매수 (Buy)** |
         | **-2.0 이하** | 🟢 **Deep Value** | 극심한 공포/투매 구간. 절호의 기회. | **강력 매수 (Strong Buy)** |
         """)
 
@@ -560,10 +572,11 @@ try:
                     if raw_asset_series.empty:
                         st.warning("데이터 부족")
                         continue
+                    # Matrix에서는 항상 Optimal Lag를 찾아서 보여줌 (Manual Lag와 비교 가능)
                     results = []
                     for liq_label, liq_data in liquidity_sources:
                         if liq_data.empty: continue
-                        res = run_quant_analysis_pure(liq_data, raw_asset_series)
+                        res = run_quant_analysis_pure(liq_data, raw_asset_series, shift_days)
                         if res:
                             res['label'] = liq_label
                             results.append(res)
@@ -577,6 +590,7 @@ try:
                             if res == best_res: st.markdown(f"#### ⭐ {res['label']}")
                             else: st.markdown(f"#### {res['label']}")
                             st.metric("Optimal Lag", f"{res['optimal_lag']} days")
+                            # [NEW] 계산된 Z-Gap이 Manual Shift 기준임을 명시
                             st.metric("Hist. Corr (4y)", f"{res['global_corr']:.2f}")
                             st.metric("Recent Corr (30d)", f"{res['recent_corr']:.2f}", delta=f"{res['recent_corr'] - res['global_corr']:.2f}")
                             regime_icon = "🟢" if "Sync" in res['regime'] else ("⚠️" if "Divergence" in res['regime'] else ("📉" if "Inverse" in res['regime'] else "⚪"))
