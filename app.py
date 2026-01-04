@@ -12,10 +12,10 @@ from datetime import date
 
 # 1. 환경 설정
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="GM Speed Terminal", layout="wide")
+st.set_page_config(page_title="GM Futures", layout="wide")
 
-st.title("🏛️ Grand Master: Speed Optimized Terminal")
-st.caption("Ver 15.3 | 초기 로딩 속도 최적화 (2021~) | Timeout 설정 강화 | 무한 로딩 해결")
+st.title("🏛️ Grand Master: Futures Market Terminal")
+st.caption("Ver 15.4 | Kraken 차단 해결 → Yahoo Futures(GC=F, SI=F) 적용 | 데이터 연결 복구")
 
 # -----------------------------------------------------------
 # [사이드바 설정]
@@ -41,16 +41,17 @@ shift_days = st.sidebar.number_input(
 st.sidebar.markdown("---")
 st.sidebar.write("3. 표시할 자산 (Right Axes)")
 
+# [핵심 변경] Gold/Silver를 Kraken에서 Yahoo Futures로 변경
 ASSETS_CONFIG = [
     {'id': 'nasdaq', 'name': 'Nasdaq', 'symbol': 'IXIC', 'source': 'hybrid', 'color': '#D62780', 'type': 'index', 'default': True},
-    {'id': 'gold', 'name': 'Gold', 'symbol': 'XAU/USD', 'source': 'kraken', 'color': '#FFD700', 'type': 'metal', 'default': True},
-    {'id': 'silver', 'name': 'Silver', 'symbol': 'XAG/USD', 'source': 'kraken', 'color': '#C0C0C0', 'type': 'metal', 'default': True},
-    {'id': 'btc', 'name': 'BTC', 'symbol': 'BTC/KRW', 'source': 'bithumb', 'color': '#00FFEE', 'type': 'crypto', 'default': True},
-    {'id': 'doge', 'name': 'DOGE', 'symbol': 'DOGE/KRW', 'source': 'bithumb', 'color': '#FFA500', 'type': 'crypto', 'default': True},
-    {'id': 'eth', 'name': 'ETH', 'symbol': 'ETH/KRW', 'source': 'bithumb', 'color': '#627EEA', 'type': 'crypto', 'default': False},
-    {'id': 'link', 'name': 'LINK', 'symbol': 'LINK/KRW', 'source': 'bithumb', 'color': '#2A5ADA', 'type': 'crypto', 'default': False},
-    {'id': 'ada', 'name': 'ADA', 'symbol': 'ADA/KRW', 'source': 'bithumb', 'color': '#0033AD', 'type': 'crypto', 'default': False},
-    {'id': 'xrp', 'name': 'XRP', 'symbol': 'XRP/KRW', 'source': 'bithumb', 'color': '#00AAE4', 'type': 'crypto', 'default': False},
+    {'id': 'gold',   'name': 'Gold',   'symbol': 'GC=F', 'source': 'yahoo',  'color': '#FFD700', 'type': 'metal', 'default': True},
+    {'id': 'silver', 'name': 'Silver', 'symbol': 'SI=F', 'source': 'yahoo',  'color': '#C0C0C0', 'type': 'metal', 'default': True},
+    {'id': 'btc',    'name': 'BTC',    'symbol': 'BTC/KRW', 'source': 'bithumb', 'color': '#00FFEE', 'type': 'crypto', 'default': True},
+    {'id': 'doge',   'name': 'DOGE',   'symbol': 'DOGE/KRW', 'source': 'bithumb', 'color': '#FFA500', 'type': 'crypto', 'default': True},
+    {'id': 'eth',    'name': 'ETH',    'symbol': 'ETH/KRW', 'source': 'bithumb', 'color': '#627EEA', 'type': 'crypto', 'default': False},
+    {'id': 'link',   'name': 'LINK',   'symbol': 'LINK/KRW', 'source': 'bithumb', 'color': '#2A5ADA', 'type': 'crypto', 'default': False},
+    {'id': 'ada',    'name': 'ADA',    'symbol': 'ADA/KRW', 'source': 'bithumb', 'color': '#0033AD', 'type': 'crypto', 'default': False},
+    {'id': 'xrp',    'name': 'XRP',    'symbol': 'XRP/KRW', 'source': 'bithumb', 'color': '#00AAE4', 'type': 'crypto', 'default': False},
 ]
 
 selected_assets = {}
@@ -58,73 +59,18 @@ for asset in ASSETS_CONFIG:
     selected_assets[asset['id']] = st.sidebar.checkbox(f"{asset['name']}", value=asset['default'])
 
 # -----------------------------------------------------------
-# 데이터 수집 (최적화 버전)
+# 데이터 수집
 # -----------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner="데이터 고속 동기화 중 (Max 30s)...")
+@st.cache_data(ttl=3600, show_spinner="데이터 소스 연결 중 (Yahoo/FRED/Bithumb)...")
 def fetch_master_data():
     d = {}
-    
-    # [설정] 데이터 시작 시점 (너무 오래된 데이터는 과감히 포기하여 속도 확보)
-    START_YEAR = 2021 
-    start_ts_ms = pd.Timestamp(f'{START_YEAR}-01-01').value // 10**6
+    START_YEAR = 2021
     
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36'
     }
 
-    # [핵심] 타임아웃 설정 추가 (3초 안에 응답 없으면 끊음)
-    bithumb = ccxt.bithumb({'enableRateLimit': True, 'timeout': 3000})
-    kraken = ccxt.kraken({'enableRateLimit': True, 'timeout': 3000})
-
-    # 1. Bithumb Fetcher
-    def fetch_bithumb(symbol_code):
-        all_data = []
-        try:
-            since = bithumb.parse8601(f'{START_YEAR}-01-01T00:00:00Z')
-            # 최대 5번 루프 (약 5000일 데이터 커버 가능하므로 충분)
-            for _ in range(10): 
-                ohlcv = bithumb.fetch_ohlcv(symbol_code, '1d', since=since, limit=1000)
-                if not ohlcv: break
-                all_data.extend(ohlcv)
-                
-                last_ts = ohlcv[-1][0]
-                # 현재 시간 근처면 종료
-                if last_ts >= (time.time() * 1000) - 86400000: break
-                
-                since = last_ts + 1
-                time.sleep(0.1) # 짧은 대기
-        except: pass
-        
-        if not all_data: return pd.Series(dtype=float)
-        df = pd.DataFrame(all_data, columns=['timestamp','open','high','low','close','volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        return df.drop_duplicates('timestamp').set_index('timestamp')['close'].tz_localize(None)
-
-    # 2. Kraken Fetcher (안전 모드)
-    def fetch_kraken(symbol):
-        all_data = []
-        try:
-            since = kraken.parse8601(f'{START_YEAR}-01-01T00:00:00Z')
-            # [핵심] 루프 횟수 5회 제한 (속도 최우선)
-            for _ in range(5): 
-                ohlcv = kraken.fetch_ohlcv(symbol, '1d', since=since, limit=720)
-                if not ohlcv: break
-                all_data.extend(ohlcv)
-                
-                last_ts = ohlcv[-1][0]
-                if last_ts >= (time.time() * 1000) - 86400000: break
-                
-                since = last_ts + 1
-                # Kraken은 rate limit이 엄격하므로 약간 대기
-                time.sleep(1.0) 
-        except: pass
-
-        if not all_data: return pd.Series(dtype=float)
-        df = pd.DataFrame(all_data, columns=['timestamp','open','high','low','close','volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        return df.drop_duplicates('timestamp').set_index('timestamp')['close'].tz_localize(None)
-
-    # 3. FRED Fetcher
+    # 1. FRED Fetcher
     def get_fred(id):
         try:
             url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={id}"
@@ -134,40 +80,82 @@ def fetch_master_data():
             return df.squeeze().resample('D').interpolate(method='time').tz_localize(None)
         except: return pd.Series(dtype=float)
 
-    # 4. Yahoo Backup
+    # 2. Yahoo Fetcher (Futures & Backup)
     def get_yahoo(ticker):
         try:
             import yfinance as yf
+            # 2021년부터 데이터 요청
             df = yf.download(ticker, start=f"{START_YEAR}-01-01", progress=False, auto_adjust=True)
+            
             if not df.empty:
-                if 'Close' in df.columns: return df['Close'].tz_localize(None)
-                return df.iloc[:,0].tz_localize(None)
+                # MultiIndex 컬럼 처리 (yfinance 최신 버전 대응)
+                if isinstance(df.columns, pd.MultiIndex):
+                    try: s = df.xs('Close', axis=1, level=0)[ticker]
+                    except: s = df.iloc[:, 0] # 실패시 첫번째 컬럼
+                elif 'Close' in df.columns:
+                    s = df['Close']
+                else:
+                    s = df.iloc[:, 0]
+                
+                # Series 변환 및 타임존 제거
+                if isinstance(s, pd.DataFrame): s = s.squeeze()
+                s = s.tz_localize(None)
+                
+                # 주말 데이터 보간 (Futures는 주말이 빔)
+                return s.resample('D').interpolate(method='time')
+            return pd.Series(dtype=float)
         except: return pd.Series(dtype=float)
 
-    # === 실행 (병렬처리 흉내 - 순차 실행이지만 빠르게) ===
-    
-    # FRED Data
-    fred_map = {
+    # 3. Bithumb Fetcher
+    bithumb = ccxt.bithumb({'enableRateLimit': True, 'timeout': 3000})
+    def fetch_bithumb(symbol_code):
+        all_data = []
+        try:
+            since = bithumb.parse8601(f'{START_YEAR}-01-01T00:00:00Z')
+            for _ in range(10): 
+                ohlcv = bithumb.fetch_ohlcv(symbol_code, '1d', since=since, limit=1000)
+                if not ohlcv: break
+                all_data.extend(ohlcv)
+                last_ts = ohlcv[-1][0]
+                if last_ts >= (time.time() * 1000) - 86400000: break
+                since = last_ts + 1
+                time.sleep(0.1)
+        except: pass
+        
+        if not all_data: return pd.Series(dtype=float)
+        df = pd.DataFrame(all_data, columns=['timestamp','open','high','low','close','volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        return df.drop_duplicates('timestamp').set_index('timestamp')['close'].tz_localize(None)
+
+    # === 데이터 수집 실행 ===
+
+    # [A] FRED (Liquidity + Nasdaq Primary)
+    fred_ids = {
         'fed': 'WALCL', 'tga': 'WTREGEN', 'rrp': 'RRPONTSYD',
         'ecb': 'ECBASSETSW', 'boj': 'JPNASSETS',
         'm2_us': 'M2SL', 'm3_eu': 'MABMM301EZM189S', 'm3_jp': 'MABMM301JPM189S',
         'eur_usd': 'DEXUSEU', 'usd_jpy': 'DEXJPUS',
         'nasdaq_fred': 'NASDAQCOM'
     }
-    for k, v in fred_map.items():
+    for k, v in fred_ids.items():
         d[k] = get_fred(v)
 
-    # Nasdaq Setting
-    d['nasdaq'] = d['nasdaq_fred'] if not d['nasdaq_fred'].empty else get_yahoo("^IXIC")
+    # [B] Nasdaq Hybrid (FRED 우선 -> 실패시 Yahoo)
+    if not d['nasdaq_fred'].empty:
+        d['nasdaq'] = d['nasdaq_fred']
+    else:
+        d['nasdaq'] = get_yahoo("^IXIC")
 
-    # Assets Fetching
+    # [C] Assets Fetching (Yahoo & Bithumb)
     for asset in ASSETS_CONFIG:
-        if asset['source'] == 'bithumb':
+        if asset['id'] == 'nasdaq': continue # 이미 처리함
+        
+        if asset['source'] == 'yahoo':
+            d[asset['id']] = get_yahoo(asset['symbol'])
+        elif asset['source'] == 'bithumb':
             d[asset['id']] = fetch_bithumb(asset['symbol'])
-        elif asset['source'] == 'kraken':
-            d[asset['id']] = fetch_kraken(asset['symbol'])
 
-    # Difficulty (Local)
+    # [D] Difficulty
     try:
         with open('difficulty (1).json', 'r') as f:
             js = json.load(f)['difficulty']
@@ -181,35 +169,27 @@ def fetch_master_data():
 raw = fetch_master_data()
 
 # -----------------------------------------------------------
-# 데이터 가공 및 차트 생성
+# 로직 및 차트
 # -----------------------------------------------------------
 if not raw.get('btc', pd.Series()).empty:
 
-    # 1. Macro Data Processing
-    # 기준 인덱스 생성 (주간)
+    # 1. Macro Logic
     base_idx = raw['fed'].resample('W-WED').last().index
     df_m = pd.DataFrame(index=base_idx)
-    
-    # 데이터 병합 및 보간
     for k in raw:
         if k not in [a['id'] for a in ASSETS_CONFIG] and k != 'diff':
-            # FRED 데이터는 2021년 이전 것도 있을 수 있으므로 reindex로 맞춤
             df_m[k] = raw[k].reindex(df_m.index, method='ffill')
-    
     df_m = df_m.fillna(method='ffill')
 
     # Liquidity Formulas
-    # Fed Net
     df_m['Fed_Net_Tril'] = (df_m.get('fed',0)/1000 - df_m.get('tga',0)/1000 - df_m.get('rrp',0)/1000000)
     df_m['Fed_Net_YoY'] = df_m['Fed_Net_Tril'].pct_change(52) * 100
 
-    # G3
     fed_t = df_m.get('fed',0)/1000
     ecb_t = (df_m.get('ecb',0) * df_m.get('eur_usd',1)) / 1000000
     boj_t = (df_m.get('boj',0) * 0.0001) / df_m.get('usd_jpy',1)
     df_m['G3_Asset_YoY'] = (fed_t + ecb_t + boj_t).pct_change(52) * 100
 
-    # Global M2
     m2_us = df_m.get('m2_us',0) / 1000
     m3_eu = (df_m.get('m3_eu',0) * df_m.get('eur_usd',1)) / 1e12
     m3_jp = (df_m.get('m3_jp',0) / df_m.get('usd_jpy',1)) / 1e12
@@ -226,14 +206,12 @@ if not raw.get('btc', pd.Series()).empty:
     for asset in ASSETS_CONFIG:
         processed[asset['id']] = apply_shift(raw.get(asset['id'], pd.Series(dtype=float)), shift_days)
 
-    # 3. Chart Generation
+    # 3. Chart
     st.subheader(f"📊 Integrated Strategy Chart (Shift: {shift_days}d)")
     
-    # 시각화 시작점: 2021년 데이터부터 로드했으므로 2021-06 이후부터 보여주는게 안정적 (YoY 계산 고려)
     start_viz = pd.to_datetime('2021-06-01') 
     def flt(s): return s[s.index >= start_viz] if not s.empty else s
 
-    # Select Liquidity
     if "Global M2" in liq_option:
         liq_v = flt(df_m['Global_M2_YoY'])
         liq_name, liq_color = "🌍 Global M2 YoY", "#FF4500"
@@ -244,27 +222,20 @@ if not raw.get('btc', pd.Series()).empty:
         liq_v = flt(df_m['Fed_Net_YoY'])
         liq_name, liq_color = "🇺🇸 Fed Net Liq YoY", "#00FF7F"
 
-    # Liquidity Scale
     if not liq_v.empty:
         l_min, l_max = liq_v.min(), liq_v.max()
         l_span = max(l_max - l_min, 10)
         l_rng = [l_min - l_span*0.1, l_max + l_span*0.1]
-    else:
-        l_rng = [-20, 20]
+    else: l_rng = [-20, 20]
 
-    # Dynamic Layout Calculation
     active_assets = [a for a in ASSETS_CONFIG if selected_assets[a['id']]]
     num_active = len(active_assets)
     
-    # 축 간격 자동 계산 (화면 꽉 채우기)
     if num_active == 0: domain_end = 0.95
     else:
-        # 축 하나당 5~8% 공간 할당
         margin = 0.05 if num_active > 5 else 0.08
-        domain_end = 1.0 - (num_active * margin)
-        domain_end = max(0.5, domain_end) # 차트 최소 너비 보장
+        domain_end = max(0.5, 1.0 - (num_active * margin))
 
-    # Spike Style
     spike_settings = dict(
         showspikes=True, spikemode='across', spikesnap='cursor',
         spikethickness=1, spikecolor='red', spikedash='dash'
@@ -275,13 +246,13 @@ if not raw.get('btc', pd.Series()).empty:
         xaxis=dict(domain=[0.0, domain_end], showgrid=True, gridcolor='rgba(128,128,128,0.2)', **spike_settings),
         yaxis=dict(title=liq_name, title_font_color=liq_color, tickfont_color=liq_color, range=l_rng, showgrid=False, **spike_settings),
         legend=dict(orientation="h", y=1.12, x=0, bgcolor="rgba(0,0,0,0)"),
-        hovermode="x", # Clean View (No Box)
+        hovermode="x",
         margin=dict(l=50, r=20, t=80, b=50)
     )
 
     fig = go.Figure(layout=layout)
 
-    # 1. Liquidity Trace
+    # Liquidity
     if not liq_v.empty:
         h = liq_color.lstrip('#')
         rgb = tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
@@ -292,7 +263,7 @@ if not raw.get('btc', pd.Series()).empty:
             yaxis='y', hoverinfo='none'
         ))
 
-    # 2. Assets Traces
+    # Assets
     current_pos = domain_end
     for i, asset in enumerate(active_assets):
         data = flt(processed[asset['id']])
@@ -301,11 +272,10 @@ if not raw.get('btc', pd.Series()).empty:
         axis_name = f'yaxis{i+2}'
         axis_key = f'y{i+2}'
 
-        # Scale Calculation
         d_min, d_max = data.min(), data.max()
         if d_min <= 0: d_min = 0.0001
         
-        is_log = (asset['id'] == 'doge') # Doge Log
+        is_log = (asset['id'] == 'doge')
         if is_log:
             log_min, log_max = np.log10(d_min), np.log10(d_max)
             span = log_max - log_min
@@ -313,10 +283,9 @@ if not raw.get('btc', pd.Series()).empty:
             t_type = "log"
         else:
             span = d_max - d_min
-            rng = [d_min - span*0.2, d_max + span*0.1] # Buffer
+            rng = [d_min - span*0.2, d_max + span*0.1]
             t_type = "linear"
 
-        # Update Axis
         fig.update_layout({
             axis_name: dict(
                 title=dict(text=asset['name'], font=dict(color=asset['color'])),
@@ -327,7 +296,6 @@ if not raw.get('btc', pd.Series()).empty:
             )
         })
 
-        # Add Trace
         fig.add_trace(go.Scatter(
             x=data.index, y=data, name=asset['name'],
             line=dict(color=asset['color'], width=2),
@@ -338,15 +306,13 @@ if not raw.get('btc', pd.Series()).empty:
 
     st.plotly_chart(fig, use_container_width=True)
 
-    # Status Panel
     with st.expander("🔍 데이터 연결 상태"):
         for asset in ASSETS_CONFIG:
             s = processed[asset['id']]
             if s.empty:
                 st.error(f"❌ {asset['name']}: 로드 실패 (Source: {asset['source']})")
             else:
-                st.success(f"✅ {asset['name']}: {len(s)} rows loaded")
+                st.success(f"✅ {asset['name']}: 로드 성공 ({len(s)} rows)")
 
 else:
-    st.error("데이터 로드에 실패했습니다. (Timeout)")
-    st.info("새로고침을 하거나 잠시 후 다시 시도해주세요.")
+    st.error("데이터 로드 실패")
