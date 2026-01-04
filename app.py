@@ -11,10 +11,10 @@ from datetime import date, timedelta
 
 # 1. 환경 설정
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="GM Speed Demon", layout="wide")
+st.set_page_config(page_title="GM Macro Structural", layout="wide")
 
 st.title("🏛️ Grand Master: Analytics Engine")
-st.caption("Ver 20.5 | 성능 최적화(Caching) | Ratio-Based Z-Gap | 쾌적한 속도")
+st.caption("Ver 20.6 | Structural Lag Fix (Heavy Smoothing) | Volatility Scaled Gap | 진짜 괴리율 추적")
 
 # -----------------------------------------------------------
 # [사이드바 설정]
@@ -64,9 +64,9 @@ for asset in ASSETS_CONFIG:
     selected_assets[asset['id']] = st.sidebar.checkbox(f"{asset['name']}", value=asset['default'])
 
 # -----------------------------------------------------------
-# [CORE] 데이터 수집 Logic (Caching 적용)
+# 데이터 수집 (Caching)
 # -----------------------------------------------------------
-@st.cache_data(ttl=3600) # 1시간 동안 메모리에 저장 (속도 향상 핵심)
+@st.cache_data(ttl=3600)
 def fetch_master_data_logic():
     d = {}
     meta_info = {}
@@ -104,12 +104,11 @@ def fetch_master_data_logic():
         return pd.Series(dtype=float), "Fail"
 
     def fetch_bithumb(symbol_code):
-        # 빗썸 API는 호출 제한이 있으므로 조심스럽게
         bithumb = ccxt.bithumb({'enableRateLimit': True, 'timeout': 3000})
         all_data = []
         try:
             since = bithumb.parse8601(f'{START_YEAR}-01-01T00:00:00Z')
-            for _ in range(15): # 횟수 조절
+            for _ in range(20): 
                 ohlcv = bithumb.fetch_ohlcv(symbol_code, '1d', since=since, limit=1000)
                 if not ohlcv: break
                 all_data.extend(ohlcv)
@@ -123,7 +122,6 @@ def fetch_master_data_logic():
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         return df.drop_duplicates('timestamp').set_index('timestamp')['close'].tz_localize(None)
 
-    # 매크로 데이터 로드
     fred_ids = {
         'fed': 'WALCL', 'tga': 'WTREGEN', 'rrp': 'RRPONTSYD',
         'ecb': 'ECBASSETSW', 'boj': 'JPNASSETS',
@@ -131,14 +129,10 @@ def fetch_master_data_logic():
         'eur_usd': 'DEXUSEU', 'usd_jpy': 'DEXJPUS',
         'nasdaq_fred': 'NASDAQCOM'
     }
-    
-    for k, v in fred_ids.items():
-        d[k] = get_fred(v)
-
+    for k, v in fred_ids.items(): d[k] = get_fred(v)
     if not d.get('nasdaq_fred', pd.Series()).empty: d['nasdaq'] = d['nasdaq_fred']
     else: d['nasdaq'] = get_yahoo("^IXIC")
 
-    # 개별 자산 로드 (모든 자산 미리 로드하여 캐싱)
     for asset in ASSETS_CONFIG:
         if asset['id'] == 'nasdaq': continue
         if asset['source'] == 'fred': d[asset['id']] = get_fred(asset['symbol'])
@@ -151,12 +145,10 @@ def fetch_master_data_logic():
         
     return d, meta_info
 
-# 로딩 표시
-with st.spinner("📡 데이터 수신 중... (최초 1회만 소요됩니다)"):
-    raw, meta = fetch_master_data_logic()
+with st.spinner("📡 데이터 수신 중..."): raw, meta = fetch_master_data_logic()
 
 # -----------------------------------------------------------
-# [FUNC 1] Risk Radar Logic
+# [FUNC 1] Risk Radar
 # -----------------------------------------------------------
 def check_risk_radar(hy_series):
     if hy_series.empty: return None
@@ -175,10 +167,11 @@ def check_risk_radar(hy_series):
     return {"val": last_val, "daily_chg_bps": daily_chg_bps, "status": status, "color": color, "msg": msg}
 
 # -----------------------------------------------------------
-# [FUNC 2] Quant Engine (Ratio-Based Z-Gap)
+# [FUNC 2] Quant Engine (Structural Lag + Volatility Scaled Gap)
 # -----------------------------------------------------------
 def run_quant_analysis_pure(liq_series_raw, asset_series_raw, manual_lag_days):
     try:
+        # 전처리
         liq_weekly = liq_series_raw.resample('W-WED').last().interpolate(limit_direction='both')
         asset_weekly = asset_series_raw.resample('W-WED').last().interpolate(limit_direction='both')
         
@@ -186,21 +179,24 @@ def run_quant_analysis_pure(liq_series_raw, asset_series_raw, manual_lag_days):
         df.columns = ['L_Raw', 'P_Raw']
         if len(df) < 52: return None
 
-        # Core A: Lag Detection (Momentum)
-        df['L_YoY'] = df['L_Raw'].pct_change(52).replace([np.inf, -np.inf], np.nan)
-        df['P_YoY'] = df['P_Raw'].pct_change(52).replace([np.inf, -np.inf], np.nan)
+        # -------------------------------------------------------
+        # Phase 1: Robust Lag Detection (Heavy Smoothed YoY)
+        # -------------------------------------------------------
+        # 노이즈를 죽이기 위해 Rolling 8주(2달) 적용
+        df['L_YoY'] = df['L_Raw'].pct_change(52).rolling(8).mean().dropna()
+        df['P_YoY'] = df['P_Raw'].pct_change(52).rolling(8).mean().dropna()
         
-        L_YoY_Smooth = df['L_YoY'].rolling(4).mean()
-        P_YoY_Smooth = df['P_YoY'].rolling(4).mean()
-        df_corr = pd.concat([L_YoY_Smooth, P_YoY_Smooth], axis=1).dropna()
-        df_corr.columns = ['L', 'P']
-        
+        df_corr = df[['L_YoY', 'P_YoY']].dropna()
         best_lag_weeks, best_corr = 0, -1.0
+        
+        # 4주 ~ 52주 탐색 (너무 짧은건 무시)
         for lag in range(4, 53): 
-            corr = df_corr['P'].corr(df_corr['L'].shift(lag))
+            corr = df_corr['P_YoY'].corr(df_corr['L_YoY'].shift(lag))
             if corr > best_corr: best_corr, best_lag_weeks = corr, lag
 
-        # Core B: Ratio Z-Gap
+        # -------------------------------------------------------
+        # Phase 2: Volatility Scaled Z-Gap (The FIX for Chart)
+        # -------------------------------------------------------
         if manual_lag_days != 0:
             calc_lag_weeks = int(manual_lag_days / 7)
             used_mode = "Manual"
@@ -208,29 +204,35 @@ def run_quant_analysis_pure(liq_series_raw, asset_series_raw, manual_lag_days):
             calc_lag_weeks = best_lag_weeks
             used_mode = "Auto"
             
-        df['L_Raw_Shifted'] = df['L_Raw'].shift(calc_lag_weeks)
-        df_calc = df.dropna()
+        # 1. Log 변환 및 Z-Score (개별)
+        df['L_Log'] = np.log(df['L_Raw'])
+        df['P_Log'] = np.log(df['P_Raw'])
         
-        # Ratio Calculation
-        df_calc['Valuation_Ratio'] = np.log(df_calc['P_Raw']) - np.log(df_calc['L_Raw_Shifted'])
+        # 전체 기간 평균/표준편차로 정규화 (중요: 여기서 스케일링이 됨)
+        # 이렇게 하면 유동성의 변동폭이 가격의 변동폭과 비슷한 수준으로 맞춰짐
+        df['L_Z_Norm'] = (df['L_Log'] - df['L_Log'].mean()) / (df['L_Log'].std() + 1e-9)
+        df['P_Z_Norm'] = (df['P_Log'] - df['P_Log'].mean()) / (df['P_Log'].std() + 1e-9)
         
-        ratio_mean = df_calc['Valuation_Ratio'].mean()
-        ratio_std = df_calc['Valuation_Ratio'].std()
+        # 2. Lag 적용
+        df['L_Z_Shifted'] = df['L_Z_Norm'].shift(calc_lag_weeks)
         
-        df_calc['Z_Gap'] = (df_calc['Valuation_Ratio'] - ratio_mean) / (ratio_std + 1e-9)
+        # 3. Z-Gap 계산 (Price Z - Liquidity Z)
+        # 이제 두 변수의 스케일이 맞으므로, 단순 차이도 의미를 가짐
+        # 이것이 "Ratio Z-Score"와 수학적으로 유사하지만 시각적으로 더 명확함
+        df['Z_Gap'] = df['P_Z_Norm'] - df['L_Z_Shifted']
         
-        last_val = df_calc.iloc[-1]
+        last_val = df.iloc[-1]
         gap_z = last_val['Z_Gap']
         
+        # Regime Check
         if best_corr < 0: regime = "Inverse"
         elif gap_z > 1.5: regime = "Overheat"
         elif gap_z < -1.5: regime = "Undervalued"
         else: regime = "Fair"
         
-        # Recent Correlation (Visual check)
-        df_calc['P_Z'] = (np.log(df_calc['P_Raw']) - np.log(df_calc['P_Raw']).mean()) / np.log(df_calc['P_Raw']).std()
-        df_calc['L_Z_S'] = (np.log(df_calc['L_Raw_Shifted']) - np.log(df_calc['L_Raw_Shifted']).mean()) / np.log(df_calc['L_Raw_Shifted']).std()
-        recent_corr = df_calc['P_Z'].iloc[-8:].corr(df_calc['L_Z_S'].iloc[-8:])
+        # Correlation Verification
+        df_recent = df.iloc[-12:] # 최근 3달
+        recent_corr = df_recent['P_Z_Norm'].corr(df_recent['L_Z_Shifted'])
 
         return {
             "optimal_lag": best_lag_weeks * 7, 
@@ -292,7 +294,7 @@ try:
                 except: continue
         df_m = df_m.fillna(method='ffill')
 
-        # G3 & M2 Calc
+        # Global M2 Calc
         s_m2_us, s_m3_eu, s_m3_jp = df_m.get('m2_us'), df_m.get('m3_eu'), df_m.get('m3_jp')
         if s_m2_us is not None and s_m3_eu is not None and s_m3_jp is not None:
             global_m2_sum = (s_m2_us/1000) + ((s_m3_eu * df_m.get('eur_usd', 1))/1e12) + ((s_m3_jp / df_m.get('usd_jpy', 1))/1e12)
@@ -314,7 +316,6 @@ try:
         df_m['Fed_Net_Tril'] = (df_m.get('fed',0)/1000 - df_m.get('tga',0)/1000 - df_m.get('rrp',0)/1000000)
         df_m['Fed_Net_YoY'] = df_m['Fed_Net_Tril'].pct_change(52) * 100
 
-    # 1. 상단 Radar
     st.markdown("### ⚡ Integrated Risk Radar")
     r_cols = st.columns(2)
 
@@ -331,10 +332,11 @@ try:
                     else: st.error(f"{risk_res['msg']}")
 
     if 'btc' in raw and not raw['btc'].empty and not df_m['Global_M2_Tril'].empty:
+        # Raw Level Data 전달
         m2_res = run_quant_analysis_pure(df_m['Global_M2_Tril'], raw['btc'], shift_days)
         if m2_res:
             with r_cols[1]:
-                st.markdown("#### 🌊 Liquidity Z-Gap (Ratio)")
+                st.markdown("#### 🌊 Liquidity Z-Gap (Scaled)")
                 c1, c2 = st.columns([1.5, 2])
                 with c1:
                     gap_state = "High" if m2_res['gap_z'] > 1.0 else ("Low" if m2_res['gap_z'] < -1.0 else "Fair")
@@ -347,7 +349,7 @@ try:
                     elif "Fair" in regime: st.info(f"⚪ 적정\n({lag_msg})")
                     else: st.warning(f"⚠️ {regime}\n({lag_msg})")
     
-    # 2. Z-Gap Chart (Ratio)
+    # Z-Gap Chart (Updated Logic: Scaled Gap)
     st.markdown("#### 🌊 Z-Gap Trend Monitor (All Selected Assets)")
     target_z_assets = [a['id'] for a in ASSETS_CONFIG if selected_assets[a['id']] and a['id'] != 'hy_spread']
     z_chart_data = {}
@@ -357,23 +359,25 @@ try:
             asset_series = raw[t_asset]
             res = run_quant_analysis_pure(df_m['Global_M2_Tril'], asset_series, shift_days)
             if res:
+                # 함수 내부 로직과 동일하게 구현하여 차트 데이터 생성
                 l_weekly = df_m['Global_M2_Tril'].resample('W-WED').last().interpolate()
                 p_weekly = asset_series.resample('W-WED').last().interpolate()
                 df_z = pd.concat([l_weekly, p_weekly], axis=1).dropna()
                 df_z.columns = ['L', 'P']
                 
+                # Log & Normalize
+                df_z['L_Log'] = np.log(df_z['L'])
+                df_z['P_Log'] = np.log(df_z['P'])
+                
+                df_z['L_Z'] = (df_z['L_Log'] - df_z['L_Log'].mean()) / (df_z['L_Log'].std() + 1e-9)
+                df_z['P_Z'] = (df_z['P_Log'] - df_z['P_Log'].mean()) / (df_z['P_Log'].std() + 1e-9)
+                
                 lag_weeks = int(res['calc_lag'] / 7)
-                df_z['L_Shifted'] = df_z['L'].shift(lag_weeks)
-                df_calc = df_z.dropna()
+                df_z['L_Z_Shifted'] = df_z['L_Z'].shift(lag_weeks)
                 
-                # Ratio Log
-                df_calc['Valuation_Ratio'] = np.log(df_calc['P']) - np.log(df_calc['L_Shifted'])
-                
-                # Z-Score of Ratio
-                df_calc['Ratio_Smooth'] = df_calc['Valuation_Ratio'].rolling(4).mean()
-                mean_val = df_calc['Ratio_Smooth'].mean()
-                std_val = df_calc['Ratio_Smooth'].std()
-                z_chart_data[t_asset] = ((df_calc['Ratio_Smooth'] - mean_val) / (std_val + 1e-9)).dropna()
+                # Z-Gap (Difference of Normalized Z-Scores)
+                df_z['Gap_Z'] = df_z['P_Z'] - df_z['L_Z_Shifted']
+                z_chart_data[t_asset] = df_z['Gap_Z'].dropna()
 
     if z_chart_data:
         fig_z = go.Figure()
@@ -396,7 +400,7 @@ try:
         st.markdown("""
         | 구간 (Sigma) | 상태 | 의미 (Meaning) | 행동 요령 (Action) |
         | :--- | :--- | :--- | :--- |
-        | **+1.5 이상** | 🔴 **High (과열)** | 유동성 대비 가격 비율이 역사적 고점. | **매도/관망** |
+        | **+1.5 이상** | 🔴 **High (과열)** | 유동성 대비 가격이 너무 높음. | **매도/관망** |
         | **+1.0 ~ +1.5** | 🟠 **Warn (주의)** | 가격이 유동성을 앞서가기 시작함. | 추격 매수 자제 |
         | **-1.0 ~ +1.0** | ⚪ **Fair (적정)** | 가격과 유동성이 **적정 비율** 유지 중. | **추세 추종 (Hold)** |
         | **-1.5 ~ -1.0** | 🔵 **Low (기회)** | 돈은 풀렸는데 가격이 저평가됨. | **분할 매수 (Buy)** |
@@ -405,7 +409,6 @@ try:
 
     st.divider()
 
-    # 3. Main Chart
     if not raw.get('fed', pd.Series()).empty:
         def apply_shift(s, days):
             if s.empty: return pd.Series(dtype=float)
@@ -480,29 +483,8 @@ try:
         st.plotly_chart(fig, use_container_width=True, key="main_chart")
 
         st.markdown("---")
-        st.subheader("📉 Crash Simulation (Stress Test)")
-        st.caption(f"기간: **{sim_start_date} ~ {sim_end_date}** | 감지 조건: Spread Spike **≥ {spike_threshold} bps**")
-        if 'hy_spread' in raw and 'btc' in raw:
-            res_df = run_stress_test(raw['hy_spread'], raw['btc'], spike_threshold, look_forward_days, sim_start_date, sim_end_date)
-            if not res_df.empty:
-                success_cases = res_df[res_df['Raw_Return'] < 0]
-                fail_cases = res_df[res_df['Raw_Return'] >= 0]
-                total_sigs = len(res_df)
-                success_rate = (len(success_cases) / total_sigs) * 100
-                avg_saved = success_cases['Raw_Return'].mean() if not success_cases.empty else 0
-                avg_missed = fail_cases['Raw_Return'].mean() if not fail_cases.empty else 0
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("위험 감지 횟수", f"{total_sigs} 회")
-                c2.metric("방어 확률 (Win Rate)", f"{success_rate:.1f}%")
-                c3.metric("평균 방어 수익률", f"{avg_saved:.2f}%")
-                c4.metric("평균 기회비용", f"{avg_missed:.2f}%")
-                st.dataframe(res_df[['Date', 'Spike', 'BTC Return', 'Outcome']].style.map(lambda x: 'color: #00FF7F' if '성공' in str(x) else ('color: #FF4500' if '휩쏘' in str(x) else ''), subset=['Outcome']), use_container_width=True)
-            else:
-                st.info(f"선택하신 기간 동안 감지된 위험 신호가 없습니다.")
-
-        st.markdown("---")
         st.subheader("🛰️ Matrix Quant Analytics")
-        st.caption("비교 기준: Ratio-Based Z-Gap (P/L Valuation)")
+        st.caption("비교 기준: Scaled Levels")
         
         if active_assets:
             asset_tabs = st.tabs([f"{a['name']}" for a in active_assets])
