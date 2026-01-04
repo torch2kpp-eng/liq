@@ -12,10 +12,10 @@ from datetime import date, timedelta
 
 # 1. 환경 설정
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="GM Macro Filter", layout="wide")
+st.set_page_config(page_title="GM Momentum Core", layout="wide")
 
 st.title("🏛️ Grand Master: Analytics Engine")
-st.caption("Ver 20.2 | Macro Filter 적용 | 최소 4주(28일) 이상 시차만 탐색하여 '7일 노이즈' 제거")
+st.caption("Ver 20.3 | Momentum Correlation | 변곡점(Turning Point) 기반 정밀 시차 산출 | 노이즈 제거")
 
 # -----------------------------------------------------------
 # [사이드바 설정]
@@ -189,7 +189,7 @@ def check_risk_radar(hy_series):
     return {"val": last_val, "daily_chg_bps": daily_chg_bps, "status": status, "color": color, "msg": msg}
 
 # -----------------------------------------------------------
-# [FUNC 2] Quant Engine (With Macro Filter)
+# [FUNC 2] Quant Engine (The Momentum Fix)
 # -----------------------------------------------------------
 def run_quant_analysis_pure(liq_series_raw, asset_series_raw, manual_lag_days):
     try:
@@ -203,35 +203,41 @@ def run_quant_analysis_pure(liq_series_raw, asset_series_raw, manual_lag_days):
         if len(df) < 52: return None
 
         # -------------------------------------------------------
-        # Core A: Lag Detection (YoY + Macro Filter)
-        # -------------------------------------------------------
-        df['L_YoY'] = df['L_Raw'].pct_change(52).replace([np.inf, -np.inf], np.nan)
-        df['P_YoY'] = df['P_Raw'].pct_change(52).replace([np.inf, -np.inf], np.nan)
-        
-        # Smoothing
-        L_YoY_Smooth = df['L_YoY'].rolling(4).mean()
-        P_YoY_Smooth = df['P_YoY'].rolling(4).mean()
-        
-        df_corr = pd.concat([L_YoY_Smooth, P_YoY_Smooth], axis=1).dropna()
-        df_corr.columns = ['L', 'P']
-        
-        best_lag_weeks, best_corr = 0, -1.0
-        
-        # [Macro Filter] 4주(28일) 미만의 시차는 경제적 노이즈로 간주하고 무시함
-        # Start searching from lag=4 instead of lag=0
-        for lag in range(4, 53): 
-            corr = df_corr['P'].corr(df_corr['L'].shift(lag))
-            if corr > best_corr: best_corr, best_lag_weeks = corr, lag
-
-        # -------------------------------------------------------
-        # Core B: Z-Gap Calculation (Log Level)
+        # Core: Prepare Z-Score Levels
         # -------------------------------------------------------
         df['L_Log'] = np.log(df['L_Raw'])
         df['P_Log'] = np.log(df['P_Raw'])
         
-        df['L_Z'] = (df['L_Log'] - df['L_Log'].mean()) / (df['L_Log'].std() + 1e-9)
-        df['P_Z'] = (df['P_Log'] - df['P_Log'].mean()) / (df['P_Log'].std() + 1e-9)
+        # Log Level Smoothing
+        df['L_Smooth'] = df['L_Log'].rolling(4).mean()
+        df['P_Smooth'] = df['P_Log'].rolling(4).mean()
+        df = df.dropna()
         
+        # Z-Score (Levels) - "위치 에너지"
+        df['L_Z'] = (df['L_Smooth'] - df['L_Smooth'].mean()) / (df['L_Smooth'].std() + 1e-9)
+        df['P_Z'] = (df['P_Smooth'] - df['P_Smooth'].mean()) / (df['P_Smooth'].std() + 1e-9)
+
+        # -------------------------------------------------------
+        # [NEW] Momentum Extraction for Lag Detection
+        # "Z-Score의 변화량(미분)"을 사용하여 상관분석
+        # -------------------------------------------------------
+        # 1차 차분 (Velocity) + 4주 스무딩 = "추세적 모멘텀"
+        # 이렇게 하면 '단순 상승 추세'가 제거되고 '변곡점'이 드러남
+        df['L_Mom'] = df['L_Z'].diff().rolling(4).mean()
+        df['P_Mom'] = df['P_Z'].diff().rolling(4).mean()
+        
+        df_corr = df[['L_Mom', 'P_Mom']].dropna()
+        
+        best_lag_weeks, best_corr = 0, -1.0
+        
+        # 최소 1주 이상 탐색
+        for lag in range(1, 53): 
+            corr = df_corr['P_Mom'].corr(df_corr['L_Mom'].shift(lag))
+            if corr > best_corr: best_corr, best_lag_weeks = corr, lag
+
+        # -------------------------------------------------------
+        # Final Calculation
+        # -------------------------------------------------------
         if manual_lag_days != 0:
             calc_lag_weeks = int(manual_lag_days / 7)
             used_mode = "Manual"
@@ -239,11 +245,13 @@ def run_quant_analysis_pure(liq_series_raw, asset_series_raw, manual_lag_days):
             calc_lag_weeks = best_lag_weeks
             used_mode = "Auto"
         
+        # Lag 적용 (Levels에 적용)
         df['L_Z_Shifted'] = df['L_Z'].shift(calc_lag_weeks)
         
         last_val = df.iloc[-1]
         gap_z = last_val['P_Z'] - last_val['L_Z_Shifted']
         
+        # 최근 상관관계 (레벨 기준)
         df_recent = df.iloc[-8:]
         recent_corr = df_recent['P_Z'].corr(df_recent['L_Z_Shifted'])
         
