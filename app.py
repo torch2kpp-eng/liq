@@ -12,16 +12,15 @@ from datetime import date, timedelta
 
 # 1. 환경 설정
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="GM Complete", layout="wide")
+st.set_page_config(page_title="GM PnL Validator", layout="wide")
 
 st.title("🏛️ Grand Master: Analytics Engine")
-st.caption("Ver 19.1 | 통합 완전판 | Stress Test 버그 수정 | M2 로직 포함 | 모든 기능 활성화")
+st.caption("Ver 19.2 | 손익비(Payoff) 검증 로직 추가 | 단순 승률 너머 '방어 효율' 분석")
 
 # -----------------------------------------------------------
 # [사이드바 설정]
 # -----------------------------------------------------------
 st.sidebar.header("⚙️ Control Panel")
-
 is_mobile = st.sidebar.checkbox("📱 모바일 모드 (축 공간 최소화)", value=True)
 
 # [Stress Test 옵션]
@@ -52,8 +51,7 @@ liq_option = st.sidebar.radio(
 st.sidebar.markdown("---")
 st.sidebar.write("2. Time Shift (Days)")
 shift_days = st.sidebar.number_input(
-    "자산/지표 이동 (일)", min_value=-365, max_value=365, value=90, step=7,
-    help="자산 가격과 스프레드 지표를 과거/미래로 이동시켜 유동성과 비교합니다."
+    "자산/지표 이동 (일)", min_value=-365, max_value=365, value=90, step=7
 )
 
 st.sidebar.markdown("---")
@@ -85,7 +83,6 @@ def fetch_master_data_logic():
     GLOBAL_START = time.time()
     MAX_EXECUTION_TIME = 30 
     
-    # [설정] Stress Test를 위해 2018년부터 로드
     START_YEAR = 2018 
     headers = {'User-Agent': 'Mozilla/5.0'}
 
@@ -156,7 +153,6 @@ def fetch_master_data_logic():
         'nasdaq_fred': 'NASDAQCOM'
     }
     
-    # 매크로 데이터 로드
     for k, v in fred_ids.items():
         if check_timeout(): break
         d[k] = get_fred(v)
@@ -164,7 +160,6 @@ def fetch_master_data_logic():
     if not d.get('nasdaq_fred', pd.Series()).empty: d['nasdaq'] = d['nasdaq_fred']
     else: d['nasdaq'] = get_yahoo("^IXIC")
 
-    # 개별 자산 로드
     active_ids = [a['id'] for a in ASSETS_CONFIG if selected_assets[a['id']]]
     for asset in ASSETS_CONFIG:
         if asset['id'] not in active_ids: continue
@@ -216,37 +211,28 @@ def check_risk_radar(hy_series):
     }
 
 # -----------------------------------------------------------
-# [FUNC 2] Stress Test Simulator (FIXED)
+# [FUNC 2] Stress Test (With PnL Calc)
 # -----------------------------------------------------------
 def run_stress_test(hy_series, btc_series, threshold_bps, look_forward):
     try:
-        # [CRITICAL FIX] 인덱스를 날짜(자정) 기준으로 정렬하여 교집합 확보
         hy = hy_series.copy()
         btc = btc_series.copy()
-        
         hy.index = hy.index.normalize()
         btc.index = btc.index.normalize()
         
-        # 교집합 데이터프레임 생성
         df = pd.concat([hy, btc], axis=1).dropna()
         df.columns = ['Spread', 'Price']
         
         if df.empty: return pd.DataFrame()
         
-        # 일일 변동폭 계산 (bps)
         df['Spread_Chg_Bps'] = df['Spread'].diff() * 100
-        
-        # 이벤트 감지
         events = df[df['Spread_Chg_Bps'] >= threshold_bps].index
         
         results = []
         for date in events:
             target_date = date + timedelta(days=look_forward)
-            
-            # 미래 데이터가 있는지 확인
             if target_date <= df.index[-1]:
                 price_at_signal = df.loc[date]['Price']
-                # target_date 이후 가장 가까운 날짜의 가격
                 future_data = df[df.index >= target_date]
                 
                 if not future_data.empty:
@@ -258,17 +244,17 @@ def run_stress_test(hy_series, btc_series, threshold_bps, look_forward):
                     results.append({
                         "Date": date.strftime("%Y-%m-%d"),
                         "Spike": f"+{df.loc[date]['Spread_Chg_Bps']:.1f} bps",
-                        "BTC Return": f"{price_chg_pct:+.2f}%",
+                        "Raw_Return": price_chg_pct, # 계산용 원본 수치
+                        "BTC Return": f"{price_chg_pct:+.2f}%", # 표시용
                         "Outcome": outcome
                     })
         
         return pd.DataFrame(results).sort_values("Date", ascending=False)
-        
     except Exception:
         return pd.DataFrame()
 
 # -----------------------------------------------------------
-# [FUNC 3] Quant Analytics (Pure Calc)
+# [FUNC 3] Quant Analytics
 # -----------------------------------------------------------
 def run_quant_analysis_pure(liq_series, asset_series_daily):
     try:
@@ -317,7 +303,6 @@ def run_quant_analysis_pure(liq_series, asset_series_daily):
 # Main Logic
 # -----------------------------------------------------------
 try:
-    # 1. 상단: Risk Radar Display
     if 'hy_spread' in raw and not raw['hy_spread'].empty:
         risk_res = check_risk_radar(raw['hy_spread'])
         if risk_res:
@@ -332,7 +317,6 @@ try:
                 else: st.error("위험 (Risk-Off)")
             st.divider()
 
-    # 2. 데이터 처리
     if not raw.get('fed', pd.Series()).empty:
         base_idx = raw['fed'].resample('W-WED').last().index
         df_m = pd.DataFrame(index=base_idx)
@@ -355,7 +339,7 @@ try:
             df_m['G3_Asset_YoY'] = df_m['G3_Asset_Tril'].pct_change(52) * 100
         else: df_m['G3_Asset_YoY'] = pd.Series(dtype=float)
 
-        # Global M2 Calc (NaN Safe)
+        # Global M2 Calc
         s_m2_us, s_m3_eu, s_m3_jp = df_m.get('m2_us'), df_m.get('m3_eu'), df_m.get('m3_jp')
         if s_m2_us is not None and s_m3_eu is not None and s_m3_jp is not None:
             m2_us = s_m2_us / 1000
@@ -370,7 +354,7 @@ try:
         df_m['Fed_Net_Tril'] = (df_m.get('fed',0)/1000 - df_m.get('tga',0)/1000 - df_m.get('rrp',0)/1000000)
         df_m['Fed_Net_YoY'] = df_m['Fed_Net_Tril'].pct_change(52) * 100
 
-        # Shift Logic
+        # Shift
         def apply_shift(s, days):
             if s.empty: return pd.Series(dtype=float)
             new_s = s.copy()
@@ -384,7 +368,7 @@ try:
                 processed[asset['id']] = apply_shift(s, shift_days)
             else: processed[asset['id']] = pd.Series(dtype=float)
 
-        # 3. Chart
+        # Chart
         st.subheader(f"📊 Integrated Strategy Chart (Shift: {shift_days}d)")
         
         start_viz = pd.to_datetime('2021-06-01') 
@@ -464,29 +448,36 @@ try:
 
         st.plotly_chart(fig, use_container_width=True, key="main_chart")
 
-        # 4. Stress Test (시뮬레이션)
+        # 4. Stress Test
         st.markdown("---")
         st.subheader("📉 Crash Simulation (Stress Test)")
         st.caption(f"가정: HY Spread가 하루에 **{spike_threshold} bps 이상 급등**하면 즉시 매도 후 **{look_forward_days}일간 관망**했다면?")
 
         if 'hy_spread' in raw and 'btc' in raw:
-            # 원본(Shift 안 된) 데이터를 사용하여 시뮬레이션
             res_df = run_stress_test(raw['hy_spread'], raw['btc'], spike_threshold, look_forward_days)
             
             if not res_df.empty:
+                # [수정] 방어 성공 시 평균 방어율(수익률이 마이너스인 것들의 평균) 계산
+                success_cases = res_df[res_df['Raw_Return'] < 0]
+                fail_cases = res_df[res_df['Raw_Return'] >= 0]
+                
                 total_sigs = len(res_df)
-                success_sigs = len(res_df[res_df['Outcome'].str.contains("성공")])
-                success_rate = (success_sigs / total_sigs) * 100
+                success_rate = (len(success_cases) / total_sigs) * 100
                 
-                c1, c2, c3 = st.columns(3)
-                c1.metric("총 위험 신호 발생", f"{total_sigs} 회")
-                c2.metric("하락 방어 성공률", f"{success_rate:.1f}%")
+                avg_saved = success_cases['Raw_Return'].mean() if not success_cases.empty else 0
+                avg_missed = fail_cases['Raw_Return'].mean() if not fail_cases.empty else 0
                 
-                st.dataframe(res_df.style.map(lambda x: 'color: #00FF7F' if '성공' in str(x) else ('color: #FF4500' if '휩쏘' in str(x) else ''), subset=['Outcome']), use_container_width=True)
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("총 위험 신호", f"{total_sigs} 회")
+                c2.metric("하락 방어 확률", f"{success_rate:.1f}%")
+                c3.metric("평균 방어 수익률", f"{avg_saved:.2f}%", help="위기 감지 성공 시, 평균적으로 이만큼의 하락을 피했습니다.")
+                c4.metric("평균 기회비용", f"{avg_missed:.2f}%", help="위기 감지 실패(휩쏘) 시, 평균적으로 이만큼의 상승을 놓쳤습니다.")
+                
+                st.dataframe(res_df[['Date', 'Spike', 'BTC Return', 'Outcome']].style.map(lambda x: 'color: #00FF7F' if '성공' in str(x) else ('color: #FF4500' if '휩쏘' in str(x) else ''), subset=['Outcome']), use_container_width=True)
             else:
                 st.info(f"설정하신 민감도({spike_threshold} bps)로는 감지된 위험 신호가 없습니다.")
 
-        # 5. Quant Analytics (Matrix)
+        # 5. Quant Analytics
         st.markdown("---")
         st.subheader("🛰️ Matrix Quant Analytics")
         st.caption("비교 기준: Historical (2021~, 전체 역사) ↔ Recent (Last 30d, 최근 1달)")
