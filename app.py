@@ -12,10 +12,10 @@ from datetime import date, timedelta
 
 # 1. 환경 설정
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="GM Sync Master", layout="wide")
+st.set_page_config(page_title="GM Hybrid Lag", layout="wide")
 
 st.title("🏛️ Grand Master: Analytics Engine")
-st.caption("Ver 19.8 | Z-Gap Shift 동기화 | 사이드바 설정 실시간 반영 | 정밀 퀀트 연산")
+st.caption("Ver 19.9 | Hybrid Lag System | 0일 설정 시 '자산별 최적 시차' 자동 적용 | 수동/자동 겸용")
 
 # -----------------------------------------------------------
 # [사이드바 설정]
@@ -54,7 +54,7 @@ st.sidebar.markdown("---")
 st.sidebar.write("2. Time Shift (Days)")
 shift_days = st.sidebar.number_input(
     "자산/지표 이동 (일)", min_value=-365, max_value=365, value=112, step=7,
-    help="설정한 일수만큼 유동성 지표를 이동시켜 Z-Gap을 계산합니다."
+    help="0으로 설정하면 각 자산별로 가장 적합한 시차(Optimal Lag)를 자동으로 찾아 적용합니다."
 )
 
 st.sidebar.markdown("---")
@@ -201,7 +201,7 @@ def check_risk_radar(hy_series):
     return {"val": last_val, "daily_chg_bps": daily_chg_bps, "status": status, "color": color, "msg": msg}
 
 # -----------------------------------------------------------
-# [FUNC 2] Quant Engine
+# [FUNC 2] Quant Engine (Hybrid Shift)
 # -----------------------------------------------------------
 def run_quant_analysis_pure(liq_series, asset_series_daily, manual_lag_days):
     try:
@@ -219,15 +219,21 @@ def run_quant_analysis_pure(liq_series, asset_series_daily, manual_lag_days):
         df['L_Z'] = (df['L_Smooth'] - df['L_Smooth'].mean()) / (df['L_Smooth'].std() + 1e-9)
         df['P_Z'] = (df['P_Smooth'] - df['P_Smooth'].mean()) / (df['P_Smooth'].std() + 1e-9)
 
-        # 1. Optimal Lag 찾기
+        # 1. Optimal Lag 찾기 (상관계수가 가장 높은 지점)
         best_lag_weeks, best_corr = 0, -1.0
         for lag in range(0, 53): 
             corr = df['P_Z'].corr(df['L_Z'].shift(lag))
             if corr > best_corr: best_corr, best_lag_weeks = corr, lag
         
-        # 2. Z-Gap 계산은 사용자가 설정한 manual_lag_days를 따름 (일관성)
-        # 단, manual_lag가 0이면 best_lag를 씀
-        calc_lag_weeks = int(manual_lag_days / 7) if manual_lag_days > 0 else best_lag_weeks
+        # 2. [핵심] Hybrid Shift Logic
+        # manual_lag_days가 0이 아니면 -> 사용자 설정값 강제 적용 (시나리오 모드)
+        # manual_lag_days가 0이면 -> 최적 시차(best_lag) 자동 적용 (오토파일럿)
+        if manual_lag_days != 0:
+            calc_lag_weeks = int(manual_lag_days / 7)
+            used_mode = "Manual"
+        else:
+            calc_lag_weeks = best_lag_weeks
+            used_mode = "Auto"
         
         df['L_Z_Shifted'] = df['L_Z'].shift(calc_lag_weeks)
         df_recent = df.iloc[-4:]
@@ -243,8 +249,9 @@ def run_quant_analysis_pure(liq_series, asset_series_daily, manual_lag_days):
         else: regime = "Weak"
 
         return {
-            "optimal_lag": best_lag_weeks * 7, # 최적 시차는 정보로 제공
-            "calc_lag": calc_lag_weeks * 7,    # 실제 계산에 쓴 시차
+            "optimal_lag": best_lag_weeks * 7, 
+            "calc_lag": calc_lag_weeks * 7,    
+            "mode": used_mode,
             "global_corr": best_corr,
             "recent_corr": recent_corr,
             "gap_z": gap_z, 
@@ -341,7 +348,7 @@ try:
 
     # [Radar 2] M2 Divergence
     if 'btc' in raw and not raw['btc'].empty and not df_m['Global_M2_YoY'].empty:
-        # manual_lag_days를 전달하여 계산
+        # manual_lag_days를 전달
         m2_res = run_quant_analysis_pure(df_m['Global_M2_YoY'], raw['btc'], shift_days)
         if m2_res:
             with r_cols[1]:
@@ -352,24 +359,27 @@ try:
                     st.metric("Z-Gap", f"{m2_res['gap_z']:+.2f} σ", gap_state, delta_color="inverse")
                 with c2:
                     regime = m2_res['regime']
-                    if "Sync" in regime: st.success(f"🟢 동행 (Sync)")
-                    elif "Divergence" in regime: st.warning(f"⚠️ 이탈 (Divergence)")
-                    elif "Inverse" in regime: st.error(f"📉 역상관 (Inverse)")
-                    else: st.info(f"⚪ 약세 (Weak)")
+                    
+                    # 사용된 Lag 모드 표시 (중요)
+                    lag_msg = f"Lag: {m2_res['calc_lag']}d ({m2_res['mode']})"
+                    
+                    if "Sync" in regime: st.success(f"🟢 동행\n({lag_msg})")
+                    elif "Divergence" in regime: st.warning(f"⚠️ 이탈\n({lag_msg})")
+                    elif "Inverse" in regime: st.error(f"📉 역상관\n({lag_msg})")
+                    else: st.info(f"⚪ 약세\n({lag_msg})")
     
-    # [NEW] Z-Gap Trend Chart (Synced with Shift Days)
+    # [NEW] Z-Gap Trend Chart (Synced with Logic)
     st.markdown("#### 🌊 Z-Gap Trend Monitor (All Selected Assets)")
-    st.caption(f"※ 계산 기준: **{shift_days}일 (Shift)** 시차 적용")
     
     target_z_assets = [a['id'] for a in ASSETS_CONFIG if selected_assets[a['id']] and a['id'] != 'hy_spread']
     z_chart_data = {}
     
-    # Z-Gap 계산용 Lag (주 단위)
-    calc_lag_weeks_chart = int(shift_days / 7) if shift_days > 0 else 0
-
     for t_asset in target_z_assets:
         if t_asset in raw and not raw[t_asset].empty and not df_m['Global_M2_YoY'].empty:
             asset_series_daily = raw[t_asset]
+            # 개별 자산에 대해 Hybrid Shift 적용하여 Z-Gap 시리즈 생성
+            # (차트용으로 전체 시계열을 뽑아야 하므로 함수 로직을 풀어서 씀)
+            
             asset_weekly = asset_series_daily.resample('W-WED').last()
             asset_yoy = asset_weekly.pct_change(52) * 100
             df_z = pd.concat([df_m['Global_M2_YoY'], asset_yoy], axis=1).dropna()
@@ -383,14 +393,23 @@ try:
                 df_z['L_Z'] = (df_z['L_Smooth'] - df_z['L_Smooth'].mean()) / (df_z['L_Smooth'].std() + 1e-9)
                 df_z['P_Z'] = (df_z['P_Smooth'] - df_z['P_Smooth'].mean()) / (df_z['P_Smooth'].std() + 1e-9)
                 
-                # [Shift Synced] 사용자가 설정한 Shift Days 적용
-                df_z['L_Z_Shifted'] = df_z['L_Z'].shift(calc_lag_weeks_chart)
+                # Hybrid Shift 결정
+                if shift_days != 0:
+                    final_lag_weeks = int(shift_days / 7)
+                else:
+                    # Auto Mode: 각 자산별 최적 Lag 찾기
+                    best_lag_w, best_r = 0, -1.0
+                    for lg in range(0, 53):
+                        r = df_z['P_Z'].corr(df_z['L_Z'].shift(lg))
+                        if r > best_r: best_r, best_lag_w = r, lg
+                    final_lag_weeks = best_lag_w
+                
+                df_z['L_Z_Shifted'] = df_z['L_Z'].shift(final_lag_weeks)
                 df_z['Gap_Z'] = df_z['P_Z'] - df_z['L_Z_Shifted']
                 z_chart_data[t_asset] = df_z['Gap_Z'].dropna()
 
     if z_chart_data:
         fig_z = go.Figure()
-        
         x_min = min([s.index.min() for s in z_chart_data.values()])
         x_max = max([s.index.max() for s in z_chart_data.values()])
         
@@ -446,6 +465,7 @@ try:
         for asset in ASSETS_CONFIG:
             s = raw.get(asset['id'], pd.Series(dtype=float))
             if isinstance(s.index, pd.DatetimeIndex):
+                # 메인 차트는 항상 설정된 Shift Days를 따름 (0이면 0으로)
                 processed[asset['id']] = apply_shift(s, shift_days)
             else: processed[asset['id']] = pd.Series(dtype=float)
 
@@ -572,7 +592,6 @@ try:
                     if raw_asset_series.empty:
                         st.warning("데이터 부족")
                         continue
-                    # Matrix에서는 항상 Optimal Lag를 찾아서 보여줌 (Manual Lag와 비교 가능)
                     results = []
                     for liq_label, liq_data in liquidity_sources:
                         if liq_data.empty: continue
@@ -590,13 +609,13 @@ try:
                             if res == best_res: st.markdown(f"#### ⭐ {res['label']}")
                             else: st.markdown(f"#### {res['label']}")
                             st.metric("Optimal Lag", f"{res['optimal_lag']} days")
-                            # [NEW] 계산된 Z-Gap이 Manual Shift 기준임을 명시
                             st.metric("Hist. Corr (4y)", f"{res['global_corr']:.2f}")
                             st.metric("Recent Corr (30d)", f"{res['recent_corr']:.2f}", delta=f"{res['recent_corr'] - res['global_corr']:.2f}")
                             regime_icon = "🟢" if "Sync" in res['regime'] else ("⚠️" if "Divergence" in res['regime'] else ("📉" if "Inverse" in res['regime'] else "⚪"))
                             st.metric("Regime", f"{regime_icon} {res['regime']}")
                             gap_state = "High" if res['gap_z'] > 1.0 else ("Low" if res['gap_z'] < -1.0 else "Fair")
                             st.metric("Z-Gap", f"{res['gap_z']:+.2f} σ", gap_state, delta_color="inverse")
+                            st.caption(f"Lag Used: {res['calc_lag']}d ({res['mode']})") # 사용된 Lag 정보 표시
                     if best_res['global_corr'] < 0:
                         insight = f"**{asset['name']}**는 유동성과 **역상관(Inverse)** 관계입니다."
                     else:
