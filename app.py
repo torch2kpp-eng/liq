@@ -12,10 +12,10 @@ from datetime import date
 
 # 1. 환경 설정
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="GM Kraken Link", layout="wide")
+st.set_page_config(page_title="GM Anti-Block", layout="wide")
 
-st.title("🏛️ Grand Master: Kraken XAU/XAG Link")
-st.caption("Ver 14.2 | Gold/Silver 소스 변경 (Kraken XAU/USD, XAG/USD) | 연결 문제 완벽 해결")
+st.title("🏛️ Grand Master: Anti-Block Terminal")
+st.caption("Ver 15.0 | User-Agent 헤더 적용(차단 우회) | Kraken 안전 모드 | 데이터 연결 복구")
 
 # -----------------------------------------------------------
 # [사이드바 설정]
@@ -46,9 +46,9 @@ shift_days = st.sidebar.number_input(
 st.sidebar.markdown("---")
 st.sidebar.write("3. 표시할 자산 (Right Axes)")
 
-# 요청하신 순서: 나스닥, GOLD, SILVER, BTC, DOGE, ETH, LINK, ADA, XRP
+# 나스닥 소스를 'hybrid'로 변경 (FRED 시도 -> 실패시 Yahoo)
 ASSETS_CONFIG = [
-    {'id': 'nasdaq', 'name': 'Nasdaq', 'symbol': 'IXIC',    'source': 'fred',   'color': '#D62780', 'type': 'index',  'default': True},
+    {'id': 'nasdaq', 'name': 'Nasdaq', 'symbol': 'IXIC',    'source': 'hybrid', 'color': '#D62780', 'type': 'index',  'default': True},
     {'id': 'gold',   'name': 'Gold',   'symbol': 'XAU/USD', 'source': 'kraken', 'color': '#FFD700', 'type': 'metal',  'default': True},
     {'id': 'silver', 'name': 'Silver', 'symbol': 'XAG/USD', 'source': 'kraken', 'color': '#C0C0C0', 'type': 'metal',  'default': True},
     {'id': 'btc',    'name': 'BTC',    'symbol': 'BTC/KRW', 'source': 'bithumb','color': '#00FFEE', 'type': 'crypto', 'default': True},
@@ -64,84 +64,137 @@ for asset in ASSETS_CONFIG:
     selected_assets[asset['id']] = st.sidebar.checkbox(f"{asset['name']}", value=asset['default'])
 
 # -----------------------------------------------------------
-# 2. 데이터 수집
+# 2. 데이터 수집 (Anti-Block Logic)
 # -----------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner="글로벌 거래소(Kraken, Bithumb) 및 FRED 연결 중...")
+@st.cache_data(ttl=3600, show_spinner="데이터 보안 접속 및 동기화 중...")
 def fetch_master_data():
     d = {}
     
-    # 거래소 인스턴스 생성
+    # [차단 우회용 헤더] 나는 로봇이 아닙니다
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+
+    # 거래소 인스턴스
     bithumb = ccxt.bithumb({'enableRateLimit': True})
     kraken = ccxt.kraken({'enableRateLimit': True})
     
-    # 공통 OHLCV Fetcher
-    def fetch_ccxt_data(exchange, symbol, since_year=2017):
+    # -------------------------------------------------------
+    # 1. Bithumb Fetcher (Crypto) - 기존 유지
+    # -------------------------------------------------------
+    def fetch_bithumb(symbol_code):
         all_data = []
         try:
-            since = exchange.parse8601(f'{since_year}-01-01T00:00:00Z')
+            since = bithumb.parse8601('2017-01-01T00:00:00Z')
             while True:
-                # Kraken과 Bithumb 모두 1d 캔들 지원
-                ohlcv = exchange.fetch_ohlcv(symbol, '1d', since=since)
+                ohlcv = bithumb.fetch_ohlcv(symbol_code, '1d', since=since, limit=1000)
                 if not ohlcv: break
                 all_data.extend(ohlcv)
-                
-                # 다음 루프를 위한 since 업데이트
                 last_ts = ohlcv[-1][0]
-                # 최신 데이터에 도달했으면 종료 (현재 시간 - 24시간)
                 if last_ts >= (time.time() * 1000) - 86400000: break
-                
                 since = last_ts + 1
-                time.sleep(exchange.rateLimit / 1000)
-                
-                # 안전장치: 너무 많은 루프 방지
-                if len(all_data) > 5000: break
-                
-        except Exception as e:
-            pass # 에러 발생 시 수집된 데이타까지만 반환
-
+                time.sleep(0.05)
+        except: pass
+        
         if not all_data: return pd.Series(dtype=float)
         df = pd.DataFrame(all_data, columns=['timestamp','open','high','low','close','volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        # 중복 제거 및 인덱스 설정
+        return df.drop_duplicates(subset=['timestamp']).set_index('timestamp')['close'].tz_localize(None)
+
+    # -------------------------------------------------------
+    # 2. Kraken Fetcher (Gold/Silver) - 안전 모드 (최근 4년만)
+    # -------------------------------------------------------
+    def fetch_kraken_safe(symbol):
+        all_data = []
+        try:
+            # Kraken API는 루프를 많이 돌면 차단됨.
+            # 전략: limit=720 (약 2년)을 2번만 호출하여 최근 4년 데이터만 빠르게 확보
+            # 1차 시도 (가장 최신)
+            ohlcv_1 = kraken.fetch_ohlcv(symbol, '1d', limit=720) 
+            if ohlcv_1:
+                all_data = ohlcv_1 + all_data # 뒤에 붙임
+                # 2차 시도 (그 이전 2년)
+                first_ts = ohlcv_1[0][0]
+                # since는 ms 단위
+                since_2 = first_ts - (720 * 24 * 60 * 60 * 1000) 
+                # Kraken의 since는 해당 시간 '이후' 데이터를 가져옴.
+                # 정확한 페이징보다는 겹치더라도 데이터를 가져오는게 중요
+                time.sleep(1.0) # 충분한 휴식
+                ohlcv_2 = kraken.fetch_ohlcv(symbol, '1d', since=since_2, limit=720)
+                if ohlcv_2:
+                     # 중복 제거를 위해 DataFrame 변환 후 병합
+                     pass
+                all_data.extend(ohlcv_2)
+
+        except Exception as e:
+            # 에러 나도 지금까지 모은거라도 리턴
+            pass
+            
+        if not all_data: return pd.Series(dtype=float)
+        
+        df = pd.DataFrame(all_data, columns=['timestamp','open','high','low','close','volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        # 중복 제거 및 정렬
         df = df.drop_duplicates(subset=['timestamp']).set_index('timestamp').sort_index()
         return df['close'].tz_localize(None)
 
-    # [A] 자산 데이터 순회 및 수집
-    for asset in ASSETS_CONFIG:
-        if asset['source'] == 'bithumb':
-            d[asset['id']] = fetch_ccxt_data(bithumb, asset['symbol'])
-        elif asset['source'] == 'kraken':
-            # Kraken은 데이터가 빗썸보다 적을 수 있으므로 2010년부터 시도하거나 조절
-            # XAU/USD, XAG/USD
-            d[asset['id']] = fetch_ccxt_data(kraken, asset['symbol'], since_year=2015)
-
-    # [B] FRED Data (Liquidity + Nasdaq)
+    # -------------------------------------------------------
+    # 3. FRED Fetcher (Liquidity + Nasdaq) - 헤더 적용
+    # -------------------------------------------------------
     fred_ids = {
         'fed': 'WALCL', 'tga': 'WTREGEN', 'rrp': 'RRPONTSYD',
         'ecb': 'ECBASSETSW', 'boj': 'JPNASSETS', 
         'm2_us': 'M2SL', 'm3_eu': 'MABMM301EZM189S', 'm3_jp': 'MABMM301JPM189S',
         'eur_usd': 'DEXUSEU', 'usd_jpy': 'DEXJPUS',
-        'nasdaq': 'NASDAQCOM' # Nasdaq은 FRED가 가장 안전
+        'nasdaq_fred': 'NASDAQCOM' 
     }
 
-    def get_fred(id):
+    def get_fred_secure(id):
         try:
             url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={id}"
-            r = requests.get(url, timeout=15)
+            # [핵심] 헤더 추가로 브라우저인 척 위장
+            r = requests.get(url, headers=headers, timeout=10)
             r.raise_for_status()
             df = pd.read_csv(io.StringIO(r.text), index_col=0, parse_dates=True)
             return df.squeeze().resample('D').interpolate(method='time').tz_localize(None)
         except: return pd.Series(dtype=float)
 
-    for key, val in fred_ids.items():
-        d[key] = get_fred(val)
-        
-    # Nasdaq을 자산 딕셔너리에 매핑
-    if 'nasdaq' in d:
-        # FRED 나스닥 데이터를 ASSETS_CONFIG의 ID('nasdaq')와 일치시킴
-        pass # 이미 d['nasdaq']에 들어있음
+    # -------------------------------------------------------
+    # 4. Yahoo Fetcher (Backup for Nasdaq)
+    # -------------------------------------------------------
+    def get_yahoo_backup(ticker):
+        try:
+            import yfinance as yf
+            # yfinance 내부적으로 requests를 쓰는데, 가끔 막힘.
+            # 하지만 FRED가 실패했을 때의 최후의 보루
+            df = yf.download(ticker, period="5y", progress=False, auto_adjust=True)
+            if not df.empty:
+                if 'Close' in df.columns: s = df['Close']
+                else: s = df.iloc[:,0]
+                return s.squeeze().tz_localize(None)
+        except: return pd.Series(dtype=float)
 
-    # [C] Difficulty
+    # === 실행 ===
+    
+    # A. FRED 데이터 수집
+    for key, val in fred_ids.items():
+        d[key] = get_fred_secure(val)
+
+    # B. Nasdaq Hybrid Logic
+    # FRED가 성공했으면 그거 쓰고, 비었으면 Yahoo 시도
+    if not d['nasdaq_fred'].empty:
+        d['nasdaq'] = d['nasdaq_fred']
+    else:
+        d['nasdaq'] = get_yahoo_backup("^IXIC")
+
+    # C. Crypto & Commodities
+    for asset in ASSETS_CONFIG:
+        if asset['source'] == 'bithumb':
+            d[asset['id']] = fetch_bithumb(asset['symbol'])
+        elif asset['source'] == 'kraken':
+            d[asset['id']] = fetch_kraken_safe(asset['symbol'])
+
+    # D. Difficulty
     try:
         with open('difficulty (1).json', 'r', encoding='utf-8') as f:
             js = json.load(f)['difficulty']
@@ -160,7 +213,6 @@ if not raw.get('btc', pd.Series()).empty:
     # --- 유동성 로직 ---
     df_m = pd.DataFrame(index=raw['fed'].resample('W-WED').last().index)
     for k in list(raw.keys()):
-        # 자산 데이터나 diff가 아닌 FRED 데이터만 병합
         if k in ['fed', 'tga', 'rrp', 'ecb', 'boj', 'm2_us', 'm3_eu', 'm3_jp', 'eur_usd', 'usd_jpy']:
             df_m[k] = raw[k].reindex(df_m.index, method='ffill')
 
@@ -211,7 +263,7 @@ if not raw.get('btc', pd.Series()).empty:
 
     # 4. 차트 생성
     st.subheader(f"📊 Integrated Strategy Chart (Shift: {shift_days} days)")
-    start_viz = pd.to_datetime('2018-01-01')
+    start_viz = pd.to_datetime('2019-01-01') # 시각화 시작 시점 (안전하게 2019년)
     def flt(s): return s[s.index >= start_viz] if not s.empty else s
 
     if "Global M2" in liq_option:
@@ -266,7 +318,7 @@ if not raw.get('btc', pd.Series()).empty:
     
     fig = go.Figure(layout=layout)
 
-    # Liquidity
+    # Liquidity Trace
     if not liq_v.empty:
         h = liq_color.lstrip('#')
         rgb = tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
@@ -291,7 +343,6 @@ if not raw.get('btc', pd.Series()).empty:
         d_min, d_max = data.min(), data.max()
         if d_min <= 0: d_min = 0.0001
         
-        # Log Scale 적용 여부: DOGE만 적용
         is_log = (asset['id'] == 'doge')
         
         if is_log:
@@ -339,18 +390,14 @@ if not raw.get('btc', pd.Series()).empty:
 
     st.plotly_chart(fig, use_container_width=True)
     
-    # 데이터 소스 상태 표시
-    with st.expander("🔍 자산 데이터 연결 리포트"):
-        st.write("• **FRED:** Nasdaq (IXIC)")
-        st.write("• **Kraken:** Gold (XAU/USD), Silver (XAG/USD)")
-        st.write("• **Bithumb:** BTC, DOGE, ETH, LINK, ADA, XRP (KRW)")
-        st.markdown("---")
+    # 상태 리포트
+    with st.expander("🔍 데이터 연결 상태"):
         for asset in ASSETS_CONFIG:
             s = processed_assets[asset['id']]
             if s.empty:
                 st.error(f"❌ {asset['name']}: 로드 실패 (Source: {asset['source']})")
             else:
-                st.success(f"✅ {asset['name']}: {len(s)}일 데이터 로드 완료")
+                st.success(f"✅ {asset['name']}: 로드 성공 ({len(s)} rows)")
 
 else:
-    st.error("데이터 로드 실패")
+    st.error("❌ 비트코인(Bithumb) 데이터 로드 실패. 잠시 후 새로고침하세요.")
