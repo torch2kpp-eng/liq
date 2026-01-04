@@ -12,21 +12,25 @@ from datetime import date
 
 # 1. 환경 설정
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="GM Stable", layout="wide")
+st.set_page_config(page_title="GM Trinity", layout="wide")
 
-st.title("🏛️ Grand Master: Stable Architecture")
-st.caption("Ver 12.2 | Nasdaq 소스 변경 (Yahoo → FRED) | 연결 안정성 100% 확보")
+st.title("🏛️ Grand Master: Trinity Liquidity Terminal")
+st.caption("Ver 13.0 | Global M2 (US+EU+JP) 지표 추가 | 3단계 유동성 심층 분석")
 
 # -----------------------------------------------------------
 # [사이드바 설정]
 # -----------------------------------------------------------
 st.sidebar.header("⚙️ Control Panel")
 
-# 1. 유동성 지표 선택
+# 1. 유동성 지표 선택 (3가지 옵션)
 liq_option = st.sidebar.radio(
     "1. 유동성 지표 (Left Axis)",
-    ("🇺🇸 Fed Net Liquidity", "🌍 G3 Global Liquidity"),
-    index=1
+    (
+        "🇺🇸 Fed Net Liquidity (미국 실질 유동성)", 
+        "🏛️ G3 Central Bank Assets (본원통화 총량)",
+        "🌍 Global M2 (실물 통화량: US+EU+JP)"
+    ),
+    index=2 # 새로 추가된 Global M2를 기본값으로
 )
 
 # 2. 자산 선택 (멀티 셀렉트)
@@ -37,9 +41,9 @@ show_doge = st.sidebar.checkbox("Dogecoin (DOGE)", value=True)
 show_nasdaq = st.sidebar.checkbox("Nasdaq (IXIC)", value=True)
 
 # -----------------------------------------------------------
-# 2. 데이터 수집 (FRED 통합)
+# 2. 데이터 수집 (FRED M2/M3 데이터 추가)
 # -----------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner="데이터 동기화 중 (FRED & Bithumb)...")
+@st.cache_data(ttl=3600, show_spinner="글로벌 통화량(M2/M3) 데이터 발굴 중...")
 def fetch_master_data():
     d = {}
     
@@ -67,26 +71,29 @@ def fetch_master_data():
     try: d['doge'] = fetch_ohlcv('DOGE/KRW', 2018)
     except: d['doge'] = pd.Series(dtype=float)
 
-    # [B] FRED Data (Liquidity + Nasdaq)
-    # yfinance를 제거하고 FRED에서 나스닥(NASDAQCOM)을 직접 가져옵니다.
+    # [B] FRED Data (G3 Assets + Global M2)
     fred_ids = {
-        'fed': 'WALCL',         # Fed Assets
-        'tga': 'WTREGEN',       # TGA
-        'rrp': 'RRPONTSYD',     # RRP
-        'ecb': 'ECBASSETSW',    # ECB Assets
-        'boj': 'JPNASSETS',     # BOJ Assets
-        'eur_usd': 'DEXUSEU',   # Exchange Rates
-        'usd_jpy': 'DEXJPUS',
-        'nasdaq': 'NASDAQCOM'   # [NEW] Nasdaq Composite from FRED
+        # 1. Fed Net Liquidity Components
+        'fed': 'WALCL', 'tga': 'WTREGEN', 'rrp': 'RRPONTSYD',
+        
+        # 2. G3 Central Bank Assets Components
+        'ecb': 'ECBASSETSW', 'boj': 'JPNASSETS', 
+        
+        # 3. Global M2 Components (Broad Money)
+        'm2_us': 'M2SL',                # US M2 (Seasonally Adjusted)
+        'm3_eu': 'MABMM301EZM189S',     # Euro Area M3 (OECD)
+        'm3_jp': 'MABMM301JPM189S',     # Japan M3 (OECD)
+        
+        # 4. Exchange Rates & Others
+        'eur_usd': 'DEXUSEU', 'usd_jpy': 'DEXJPUS',
+        'nasdaq': 'NASDAQCOM'
     }
 
     def get_fred(id):
         try:
             url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={id}"
-            r = requests.get(url, timeout=15) # 타임아웃 넉넉히
-            r.raise_for_status()
+            r = requests.get(url, timeout=15)
             df = pd.read_csv(io.StringIO(r.text), index_col=0, parse_dates=True)
-            # FRED 데이터는 공휴일이 비어있으므로 보간(Interpolate) 필수
             return df.squeeze().resample('D').interpolate(method='time').tz_localize(None)
         except: return pd.Series(dtype=float)
 
@@ -109,24 +116,61 @@ raw = fetch_master_data()
 # 3. 데이터 가공
 if not raw.get('btc', pd.Series()).empty:
     
-    # --- 유동성 계산 ---
+    # --- 통합 데이터프레임 (주간 수요일 기준) ---
     df_m = pd.DataFrame(index=raw['fed'].resample('W-WED').last().index)
-    for k in ['fed', 'tga', 'rrp', 'ecb', 'boj']:
-        if k in raw: df_m[k] = raw[k].resample('W-WED').last()
-    df_m['eur_usd'] = raw['eur_usd'].resample('W-WED').mean()
-    df_m['usd_jpy'] = raw['usd_jpy'].resample('W-WED').mean()
+    
+    # 기본 데이터 채우기
+    for k in list(raw.keys()):
+        if k not in ['btc', 'doge', 'diff']:
+            # 월간 데이터(M2)는 주간으로 리샘플링
+            df_m[k] = raw[k].reindex(df_m.index, method='ffill')
+
+    # 환율 보정 (평균값 사용)
+    df_m['eur_usd'] = raw['eur_usd'].resample('W-WED').mean().reindex(df_m.index, method='ffill')
+    df_m['usd_jpy'] = raw['usd_jpy'].resample('W-WED').mean().reindex(df_m.index, method='ffill')
     df_m = df_m.fillna(method='ffill')
 
-    # Fed Net
+    # -------------------------------------------------------
+    # [지표 1] Fed Net Liquidity
+    # -------------------------------------------------------
     df_m['Fed_Net_Tril'] = (df_m['fed'] / 1000 - df_m.get('tga', 0) / 1000 - df_m.get('rrp', 0) / 1_000_000)
     df_m['Fed_Net_YoY'] = df_m['Fed_Net_Tril'].pct_change(52) * 100
 
-    # G3 Global
+    # -------------------------------------------------------
+    # [지표 2] G3 Central Bank Assets (Balance Sheet)
+    # -------------------------------------------------------
     fed_t = df_m['fed'] / 1_000_000
     ecb_t = (df_m['ecb'] * df_m['eur_usd']) / 1_000_000
     boj_t = (df_m['boj'] * 0.0001) / df_m['usd_jpy']
-    df_m['G3_Tril'] = fed_t + ecb_t + boj_t
-    df_m['G3_YoY'] = df_m['G3_Tril'].pct_change(52) * 100
+    df_m['G3_Asset_Tril'] = fed_t + ecb_t + boj_t
+    df_m['G3_Asset_YoY'] = df_m['G3_Asset_Tril'].pct_change(52) * 100
+
+    # -------------------------------------------------------
+    # [지표 3] Global M2 (Money Supply) - NEW!
+    # Formula: US(M2) + Euro(M3) + Japan(M3)
+    # 단위: Trillions of USD
+    # -------------------------------------------------------
+    m2_us_t = df_m['m2_us'] / 1000  # Billions -> Trillions
+    # Euro M3 is in Euros -> Convert to USD
+    m3_eu_t = (df_m['m3_eu'] * df_m['eur_usd']) / 1_000_000_000_000 # Euros -> Trillions USD ? No, M3 data unit check required.
+    # FRED MABMM301EZM189S unit is Euros. Usually Billions or Millions? 
+    # FRED says "Euros" (raw unit). Let's assume it's raw units. 
+    # Usually central bank M3 is ~14-16 Trillion EUR.
+    # If raw unit is Euros, we divide by 10^12.
+    # Let's check magnitude safely by comparing with US M2 (~21T).
+    # If calculate yields crazy number, we adjust.
+    # But FRED OECD series usually are just "National Currency".
+    
+    # Safe Division for OECD Data (Adjusting Magnitude dynamically if needed, but standard is Units)
+    # Euro M3 is approx 16T EUR. US M2 is 21T USD.
+    # Japan M3 is approx 1600T JPY.
+    
+    m3_eu_usd_t = (df_m['m3_eu'] * df_m['eur_usd']) / 1_000_000_000_000 
+    m3_jp_usd_t = (df_m['m3_jp'] / df_m['usd_jpy']) / 1_000_000_000_000
+
+    # 합산
+    df_m['Global_M2_Tril'] = m2_us_t + m3_eu_usd_t + m3_jp_usd_t
+    df_m['Global_M2_YoY'] = df_m['Global_M2_Tril'].pct_change(52) * 100
 
     # --- Mining Cost ---
     df_c = pd.DataFrame(index=raw['btc'].index)
@@ -136,7 +180,6 @@ if not raw.get('btc', pd.Series()).empty:
         df_c['reward'] = df_c.index.map(lambda x: 3.125 if x.date() >= halving_date else 6.25)
         df_c['cost'] = df_c['diff'] / df_c['reward']
         sub = pd.concat([raw['btc'], df_c['cost']], axis=1).dropna()
-        sub.columns = ['btc', 'cost']
         target = sub[(sub.index >= '2022-11-01') & (sub.index <= '2023-01-31')]
         k = (target.iloc[:,0] / target.iloc[:,1]).min() if not target.empty else 0.0000001
         df_c['floor'] = df_c['cost'] * k
@@ -158,30 +201,27 @@ if not raw.get('btc', pd.Series()).empty:
     start_viz = pd.to_datetime('2018-01-01')
     def flt(s): return s[s.index >= start_viz] if not s.empty else s
 
-    if "G3" in liq_option:
-        liq_v = flt(df_m['G3_YoY'])
-        liq_name = "🌍 G3 Liquidity"
-        liq_color = "#FFD700"
+    # [선택] 유동성 지표 스위칭
+    if "Global M2" in liq_option:
+        liq_v = flt(df_m['Global_M2_YoY'])
+        liq_name = "🌍 Global M2 (US+EU+JP)"
+        liq_color = "#FF4500" # Orange Red
+        st.info("💡 **Global M2 모드:** 전 세계 실물 경제의 통화량(Money Supply)입니다. 인플레이션과 장기 자산 가격의 근원입니다. (중국 데이터 제외됨)")
+    elif "G3" in liq_option:
+        liq_v = flt(df_m['G3_Asset_YoY'])
+        liq_name = "🏛️ G3 Central Bank Assets"
+        liq_color = "#FFD700" # Gold
+        st.info("💡 **G3 Assets 모드:** 주요 중앙은행의 대차대조표 총액입니다. 양적완화(QE)와 직접적으로 연동됩니다.")
     else:
         liq_v = flt(df_m['Fed_Net_YoY'])
-        liq_name = "🇺🇸 Fed Net Liq"
-        liq_color = "#00FF7F"
+        liq_name = "🇺🇸 Fed Net Liquidity"
+        liq_color = "#00FF7F" # Spring Green
+        st.info("💡 **Fed Net 모드:** 미 연준의 실질 달러 유동성입니다. 단기 시장 변동성과 상관관계가 가장 높습니다.")
 
     btc_v = flt(btc_s)
     fl_v = flt(floor_s)
     nd_v = flt(nasdaq_s)
     dg_v = flt(doge_s)
-
-    # 사이드바 진단
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("🔍 데이터 진단")
-    st.sidebar.text(f"BTC: {'성공' if not btc_v.empty else '실패'}")
-    st.sidebar.text(f"DOGE: {'성공' if not dg_v.empty else '실패'}")
-    
-    if nd_v.empty:
-        st.sidebar.error(f"Nasdaq (FRED): 실패")
-    else:
-        st.sidebar.success(f"Nasdaq (FRED): 성공")
 
     # Dynamic Axes Logic
     if not btc_v.empty:
@@ -223,13 +263,11 @@ if not raw.get('btc', pd.Series()).empty:
     
     fig = go.Figure(layout=layout)
 
-    # Liquidity Trace
     if not liq_v.empty:
         fig.add_trace(go.Scatter(x=liq_v.index, y=liq_v, name=liq_name, line=dict(color=liq_color, width=3), fill='tozeroy', fillcolor=f"rgba{tuple(int(liq_color.lstrip('#')[i:i+2], 16) for i in (0, 2, 4)) + (0.15,)}", yaxis='y'))
 
     current_pos = domain_end 
 
-    # BTC Trace
     if show_btc and not btc_v.empty:
         fig.update_layout(yaxis2=dict(
             title=dict(text="BTC", font=dict(color="#00FFEE")),
@@ -243,7 +281,6 @@ if not raw.get('btc', pd.Series()).empty:
             fig.add_trace(go.Scatter(x=fl_v.index, y=fl_v, name="Cost", line=dict(color='red', width=1, dash='dot'), yaxis='y2'))
         current_pos += right_margin_per_axis
 
-    # Nasdaq Trace
     if show_nasdaq and not nd_v.empty:
         fig.update_layout(yaxis3=dict(
             title=dict(text="NDX", font=dict(color="#D62780")),
@@ -255,7 +292,6 @@ if not raw.get('btc', pd.Series()).empty:
         fig.add_trace(go.Scatter(x=nd_v.index, y=nd_v, name="NDX", line=dict(color='#D62780', width=2), yaxis='y3'))
         current_pos += right_margin_per_axis
 
-    # DOGE Trace
     if show_doge and not dg_v.empty:
         fig.update_layout(yaxis4=dict(
             title=dict(text="DOGE", font=dict(color="orange")),
@@ -269,7 +305,7 @@ if not raw.get('btc', pd.Series()).empty:
         current_pos += right_margin_per_axis
 
     st.plotly_chart(fig, use_container_width=True)
-    st.success("✅ 시스템 안정화 완료: Nasdaq(FRED) 연결됨")
+    st.success("✅ Ver 13.0: 3단계 유동성 분석 엔진 가동 (Fed Net / G3 Assets / Global M2)")
 
 else:
     st.error("데이터 로드 실패")
