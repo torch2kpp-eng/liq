@@ -15,7 +15,7 @@ warnings.filterwarnings("ignore")
 st.set_page_config(page_title="GM Clean View", layout="wide")
 
 st.title("🏛️ Grand Master: Clean View Terminal")
-st.caption("Ver 13.2 | 툴팁 박스 제거 | 마우스 추적 세로선(Spike Line) 적용")
+st.caption("Ver 13.3 | 구문 오류(Syntax Error) 수정 | 툴팁 제거 & 스파이크 라인 적용")
 
 # -----------------------------------------------------------
 # [사이드바 설정]
@@ -204,7 +204,7 @@ if not raw.get('btc', pd.Series()).empty:
         d_rng = [log_min - (span * 0.1), log_max + (span * 0.2)]
     else: d_rng = [-1, 1]
 
-    # Axes
+    # Axes Logic
     active_axes = []
     if show_btc: active_axes.append('btc')
     if show_nasdaq: active_axes.append('nasdaq')
@@ -218,17 +218,16 @@ if not raw.get('btc', pd.Series()).empty:
     # Layout
     layout = go.Layout(
         template="plotly_dark", height=700,
-        # [핵심] Spikes 설정 (가로/세로선)
         xaxis=dict(
             domain=[0.0, domain_end], 
             showgrid=True, 
             gridcolor='rgba(128,128,128,0.2)',
-            showspikes=True,       # Spike Line 활성화
-            spikemode='across',    # 차트 전체를 가로지르는 선
-            spikesnap='cursor',    # 마우스 커서에 스냅
-            spikethickness=1,      # 선 두께
-            spikecolor='white',    # 선 색상
-            spikedash='solid'      # 실선
+            showspikes=True,
+            spikemode='across',
+            spikesnap='cursor',
+            spikethickness=1,
+            spikecolor='white',
+            spikedash='solid'
         ),
         yaxis=dict(
             title=dict(text=liq_name, font=dict(color=liq_color)),
@@ -236,23 +235,91 @@ if not raw.get('btc', pd.Series()).empty:
             range=l_rng, showgrid=False
         ),
         legend=dict(orientation="h", y=1.12, x=0, bgcolor="rgba(0,0,0,0)"),
-        hovermode="x", # Unified 박스 제거 (기본 x 모드)
+        hovermode="x",
         margin=dict(l=50, r=20, t=80, b=50)
     )
     
     fig = go.Figure(layout=layout)
 
-    # [핵심] Trace 추가 시 hoverinfo='none' 설정
+    # 1. Liquidity Trace (구문 오류 수정: 색상 계산 로직 분리)
     if not liq_v.empty:
+        # [수정됨] 색상 변환을 미리 수행하여 f-string 복잡도 제거
+        h = liq_color.lstrip('#')
+        rgb = tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+        fill_rgba = f"rgba({rgb[0]}, {rgb[1]}, {rgb[2]}, 0.15)"
+        
         fig.add_trace(go.Scatter(
             x=liq_v.index, y=liq_v, name=liq_name, 
             line=dict(color=liq_color, width=3), 
-            fill='tozeroy', fillcolor=f"rgba{tuple(int(liq_color.lstrip('#')[i:i+2], 16) for i in (0, 2, 4)) + (0.15,)}", 
+            fill='tozeroy', 
+            fillcolor=fill_rgba, # 수정된 변수 사용
             yaxis='y',
-            hoverinfo='none' # 툴팁 끄기
+            hoverinfo='none'
         ))
 
     current_pos = domain_end 
 
+    # 2. Bitcoin Trace
     if show_btc and not btc_v.empty:
         fig.update_layout(yaxis2=dict(
+            title=dict(text="BTC", font=dict(color="#00FFEE")),
+            tickfont=dict(color="#00FFEE"),
+            overlaying="y", side="right", 
+            anchor="free", position=current_pos,
+            range=b_rng, showgrid=False, tickformat=","
+        ))
+        fig.add_trace(go.Scatter(
+            x=btc_v.index, y=btc_v, name="BTC", 
+            line=dict(color='#00FFEE', width=3), 
+            yaxis='y2',
+            hoverinfo='none'
+        ))
+        if not fl_v.empty:
+            fig.add_trace(go.Scatter(
+                x=fl_v.index, y=fl_v, name="Cost", 
+                line=dict(color='red', width=1, dash='dot'), 
+                yaxis='y2',
+                hoverinfo='none'
+            ))
+        current_pos += right_margin_per_axis
+
+    # 3. Nasdaq Trace
+    if show_nasdaq and not nd_v.empty:
+        fig.update_layout(yaxis3=dict(
+            title=dict(text="NDX", font=dict(color="#D62780")),
+            tickfont=dict(color="#D62780"),
+            overlaying="y", side="right", 
+            anchor="free", position=current_pos,
+            showgrid=False, tickformat=","
+        ))
+        fig.add_trace(go.Scatter(
+            x=nd_v.index, y=nd_v, name="NDX", 
+            line=dict(color='#D62780', width=2), 
+            yaxis='y3',
+            hoverinfo='none'
+        ))
+        current_pos += right_margin_per_axis
+
+    # 4. Doge Trace
+    if show_doge and not dg_v.empty:
+        fig.update_layout(yaxis4=dict(
+            title=dict(text="DOGE", font=dict(color="orange")),
+            tickfont=dict(color="orange"),
+            overlaying="y", side="right", 
+            anchor="free", position=current_pos,
+            type="log", range=d_rng,
+            showgrid=False
+        ))
+        fig.add_trace(go.Scatter(
+            x=dg_v.index, y=dg_v, name="DOGE", 
+            line=dict(color='orange', width=2), 
+            yaxis='y4',
+            hoverinfo='none'
+        ))
+        current_pos += right_margin_per_axis
+
+    st.plotly_chart(fig, use_container_width=True)
+    st.success("✅ Clean View: 박스 제거 및 스파이크 라인 적용 완료")
+
+else:
+    st.error("데이터 로드 실패")
