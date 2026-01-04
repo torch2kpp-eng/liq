@@ -12,10 +12,10 @@ from datetime import date, timedelta
 
 # 1. 환경 설정
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="GM Risk Radar", layout="wide")
+st.set_page_config(page_title="GM Final UX", layout="wide")
 
-st.title("🏛️ Grand Master: Risk Radar Engine")
-st.caption("Ver 18.0 | HY Spread 위기 감지 시스템(Risk Radar) 탑재 | 즉각적인 위험 신호 포착")
+st.title("🏛️ Grand Master: Analytics Engine")
+st.caption("Ver 18.1 | Spread Shift 적용 | 색상 구분 강화 | 차트 높이 최적화 | 단독 실행 버그 수정")
 
 # -----------------------------------------------------------
 # [사이드바 설정]
@@ -37,20 +37,25 @@ liq_option = st.sidebar.radio(
 st.sidebar.markdown("---")
 st.sidebar.write("2. Time Shift (Days)")
 shift_days = st.sidebar.number_input(
-    "자산 가격 이동 (일)", min_value=-365, max_value=365, value=90, step=7
+    "자산/지표 이동 (일)", min_value=-365, max_value=365, value=90, step=7,
+    help="자산 가격과 스프레드 지표를 과거/미래로 이동시켜 유동성과 비교합니다."
 )
 
 st.sidebar.markdown("---")
 st.sidebar.write("3. 표시할 자산 (Right Axes)")
 
-# [설정] HY Spread 추가
+# [설정] HY Spread 색상 변경 (#FF4500 -> #E040FB 네온 퍼플)
 ASSETS_CONFIG = [
-    {'id': 'hy_spread', 'name': '⚡ HY Spread', 'symbol': 'BAMLH0A0HYM2', 'source': 'fred', 'color': '#FF4500', 'type': 'risk', 'default': True},
+    {'id': 'hy_spread', 'name': '⚡ HY Spread', 'symbol': 'BAMLH0A0HYM2', 'source': 'fred', 'color': '#E040FB', 'type': 'risk', 'default': True},
     {'id': 'nasdaq', 'name': 'Nasdaq', 'symbol': 'IXIC', 'source': 'hybrid', 'color': '#D62780', 'type': 'index', 'default': False},
     {'id': 'btc',    'name': 'BTC',    'symbol': 'BTC/KRW', 'source': 'bithumb', 'color': '#00FFEE', 'type': 'crypto', 'default': True},
     {'id': 'gold',   'name': 'Gold',   'symbol': 'GC=F', 'source': 'hybrid_metal', 'color': '#FFD700', 'type': 'metal', 'default': False},
+    {'id': 'silver', 'name': 'Silver', 'symbol': 'SI=F', 'source': 'hybrid_metal', 'color': '#C0C0C0', 'type': 'metal', 'default': False},
     {'id': 'eth',    'name': 'ETH',    'symbol': 'ETH/KRW', 'source': 'bithumb', 'color': '#627EEA', 'type': 'crypto', 'default': False},
     {'id': 'doge',   'name': 'DOGE',   'symbol': 'DOGE/KRW', 'source': 'bithumb', 'color': '#FFA500', 'type': 'crypto', 'default': False},
+    {'id': 'link',   'name': 'LINK',   'symbol': 'LINK/KRW', 'source': 'bithumb', 'color': '#2A5ADA', 'type': 'crypto', 'default': False},
+    {'id': 'ada',    'name': 'ADA',    'symbol': 'ADA/KRW', 'source': 'bithumb', 'color': '#0033AD', 'type': 'crypto', 'default': False},
+    {'id': 'xrp',    'name': 'XRP',    'symbol': 'XRP/KRW', 'source': 'bithumb', 'color': '#00AAE4', 'type': 'crypto', 'default': False},
 ]
 
 selected_assets = {}
@@ -58,7 +63,7 @@ for asset in ASSETS_CONFIG:
     selected_assets[asset['id']] = st.sidebar.checkbox(f"{asset['name']}", value=asset['default'])
 
 # -----------------------------------------------------------
-# 데이터 수집 (HY Spread 포함)
+# 데이터 수집
 # -----------------------------------------------------------
 def fetch_master_data_logic():
     d = {}
@@ -81,7 +86,6 @@ def fetch_master_data_logic():
             url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={id}"
             r = requests.get(url, headers=headers, timeout=5)
             df = pd.read_csv(io.StringIO(r.text), index_col=0, parse_dates=True)
-            # "." 같은 문자열 결측치 처리
             s = df.squeeze().apply(pd.to_numeric, errors='coerce')
             return s.resample('D').interpolate(method='time').tz_localize(None)
         except: return pd.Series(dtype=float)
@@ -163,7 +167,6 @@ def fetch_master_data_logic():
             continue
         if asset['id'] == 'nasdaq': continue
         
-        # [추가] HY Spread Fetcher (FRED)
         if asset['source'] == 'fred':
             d[asset['id']] = get_fred(asset['symbol'])
         elif asset['source'] == 'hybrid_metal':
@@ -195,93 +198,105 @@ def fetch_master_data_logic():
 raw, meta = fetch_master_data_logic()
 
 # -----------------------------------------------------------
-# [NEW] Risk Radar Logic (Fast Check)
+# [CORE] Risk Radar Logic (Real-time)
 # -----------------------------------------------------------
 def check_risk_radar(hy_series):
     if hy_series.empty: return None
-    
-    # 최신 데이터
     last_val = hy_series.iloc[-1]
     prev_val = hy_series.iloc[-2]
-    
-    # 20일 이동평균 (단기 추세선)
     ma_20 = hy_series.rolling(20).mean().iloc[-1]
-    
-    # 1. Daily Spike Check (하루에 5% 이상 급등했는가?)
     daily_chg = (last_val - prev_val) / prev_val * 100
-    
-    # 2. Trend Break Check (20일 이평선을 뚫고 올라갔는가?)
     trend_break = last_val > ma_20
-    
-    # 3. Level Check (위험 수위 4.0% 넘었는가?)
     is_danger_zone = last_val > 4.0
     
-    status = "Normal"
-    color = "green"
-    msg = "안정 (Risk-On)"
-    
+    status, color, msg = "Normal", "green", "안정 (Risk-On)"
     if daily_chg > 5.0 or (trend_break and daily_chg > 2.0):
-        status = "Warning"
-        color = "orange"
-        msg = "⚠️ 급등 감지 (Warning)"
-    
+        status, color, msg = "Warning", "orange", "⚠️ 급등 감지 (Warning)"
     if is_danger_zone:
-        status = "Danger"
-        color = "red"
-        msg = "🚨 위험 지역 (Risk-Off)"
+        status, color, msg = "Danger", "red", "🚨 위험 지역 (Risk-Off)"
         
-    return {
-        "val": last_val,
-        "daily_chg": daily_chg,
-        "ma_20": ma_20,
-        "status": status,
-        "color": color,
-        "msg": msg
-    }
+    return {"val": last_val, "daily_chg": daily_chg, "ma_20": ma_20, "status": status, "color": color, "msg": msg}
+
+# -----------------------------------------------------------
+# [CORE] Quant Analytics (Pure Calc)
+# -----------------------------------------------------------
+def run_quant_analysis_pure(liq_series, asset_series_daily):
+    try:
+        asset_weekly = asset_series_daily.resample('W-WED').last()
+        asset_yoy = asset_weekly.pct_change(52) * 100
+        df = pd.concat([liq_series, asset_yoy], axis=1).dropna()
+        df.columns = ['Liquidity_YoY', 'Price_YoY']
+        
+        if len(df) < 52: return None
+        
+        df['L_Smooth'] = df['Liquidity_YoY'].rolling(4).mean()
+        df['P_Smooth'] = df['Price_YoY'].rolling(4).mean()
+        df = df.dropna()
+        if df.empty: return None
+        
+        df['L_Z'] = (df['L_Smooth'] - df['L_Smooth'].mean()) / (df['L_Smooth'].std() + 1e-9)
+        df['P_Z'] = (df['P_Smooth'] - df['P_Smooth'].mean()) / (df['P_Smooth'].std() + 1e-9)
+
+        best_lag_weeks, best_corr = 0, -1.0
+        for lag in range(0, 53): 
+            corr = df['P_Z'].corr(df['L_Z'].shift(lag))
+            if corr > best_corr: best_corr, best_lag_weeks = corr, lag
+        
+        best_lag_days = best_lag_weeks * 7
+        recent_window = 4 
+        df['L_Z_Shifted'] = df['L_Z'].shift(best_lag_weeks)
+        df_recent = df.iloc[-recent_window:]
+        if len(df_recent) < recent_window: return None
+        
+        recent_corr = df_recent['P_Z'].corr(df_recent['L_Z_Shifted'])
+        last_val = df.iloc[-1]
+        gap_z = last_val['P_Z'] - last_val['L_Z_Shifted']
+        
+        if best_corr < 0: regime = "Inverse"
+        elif recent_corr > 0.5: regime = "Sync"
+        elif recent_corr < 0.0: regime = "Divergence" 
+        else: regime = "Weak"
+
+        return {
+            "optimal_lag": best_lag_days, "global_corr": best_corr,
+            "recent_corr": recent_corr, "gap_z": gap_z, "regime": regime
+        }
+    except Exception: return None
 
 # -----------------------------------------------------------
 # Main Logic
 # -----------------------------------------------------------
 try:
-    # [RISK RADAR DISPLAY] 최상단 배치
+    # 1. Risk Radar (Uses Raw Data for Real-time Check)
     if 'hy_spread' in raw and not raw['hy_spread'].empty:
         risk_res = check_risk_radar(raw['hy_spread'])
         if risk_res:
             st.markdown("### ⚡ Risk Radar (HY Spread)")
             r_col1, r_col2, r_col3 = st.columns([1, 1, 2])
-            
-            with r_col1:
-                st.metric("HY Spread", f"{risk_res['val']:.2f}%", f"{risk_res['daily_chg']:.2f}% (Daily)", delta_color="inverse")
-            with r_col2:
-                st.metric("Signal", risk_res['msg'])
+            with r_col1: st.metric("HY Spread", f"{risk_res['val']:.2f}%", f"{risk_res['daily_chg']:.2f}% (Daily)", delta_color="inverse")
+            with r_col2: st.metric("Signal", risk_res['msg'])
             with r_col3:
-                if risk_res['status'] == "Normal":
-                    st.success("현재 하이일드 스프레드는 안정적입니다. (20일 이평선 아래)")
-                elif risk_res['status'] == "Warning":
-                    st.warning("스프레드가 급등하거나 추세선을 돌파했습니다. 주의가 필요합니다.")
-                else:
-                    st.error("스프레드가 위험 수위(4.0%)를 넘었습니다. 현금 비중 확대를 고려하십시오.")
+                if risk_res['status'] == "Normal": st.success("현재 하이일드 스프레드는 안정적입니다. (20일 이평선 아래)")
+                elif risk_res['status'] == "Warning": st.warning("스프레드가 급등하거나 추세선을 돌파했습니다. 주의가 필요합니다.")
+                else: st.error("스프레드가 위험 수위(4.0%)를 넘었습니다. 현금 비중 확대를 고려하십시오.")
             st.divider()
 
-    if not raw.get('btc', pd.Series()).empty:
-        # Macro Data Process
+    # [FIX] BTC 의존성 제거 -> 매크로 데이터(Fed)가 있으면 실행
+    if not raw.get('fed', pd.Series()).empty:
+        
+        # Macro Data
         base_idx = raw['fed'].resample('W-WED').last().index
         df_m = pd.DataFrame(index=base_idx)
         
         for k in raw:
             if k not in [a['id'] for a in ASSETS_CONFIG] and k != 'diff':
-                series = raw[k]
-                if not series.empty and isinstance(series.index, pd.DatetimeIndex):
-                    try: df_m[k] = series.reindex(df_m.index, method='ffill')
-                    except: continue
+                try: df_m[k] = raw[k].reindex(df_m.index, method='ffill')
+                except: continue
         
         df_m = df_m.fillna(method='ffill')
 
-        # G3 Calc
-        s_fed = df_m.get('fed')
-        s_ecb = df_m.get('ecb')
-        s_boj = df_m.get('boj')
-        
+        # G3 & Liquidity Calc
+        s_fed, s_ecb, s_boj = df_m.get('fed'), df_m.get('ecb'), df_m.get('boj')
         if s_fed is not None and s_ecb is not None and s_boj is not None:
             fed_t = s_fed / 1000000
             ecb_t = (s_ecb * df_m.get('eur_usd', 1)) / 1000000
@@ -289,8 +304,7 @@ try:
             g3_sum = fed_t.fillna(0) + ecb_t.fillna(0) + boj_t.fillna(0)
             df_m['G3_Asset_Tril'] = g3_sum.replace(0, np.nan).interpolate()
             df_m['G3_Asset_YoY'] = df_m['G3_Asset_Tril'].pct_change(52) * 100
-        else:
-            df_m['G3_Asset_YoY'] = pd.Series(dtype=float)
+        else: df_m['G3_Asset_YoY'] = pd.Series(dtype=float)
 
         df_m['Fed_Net_Tril'] = (df_m.get('fed',0)/1000 - df_m.get('tga',0)/1000 - df_m.get('rrp',0)/1000000)
         df_m['Fed_Net_YoY'] = df_m['Fed_Net_Tril'].pct_change(52) * 100
@@ -300,7 +314,7 @@ try:
         m3_jp = (df_m.get('m3_jp',0) / df_m.get('usd_jpy',1)) / 1e12
         df_m['Global_M2_YoY'] = (m2_us + m3_eu + m3_jp).pct_change(52) * 100
 
-        # Shift
+        # Shift Processing
         def apply_shift(s, days):
             if s.empty: return pd.Series(dtype=float)
             new_s = s.copy()
@@ -310,15 +324,13 @@ try:
         processed = {}
         for asset in ASSETS_CONFIG:
             s = raw.get(asset['id'], pd.Series(dtype=float))
-            # HY Spread는 Shift 하지 않음 (실시간 감시용)
-            if asset['id'] == 'hy_spread':
-                processed[asset['id']] = s
-            elif isinstance(s.index, pd.DatetimeIndex):
+            # [FIX] HY Spread도 이제 Shift 적용 (차트 비교용)
+            if isinstance(s.index, pd.DatetimeIndex):
                 processed[asset['id']] = apply_shift(s, shift_days)
             else:
                 processed[asset['id']] = pd.Series(dtype=float)
 
-        # Chart
+        # Chart Render
         st.subheader(f"📊 Integrated Strategy Chart (Shift: {shift_days}d)")
         
         start_viz = pd.to_datetime('2021-06-01') 
@@ -348,24 +360,18 @@ try:
         num_active = len(active_assets)
         
         if is_mobile:
-            tick_fmt = "s" 
-            margin = 0.03  
-            font_size = 10
+            tick_fmt, margin, font_size = "s", 0.03, 10
         else:
-            tick_fmt = "," 
-            margin = 0.05 if num_active > 5 else 0.08
-            font_size = 12
+            tick_fmt, margin, font_size = ",", 0.05 if num_active > 5 else 0.08, 12
 
         if num_active == 0: domain_end = 0.95
-        else:
-            domain_end = max(0.5, 1.0 - (num_active * margin))
-
-        spike_settings = dict(showspikes=True, spikemode='across', spikesnap='cursor', spikethickness=1, spikecolor='red', spikedash='dash')
+        else: domain_end = max(0.5, 1.0 - (num_active * margin))
 
         layout = go.Layout(
-            template="plotly_dark", height=800,
-            xaxis=dict(domain=[0.0, domain_end], showgrid=True, gridcolor='rgba(128,128,128,0.2)', **spike_settings),
-            yaxis=dict(title=dict(text=liq_name, font=dict(color=liq_color, size=font_size)), tickfont=dict(color=liq_color, size=font_size), range=l_rng, showgrid=False, **spike_settings),
+            template="plotly_dark", 
+            height=600, # [FIX] 차트 높이 축소 (800 -> 600)
+            xaxis=dict(domain=[0.0, domain_end], showgrid=True, gridcolor='rgba(128,128,128,0.2)'),
+            yaxis=dict(title=dict(text=liq_name, font=dict(color=liq_color, size=font_size)), tickfont=dict(color=liq_color, size=font_size), range=l_rng, showgrid=False),
             legend=dict(orientation="h", y=1.12, x=0, bgcolor="rgba(0,0,0,0)"),
             hovermode="x",
             margin=dict(l=30, r=10, t=80, b=50)
@@ -397,26 +403,24 @@ try:
             d_min, d_max = data.min(), data.max()
             if pd.isna(d_min) or pd.isna(d_max) or d_min <= 0: d_min = 0.0001
             
-            # [설정] HY Spread는 퍼센트 단위
-            if asset['id'] == 'hy_spread':
-                t_type = "linear"
-                rng = [d_min - 0.5, d_max + 0.5] # 여유 있게
-            elif asset['id'] == 'doge':
+            # [설정] 축 범위 및 타입 설정
+            t_type = "linear"
+            if asset['id'] == 'hy_spread': rng = [d_min - 0.5, d_max + 0.5]
+            elif asset['id'] == 'doge': 
+                t_type = "log"
                 log_min, log_max = np.log10(d_min), np.log10(d_max)
                 span = log_max - log_min
                 rng = [log_min - span*0.1, log_max + span*0.1]
-                t_type = "log"
             else:
                 span = d_max - d_min
                 rng = [d_min - span*0.2, d_max + span*0.1]
-                t_type = "linear"
 
             fig.update_layout({
                 axis_name: dict(
                     title=dict(text=asset['name'], font=dict(color=asset['color'], size=font_size)),
                     tickfont=dict(color=asset['color'], size=font_size),
                     overlaying="y", side="right", anchor="free", position=current_pos,
-                    range=rng, type=t_type, showgrid=False, tickformat=tick_fmt, **spike_settings
+                    range=rng, type=t_type, showgrid=False, tickformat=tick_fmt
                 )
             })
 
@@ -424,9 +428,81 @@ try:
             current_pos += margin
 
         st.plotly_chart(fig, use_container_width=True, key="main_chart")
-    
+
+        # Quant Analytics
+        st.markdown("---")
+        st.subheader("🛰️ Matrix Quant Analytics")
+        st.caption("비교 기준: Historical (2021~, 전체 역사) ↔ Recent (Last 30d, 최근 1달)")
+        
+        status_box = st.empty()
+        status_box.info("🚀 Starting Quant Analysis...")
+        
+        liquidity_sources = [
+            ("🇺🇸 Fed Net Liq", df_m['Fed_Net_YoY']),
+            ("🏛️ G3 Assets",    df_m.get('G3_Asset_YoY', pd.Series(dtype=float))),
+            ("🌍 Global M2",    df_m['Global_M2_YoY'])
+        ]
+
+        if active_assets:
+            asset_tabs = st.tabs([f"{a['name']}" for a in active_assets])
+            for tab, asset in zip(asset_tabs, active_assets):
+                with tab:
+                    status_box.caption(f"Analyzing {asset['name']}...")
+                    raw_asset_series = raw.get(asset['id'], pd.Series(dtype=float))
+                    
+                    if raw_asset_series.empty:
+                        st.warning("데이터 부족")
+                        continue
+                    
+                    results = []
+                    for liq_label, liq_data in liquidity_sources:
+                        if liq_data.empty: continue
+                        res = run_quant_analysis_pure(liq_data, raw_asset_series)
+                        if res:
+                            res['label'] = liq_label
+                            results.append(res)
+                    
+                    if not results:
+                        st.info("분석 데이터 부족")
+                        continue
+
+                    cols = st.columns(len(results))
+                    best_res = max(results, key=lambda x: x['global_corr'])
+                    
+                    for i, res in enumerate(results):
+                        with cols[i]:
+                            if res == best_res: st.markdown(f"#### ⭐ {res['label']}")
+                            else: st.markdown(f"#### {res['label']}")
+
+                            st.metric("Optimal Lag", f"{res['optimal_lag']} days")
+                            st.metric("Hist. Corr (4y)", f"{res['global_corr']:.2f}")
+                            st.metric("Recent Corr (30d)", f"{res['recent_corr']:.2f}", delta=f"{res['recent_corr'] - res['global_corr']:.2f}")
+                            
+                            regime_icon = "🟢" if "Sync" in res['regime'] else ("⚠️" if "Divergence" in res['regime'] else ("📉" if "Inverse" in res['regime'] else "⚪"))
+                            st.metric("Regime", f"{regime_icon} {res['regime']}")
+                            
+                            gap_state = "High" if res['gap_z'] > 1.0 else ("Low" if res['gap_z'] < -1.0 else "Fair")
+                            st.metric("Z-Gap", f"{res['gap_z']:+.2f} σ", gap_state, delta_color="inverse")
+                    
+                    if best_res['global_corr'] < 0:
+                        insight = f"**{asset['name']}**는 유동성과 **역상관(Inverse)** 관계입니다."
+                    else:
+                        insight = f"**{asset['name']}**는 **{best_res['label']}**와 밀접하며, 최근 **{best_res['regime']}** 상태입니다."
+                    st.info(f"**Insight:** {insight}")
+        
+        status_box.empty()
+
+        with st.expander("🔍 데이터 연결 리포트"):
+            active_ids_report = [a['id'] for a in ASSETS_CONFIG if selected_assets[a['id']]]
+            for asset in ASSETS_CONFIG:
+                if asset['id'] in active_ids_report:
+                    s = processed[asset['id']]
+                    if s.empty: st.error(f"❌ {asset['name']}: 로드 실패")
+                    else:
+                        extra = f" ({meta.get(asset['id'], 'OK')})" if asset['id'] in meta else ""
+                        st.success(f"✅ {asset['name']}: 로드 성공{extra}")
     else:
-        st.error("❌ 비트코인 로드 실패")
+        st.error("❌ 데이터 로드 실패 (Macro Data Unavailable)")
 
 except Exception as e:
-    st.error(f"⚠️ 렌더링 오류: {str(e)}")
+    st.error(f"⚠️ 시스템 오류: {str(e)}")
