@@ -8,14 +8,14 @@ import warnings
 import time
 import ccxt
 import numpy as np
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 
 # 1. 환경 설정
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="GM PnL Validator", layout="wide")
+st.set_page_config(page_title="GM Time Machine", layout="wide")
 
 st.title("🏛️ Grand Master: Analytics Engine")
-st.caption("Ver 19.2 | 손익비(Payoff) 검증 로직 추가 | 단순 승률 너머 '방어 효율' 분석")
+st.caption("Ver 19.3 | 시뮬레이션 기간 설정(Time Machine) 추가 | 구간별 정밀 검증 가능")
 
 # -----------------------------------------------------------
 # [사이드바 설정]
@@ -23,9 +23,11 @@ st.caption("Ver 19.2 | 손익비(Payoff) 검증 로직 추가 | 단순 승률 �
 st.sidebar.header("⚙️ Control Panel")
 is_mobile = st.sidebar.checkbox("📱 모바일 모드 (축 공간 최소화)", value=True)
 
-# [Stress Test 옵션]
+# [Stress Test 옵션 - 날짜 선택 추가]
 st.sidebar.markdown("---")
 st.sidebar.subheader("📉 Crash Simulation")
+
+# 1. 민감도 설정
 spike_threshold = st.sidebar.slider(
     "위험 감지 민감도 (Daily Delta bps)", 
     min_value=5, max_value=50, value=15, step=1,
@@ -36,6 +38,14 @@ look_forward_days = st.sidebar.slider(
     min_value=1, max_value=30, value=7,
     help="신호 발생 후 며칠 뒤의 가격 등락을 확인할까요?"
 )
+
+# 2. [NEW] 날짜 구간 설정
+st.sidebar.markdown("**검증 기간 설정 (Date Range)**")
+col_d1, col_d2 = st.sidebar.columns(2)
+with col_d1:
+    sim_start_date = st.date_input("시작일", value=date(2019, 1, 1))
+with col_d2:
+    sim_end_date = st.date_input("종료일", value="today")
 
 st.sidebar.markdown("---")
 liq_option = st.sidebar.radio(
@@ -83,6 +93,7 @@ def fetch_master_data_logic():
     GLOBAL_START = time.time()
     MAX_EXECUTION_TIME = 30 
     
+    # [설정] 2018년부터 데이터를 가져오되, 실제 분석은 사용자가 지정한 날짜로 자름
     START_YEAR = 2018 
     headers = {'User-Agent': 'Mozilla/5.0'}
 
@@ -211,17 +222,25 @@ def check_risk_radar(hy_series):
     }
 
 # -----------------------------------------------------------
-# [FUNC 2] Stress Test (With PnL Calc)
+# [FUNC 2] Stress Test (Date Range Added)
 # -----------------------------------------------------------
-def run_stress_test(hy_series, btc_series, threshold_bps, look_forward):
+def run_stress_test(hy_series, btc_series, threshold_bps, look_forward, start_d, end_d):
     try:
         hy = hy_series.copy()
         btc = btc_series.copy()
         hy.index = hy.index.normalize()
         btc.index = btc.index.normalize()
         
+        # [NEW] 사용자 지정 날짜 구간으로 필터링
+        s_date = pd.to_datetime(start_d).normalize()
+        e_date = pd.to_datetime(end_d).normalize()
+        
+        # 데이터를 병합하기 전에 먼저 자르는 게 아니라, 병합 후 자르는 게 안전
         df = pd.concat([hy, btc], axis=1).dropna()
         df.columns = ['Spread', 'Price']
+        
+        # 날짜 필터링 적용
+        df = df[(df.index >= s_date) & (df.index <= e_date)]
         
         if df.empty: return pd.DataFrame()
         
@@ -231,23 +250,32 @@ def run_stress_test(hy_series, btc_series, threshold_bps, look_forward):
         results = []
         for date in events:
             target_date = date + timedelta(days=look_forward)
-            if target_date <= df.index[-1]:
-                price_at_signal = df.loc[date]['Price']
-                future_data = df[df.index >= target_date]
-                
-                if not future_data.empty:
-                    price_future = future_data.iloc[0]['Price']
-                    price_chg_pct = (price_future - price_at_signal) / price_at_signal * 100
+            # 미래 날짜가 현재 데이터 범위(필터링 된 범위가 아님, 전체 범위) 내에 있어야 함
+            # 따라서 미래 가격 조회용으로는 원본(필터 전) 데이터를 쓰는 게 좋을 수도 있으나,
+            # 여기서는 편의상 잘린 데이터 내에서 확인하거나, 원본 데이터를 참조해야 함.
+            # 정확도를 위해 원본 시리즈에서 미래 가격을 조회
+            
+            # 원본 시리즈에서 가격 조회
+            if target_date <= btc.index[-1]:
+                try:
+                    price_at_signal = df.loc[date]['Price']
+                    # 미래 가격은 btc 원본에서 조회 (필터링된 종료일 이후의 결과도 궁금할 수 있으므로)
+                    future_data = btc[btc.index >= target_date]
                     
-                    outcome = "🛡️ 방어 성공" if price_chg_pct < 0 else "🎣 휩쏘 (False)"
-                    
-                    results.append({
-                        "Date": date.strftime("%Y-%m-%d"),
-                        "Spike": f"+{df.loc[date]['Spread_Chg_Bps']:.1f} bps",
-                        "Raw_Return": price_chg_pct, # 계산용 원본 수치
-                        "BTC Return": f"{price_chg_pct:+.2f}%", # 표시용
-                        "Outcome": outcome
-                    })
+                    if not future_data.empty:
+                        price_future = future_data.iloc[0]
+                        price_chg_pct = (price_future - price_at_signal) / price_at_signal * 100
+                        
+                        outcome = "🛡️ 방어 성공" if price_chg_pct < 0 else "🎣 휩쏘 (False)"
+                        
+                        results.append({
+                            "Date": date.strftime("%Y-%m-%d"),
+                            "Spike": f"+{df.loc[date]['Spread_Chg_Bps']:.1f} bps",
+                            "Raw_Return": price_chg_pct,
+                            "BTC Return": f"{price_chg_pct:+.2f}%",
+                            "Outcome": outcome
+                        })
+                except: continue
         
         return pd.DataFrame(results).sort_values("Date", ascending=False)
     except Exception:
@@ -451,13 +479,13 @@ try:
         # 4. Stress Test
         st.markdown("---")
         st.subheader("📉 Crash Simulation (Stress Test)")
-        st.caption(f"가정: HY Spread가 하루에 **{spike_threshold} bps 이상 급등**하면 즉시 매도 후 **{look_forward_days}일간 관망**했다면?")
+        # [NEW] 날짜 표시 추가
+        st.caption(f"기간: **{sim_start_date} ~ {sim_end_date}** | 감지 조건: Spread Spike **≥ {spike_threshold} bps**")
 
         if 'hy_spread' in raw and 'btc' in raw:
-            res_df = run_stress_test(raw['hy_spread'], raw['btc'], spike_threshold, look_forward_days)
+            res_df = run_stress_test(raw['hy_spread'], raw['btc'], spike_threshold, look_forward_days, sim_start_date, sim_end_date)
             
             if not res_df.empty:
-                # [수정] 방어 성공 시 평균 방어율(수익률이 마이너스인 것들의 평균) 계산
                 success_cases = res_df[res_df['Raw_Return'] < 0]
                 fail_cases = res_df[res_df['Raw_Return'] >= 0]
                 
@@ -468,14 +496,14 @@ try:
                 avg_missed = fail_cases['Raw_Return'].mean() if not fail_cases.empty else 0
                 
                 c1, c2, c3, c4 = st.columns(4)
-                c1.metric("총 위험 신호", f"{total_sigs} 회")
-                c2.metric("하락 방어 확률", f"{success_rate:.1f}%")
-                c3.metric("평균 방어 수익률", f"{avg_saved:.2f}%", help="위기 감지 성공 시, 평균적으로 이만큼의 하락을 피했습니다.")
-                c4.metric("평균 기회비용", f"{avg_missed:.2f}%", help="위기 감지 실패(휩쏘) 시, 평균적으로 이만큼의 상승을 놓쳤습니다.")
+                c1.metric("위험 감지 횟수", f"{total_sigs} 회")
+                c2.metric("방어 확률 (Win Rate)", f"{success_rate:.1f}%")
+                c3.metric("평균 방어 수익률", f"{avg_saved:.2f}%", help="성공 시 회피한 하락폭 평균")
+                c4.metric("평균 기회비용", f"{avg_missed:.2f}%", help="실패 시 놓친 상승폭 평균")
                 
                 st.dataframe(res_df[['Date', 'Spike', 'BTC Return', 'Outcome']].style.map(lambda x: 'color: #00FF7F' if '성공' in str(x) else ('color: #FF4500' if '휩쏘' in str(x) else ''), subset=['Outcome']), use_container_width=True)
             else:
-                st.info(f"설정하신 민감도({spike_threshold} bps)로는 감지된 위험 신호가 없습니다.")
+                st.info(f"선택하신 기간({sim_start_date} ~ {sim_end_date}) 동안 설정된 민감도({spike_threshold} bps)로 감지된 위험 신호가 없습니다.")
 
         # 5. Quant Analytics
         st.markdown("---")
