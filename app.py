@@ -302,9 +302,9 @@ try:
             df_m['G3_Asset_YoY'] = df_m['G3_Asset_Tril'].pct_change(52) * 100
         else: df_m['G3_Asset_YoY'] = pd.Series(dtype=float)
 
-        # [FIX] Global M2 Calculation (NaN Safe for Mobile)
-        # 이전에는 get(..., 0) 때문에 초기 로딩 시 0이 들어가서 그래프가 깨짐
-        s_m2_us = df_m.get('m2_us') # Default None
+        # [FIX] Global M2 Calculation (Ver 18.3: Integrity Patch)
+        # 하나라도 데이터가 없으면(NaN) 합산을 보류하여, 그래프가 깨지는 것을 방지합니다.
+        s_m2_us = df_m.get('m2_us')
         s_m3_eu = df_m.get('m3_eu')
         s_m3_jp = df_m.get('m3_jp')
         
@@ -313,9 +313,12 @@ try:
             m3_eu = (s_m3_eu * df_m.get('eur_usd', 1)) / 1e12
             m3_jp = (s_m3_jp / df_m.get('usd_jpy', 1)) / 1e12
             
-            # 합산 전 0을 NaN으로 처리하여 안전하게 Sum
-            global_m2_sum = m2_us.fillna(0) + m3_eu.fillna(0) + m3_jp.fillna(0)
-            df_m['Global_M2_Tril'] = global_m2_sum.replace(0, np.nan).interpolate()
+            # [핵심 수정] fillna(0) 제거 -> 데이터가 하나라도 비면 결과도 NaN (차트 왜곡 방지)
+            # 3개국 데이터가 모두 존재하는 교집합 구간만 계산됩니다.
+            global_m2_sum = m2_us + m3_eu + m3_jp
+            
+            # 중간에 빈 곳은 부드럽게 연결 (Interpolate)
+            df_m['Global_M2_Tril'] = global_m2_sum.interpolate(limit_direction='both')
             df_m['Global_M2_YoY'] = df_m['Global_M2_Tril'].pct_change(52) * 100
         else:
             df_m['Global_M2_YoY'] = pd.Series(dtype=float)
@@ -510,3 +513,4 @@ try:
 
 except Exception as e:
     st.error(f"⚠️ 시스템 오류: {str(e)}")
+
