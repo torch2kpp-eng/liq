@@ -12,10 +12,10 @@ from datetime import date, timedelta
 
 # 1. 환경 설정
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="GM Bulletproof", layout="wide")
+st.set_page_config(page_title="GM True YoY", layout="wide")
 
-st.title("🏛️ Grand Master: Bulletproof Renderer")
-st.caption("Ver 16.6 | 렌더링 충돌 방지(Try-Except) | NaN/Inf 데이터 자동 세탁 | 차트 강제 출력")
+st.title("🏛️ Grand Master: True YoY Analytics")
+st.caption("Ver 17.1 | 자산 가격 YoY 변환 적용 | 유동성 vs 자산 등락률 동기화 분석")
 
 # -----------------------------------------------------------
 # [사이드바 설정]
@@ -38,7 +38,7 @@ st.sidebar.markdown("---")
 st.sidebar.write("2. Time Shift (Days)")
 shift_days = st.sidebar.number_input(
     "자산 가격 이동 (일)", min_value=-365, max_value=365, value=90, step=7,
-    help="양수(+) 입력 시 자산 차트를 과거로 이동시킵니다."
+    help="차트 시각화용 수동 이동입니다. (하단 퀀트 분석은 자동으로 최적값을 찾습니다)"
 )
 
 st.sidebar.markdown("---")
@@ -76,8 +76,7 @@ def fetch_master_data_logic():
     START_YEAR = 2021
     headers = {'User-Agent': 'Mozilla/5.0'}
 
-    def check_timeout():
-        return (time.time() - GLOBAL_START > MAX_EXECUTION_TIME)
+    def check_timeout(): return (time.time() - GLOBAL_START > MAX_EXECUTION_TIME)
 
     def get_fred(id):
         if check_timeout(): return pd.Series(dtype=float)
@@ -194,7 +193,77 @@ def fetch_master_data_logic():
 raw, meta = fetch_master_data_logic()
 
 # -----------------------------------------------------------
-# Logic & Chart (Safety Wrapped)
+# [CORE] Quant Analytics Engine (True YoY)
+# -----------------------------------------------------------
+def run_quant_analysis(liq_series, asset_series_daily):
+    """
+    유동성(YoY)과 자산가격(YoY)을 동기화하여 분석
+    """
+    try:
+        # 1. 데이터 동기화 (주간 단위 Resample)
+        # 유동성 지표는 주간(Weekly) 데이터이므로, 자산 가격도 주간으로 맞춤
+        # W-WED (수요일 기준)으로 맞추면 노이즈가 줄고 추세가 명확해짐
+        asset_weekly = asset_series_daily.resample('W-WED').last()
+        
+        # 2. 자산 가격 YoY 변환 (핵심 수정)
+        # 52주 전 가격 대비 변동률 = YoY
+        asset_yoy = asset_weekly.pct_change(52) * 100
+        
+        # 데이터 병합 (교집합)
+        df = pd.concat([liq_series, asset_yoy], axis=1).dropna()
+        df.columns = ['Liquidity_YoY', 'Price_YoY']
+        
+        # 데이터가 너무 짧으면 분석 불가 (최소 1년치 데이터 필요)
+        if len(df) < 52: return None
+        
+        # 3. 스무딩 & 정규화 (Z-Score)
+        # YoY 데이터는 이미 추세성이 강하므로 가볍게 스무딩 (4주/1달)
+        df['L_Smooth'] = df['Liquidity_YoY'].rolling(4).mean()
+        df['P_Smooth'] = df['Price_YoY'].rolling(4).mean()
+        df = df.dropna()
+        
+        df['L_Z'] = (df['L_Smooth'] - df['L_Smooth'].mean()) / df['L_Smooth'].std()
+        df['P_Z'] = (df['P_Smooth'] - df['P_Smooth'].mean()) / df['P_Smooth'].std()
+
+        # 4. 최적 시차 탐색 (Optimal Lag)
+        # 주간 데이터이므로 Lag 1 = 1주일(7일)
+        # 0주 ~ 26주(약 6개월) 후행 테스트
+        best_lag_weeks = 0
+        best_corr = -1.0
+        
+        for lag in range(0, 27): # 0~26 weeks
+            shifted_L = df['L_Z'].shift(lag)
+            corr = df['P_Z'].corr(shifted_L)
+            if corr > best_corr:
+                best_corr = corr
+                best_lag_weeks = lag
+        
+        best_lag_days = best_lag_weeks * 7 # 일수로 변환
+        
+        # 5. 국면 감지 (Regime)
+        # 최근 12주(약 3달) 상관계수 확인
+        recent_window = 12
+        df['L_Z_Shifted'] = df['L_Z'].shift(best_lag_weeks)
+        df_recent = df.iloc[-recent_window:]
+        recent_corr = df_recent['P_Z'].corr(df_recent['L_Z_Shifted'])
+        
+        # 6. 괴리율 (Gap)
+        last_val = df.iloc[-1]
+        gap_z = last_val['P_Z'] - last_val['L_Z_Shifted']
+        
+        return {
+            "optimal_lag": best_lag_days,
+            "max_corr": best_corr,
+            "recent_corr": recent_corr,
+            "gap_z": gap_z,
+            "regime": "Sync" if recent_corr > 0.5 else ("Divergence" if recent_corr < 0.2 else "Weak")
+        }
+
+    except Exception:
+        return None
+
+# -----------------------------------------------------------
+# Main Logic & Rendering
 # -----------------------------------------------------------
 try:
     if not raw.get('btc', pd.Series()).empty:
@@ -246,14 +315,16 @@ try:
         if "Global M2" in liq_option:
             liq_v = flt(df_m['Global_M2_YoY'])
             liq_name, liq_color = "Global M2", "#FF4500"
+            liq_full_series = df_m['Global_M2_YoY']
         elif "G3" in liq_option:
             liq_v = flt(df_m['G3_Asset_YoY'])
             liq_name, liq_color = "G3 Assets", "#FFD700"
+            liq_full_series = df_m['G3_Asset_YoY']
         else:
             liq_v = flt(df_m['Fed_Net_YoY'])
             liq_name, liq_color = "Fed Net", "#00FF7F"
+            liq_full_series = df_m['Fed_Net_YoY']
 
-        # [Safety] Clean Liquidity Data
         liq_v = liq_v.replace([np.inf, -np.inf], np.nan).dropna()
 
         if not liq_v.empty:
@@ -280,17 +351,12 @@ try:
         else:
             domain_end = max(0.5, 1.0 - (num_active * margin))
 
-        spike_settings = dict(
-            showspikes=True, spikemode='across', spikesnap='cursor',
-            spikethickness=1, spikecolor='red', spikedash='dash'
-        )
+        spike_settings = dict(showspikes=True, spikemode='across', spikesnap='cursor', spikethickness=1, spikecolor='red', spikedash='dash')
 
         layout = go.Layout(
             template="plotly_dark", height=800,
             xaxis=dict(domain=[0.0, domain_end], showgrid=True, gridcolor='rgba(128,128,128,0.2)', **spike_settings),
-            yaxis=dict(title=dict(text=liq_name, font=dict(color=liq_color, size=font_size)),
-                       tickfont=dict(color=liq_color, size=font_size),
-                       range=l_rng, showgrid=False, **spike_settings),
+            yaxis=dict(title=dict(text=liq_name, font=dict(color=liq_color, size=font_size)), tickfont=dict(color=liq_color, size=font_size), range=l_rng, showgrid=False, **spike_settings),
             legend=dict(orientation="h", y=1.12, x=0, bgcolor="rgba(0,0,0,0)"),
             hovermode="x",
             margin=dict(l=30, r=10, t=80, b=50)
@@ -305,28 +371,15 @@ try:
             if shift_days != 0:
                 last_date = liq_v.index.max()
                 start_date = last_date - pd.Timedelta(days=abs(shift_days))
-                fig.add_shape(
-                    type="rect", x0=start_date, x1=last_date, y0=l_rng[0], y1=l_rng[1],
-                    fillcolor="rgba(200, 200, 200, 0.15)", line=dict(width=0), layer="below"
-                )
-                fig.add_annotation(
-                    x=last_date, y=l_rng[1], text=f"Lag:{abs(shift_days)}d",
-                    showarrow=False, yshift=10, xshift=-40, font=dict(color="rgba(255,255,255,0.7)", size=10)
-                )
+                fig.add_shape(type="rect", x0=start_date, x1=last_date, y0=l_rng[0], y1=l_rng[1], fillcolor="rgba(200, 200, 200, 0.15)", line=dict(width=0), layer="below")
+                fig.add_annotation(x=last_date, y=l_rng[1], text=f"Lag:{abs(shift_days)}d", showarrow=False, yshift=10, xshift=-40, font=dict(color="rgba(255,255,255,0.7)", size=10))
 
-            fig.add_trace(go.Scatter(
-                x=liq_v.index, y=liq_v, name=liq_name,
-                line=dict(color=liq_color, width=3),
-                fill='tozeroy', fillcolor=f"rgba({rgb[0]},{rgb[1]},{rgb[2]},0.15)",
-                yaxis='y', hoverinfo='none'
-            ))
+            fig.add_trace(go.Scatter(x=liq_v.index, y=liq_v, name=liq_name, line=dict(color=liq_color, width=3), fill='tozeroy', fillcolor=f"rgba({rgb[0]},{rgb[1]},{rgb[2]},0.15)", yaxis='y', hoverinfo='none'))
 
         current_pos = domain_end
         for i, asset in enumerate(active_assets):
-            # [Safety] Data Cleaning
             data = flt(processed[asset['id']])
             data = data.replace([np.inf, -np.inf], np.nan).dropna()
-            
             if data.empty: continue
 
             axis_name = f'yaxis{i+2}'
@@ -351,20 +404,52 @@ try:
                     title=dict(text=asset['name'], font=dict(color=asset['color'], size=font_size)),
                     tickfont=dict(color=asset['color'], size=font_size),
                     overlaying="y", side="right", anchor="free", position=current_pos,
-                    range=rng, type=t_type, showgrid=False, tickformat=tick_fmt,
-                    **spike_settings
+                    range=rng, type=t_type, showgrid=False, tickformat=tick_fmt, **spike_settings
                 )
             })
 
-            fig.add_trace(go.Scatter(
-                x=data.index, y=data, name=asset['name'],
-                line=dict(color=asset['color'], width=2),
-                yaxis=axis_key, hoverinfo='none'
-            ))
+            fig.add_trace(go.Scatter(x=data.index, y=data, name=asset['name'], line=dict(color=asset['color'], width=2), yaxis=axis_key, hoverinfo='none'))
             current_pos += margin
 
-        # [핵심] 차트 출력 (여기서 멈추면 catch로 이동)
         st.plotly_chart(fig, use_container_width=True, key="main_chart")
+
+        # ------------------------------------------------------------------
+        # [NEW] Quant Analysis (Using Correct YoY Logic)
+        # ------------------------------------------------------------------
+        st.markdown("---")
+        st.subheader("🛰️ Market Quant Analytics (YoY vs YoY)")
+        st.caption(f"분석 기준: {liq_name} (YoY) ↔ 자산 가격 등락률 (YoY)")
+
+        target_asset_id = 'btc' if 'btc' in [a['id'] for a in active_assets] else (active_assets[0]['id'] if active_assets else None)
+
+        if target_asset_id:
+            raw_asset_series = raw.get(target_asset_id, pd.Series(dtype=float))
+            
+            if not raw_asset_series.empty and not liq_full_series.empty:
+                res = run_quant_analysis(liq_full_series, raw_asset_series)
+                
+                if res:
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("최적 후행 시차 (Optimal Lag)", f"{res['optimal_lag']} days", help="자산의 등락률이 유동성 등락률을 따라가는 시간")
+                    with col2:
+                        st.metric("최대 상관계수 (Max Corr)", f"{res['max_corr']:.2f}", help="YoY 등락률 간의 상관관계 (1.0 = 완벽 동행)")
+                    with col3:
+                        if res['regime'] == "Sync": regime_icon = "🟢 동행 (Sync)"
+                        elif res['regime'] == "Divergence": regime_icon = "⚠️ 이탈 (Div)"
+                        else: regime_icon = "⚪ 약세 (Weak)"
+                        st.metric("현재 국면 (Regime)", regime_icon, f"Recent Corr: {res['recent_corr']:.2f}")
+                    with col4:
+                        gap_val = res['gap_z']
+                        gap_state = "High" if gap_val > 1.0 else ("Low" if gap_val < -1.0 else "Fair")
+                        st.metric("괴리율 (Z-Gap)", f"{gap_val:+.2f} σ", f"{gap_state}", delta_color="inverse")
+
+                    st.info(f"""
+                    **💡 Insight:** **{target_asset_id.upper()}**의 가격 등락률(YoY)은 **{liq_name}**의 변화를 약 **{res['optimal_lag']}일** 후에 따라가는 경향이 있습니다.
+                    현재 두 지표의 추세는 **{res['regime']}** 상태이며, 유동성 흐름 대비 가격 모멘텀은 **{gap_val:.2f} Sigma** 수준으로 **{gap_state}** 상태입니다.
+                    """)
+                else:
+                    st.warning("데이터가 부족하여 퀀트 분석을 수행할 수 없습니다.")
 
         with st.expander("🔍 데이터 연결 리포트"):
             active_ids_report = [a['id'] for a in ASSETS_CONFIG if selected_assets[a['id']]]
@@ -382,4 +467,3 @@ try:
 
 except Exception as e:
     st.error(f"⚠️ 차트 렌더링 중 오류 발생: {str(e)}")
-    st.info("데이터에 문제가 있거나 일시적인 연결 오류일 수 있습니다. 잠시 후 다시 시도해주세요.")
