@@ -12,10 +12,10 @@ from datetime import date, timedelta
 
 # 1. 환경 설정
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="GM Stress Test", layout="wide")
+st.set_page_config(page_title="GM Complete", layout="wide")
 
-st.title("🏛️ Grand Master: Stress Test Simulator")
-st.caption("Ver 19.0 | HY Spread 급등 시나리오 백테스트 | 위기 감지 유효성 검증")
+st.title("🏛️ Grand Master: Analytics Engine")
+st.caption("Ver 19.1 | 통합 완전판 | Stress Test 버그 수정 | M2 로직 포함 | 모든 기능 활성화")
 
 # -----------------------------------------------------------
 # [사이드바 설정]
@@ -24,13 +24,13 @@ st.sidebar.header("⚙️ Control Panel")
 
 is_mobile = st.sidebar.checkbox("📱 모바일 모드 (축 공간 최소화)", value=True)
 
-# [NEW] 백테스트 설정
+# [Stress Test 옵션]
 st.sidebar.markdown("---")
 st.sidebar.subheader("📉 Crash Simulation")
 spike_threshold = st.sidebar.slider(
     "위험 감지 민감도 (Daily Delta bps)", 
     min_value=5, max_value=50, value=15, step=1,
-    help="하루에 스프레드가 이 값(bps) 이상 튀어 오르면 '위기'로 간주합니다. (권장: 10~20)"
+    help="하루에 스프레드가 이 값(bps) 이상 튀어 오르면 '위기'로 간주합니다."
 )
 look_forward_days = st.sidebar.slider(
     "반응 관찰 기간 (Days)",
@@ -38,6 +38,7 @@ look_forward_days = st.sidebar.slider(
     help="신호 발생 후 며칠 뒤의 가격 등락을 확인할까요?"
 )
 
+st.sidebar.markdown("---")
 liq_option = st.sidebar.radio(
     "1. 유동성 지표 (Left Axis)",
     (
@@ -51,7 +52,8 @@ liq_option = st.sidebar.radio(
 st.sidebar.markdown("---")
 st.sidebar.write("2. Time Shift (Days)")
 shift_days = st.sidebar.number_input(
-    "자산/지표 이동 (일)", min_value=-365, max_value=365, value=90, step=7
+    "자산/지표 이동 (일)", min_value=-365, max_value=365, value=90, step=7,
+    help="자산 가격과 스프레드 지표를 과거/미래로 이동시켜 유동성과 비교합니다."
 )
 
 st.sidebar.markdown("---")
@@ -59,10 +61,15 @@ st.sidebar.write("3. 표시할 자산 (Right Axes)")
 
 ASSETS_CONFIG = [
     {'id': 'hy_spread', 'name': '⚡ HY Spread', 'symbol': 'BAMLH0A0HYM2', 'source': 'fred', 'color': '#E040FB', 'type': 'risk', 'default': True},
-    {'id': 'btc',    'name': 'BTC',    'symbol': 'BTC/KRW', 'source': 'bithumb', 'color': '#00FFEE', 'type': 'crypto', 'default': True},
     {'id': 'nasdaq', 'name': 'Nasdaq', 'symbol': 'IXIC', 'source': 'hybrid', 'color': '#D62780', 'type': 'index', 'default': False},
+    {'id': 'btc',    'name': 'BTC',    'symbol': 'BTC/KRW', 'source': 'bithumb', 'color': '#00FFEE', 'type': 'crypto', 'default': True},
     {'id': 'gold',   'name': 'Gold',   'symbol': 'GC=F', 'source': 'hybrid_metal', 'color': '#FFD700', 'type': 'metal', 'default': False},
+    {'id': 'silver', 'name': 'Silver', 'symbol': 'SI=F', 'source': 'hybrid_metal', 'color': '#C0C0C0', 'type': 'metal', 'default': False},
     {'id': 'eth',    'name': 'ETH',    'symbol': 'ETH/KRW', 'source': 'bithumb', 'color': '#627EEA', 'type': 'crypto', 'default': False},
+    {'id': 'doge',   'name': 'DOGE',   'symbol': 'DOGE/KRW', 'source': 'bithumb', 'color': '#FFA500', 'type': 'crypto', 'default': False},
+    {'id': 'link',   'name': 'LINK',   'symbol': 'LINK/KRW', 'source': 'bithumb', 'color': '#2A5ADA', 'type': 'crypto', 'default': False},
+    {'id': 'ada',    'name': 'ADA',    'symbol': 'ADA/KRW', 'source': 'bithumb', 'color': '#0033AD', 'type': 'crypto', 'default': False},
+    {'id': 'xrp',    'name': 'XRP',    'symbol': 'XRP/KRW', 'source': 'bithumb', 'color': '#00AAE4', 'type': 'crypto', 'default': False},
 ]
 
 selected_assets = {}
@@ -70,7 +77,7 @@ for asset in ASSETS_CONFIG:
     selected_assets[asset['id']] = st.sidebar.checkbox(f"{asset['name']}", value=asset['default'])
 
 # -----------------------------------------------------------
-# 데이터 수집
+# 데이터 수집 (Logic)
 # -----------------------------------------------------------
 def fetch_master_data_logic():
     d = {}
@@ -78,7 +85,8 @@ def fetch_master_data_logic():
     GLOBAL_START = time.time()
     MAX_EXECUTION_TIME = 30 
     
-    START_YEAR = 2018 # [수정] 2019년 사례를 보기 위해 기간 확장
+    # [설정] Stress Test를 위해 2018년부터 로드
+    START_YEAR = 2018 
     headers = {'User-Agent': 'Mozilla/5.0'}
 
     def check_timeout(): return (time.time() - GLOBAL_START > MAX_EXECUTION_TIME)
@@ -138,8 +146,8 @@ def fetch_master_data_logic():
         return df.drop_duplicates('timestamp').set_index('timestamp')['close'].tz_localize(None)
 
     status_text = st.empty()
-    status_text.text("📡 Initializing Data (2018~)...")
-    
+    status_text.text("📡 Initializing Data...")
+
     fred_ids = {
         'fed': 'WALCL', 'tga': 'WTREGEN', 'rrp': 'RRPONTSYD',
         'ecb': 'ECBASSETSW', 'boj': 'JPNASSETS',
@@ -148,6 +156,7 @@ def fetch_master_data_logic():
         'nasdaq_fred': 'NASDAQCOM'
     }
     
+    # 매크로 데이터 로드
     for k, v in fred_ids.items():
         if check_timeout(): break
         d[k] = get_fred(v)
@@ -155,6 +164,7 @@ def fetch_master_data_logic():
     if not d.get('nasdaq_fred', pd.Series()).empty: d['nasdaq'] = d['nasdaq_fred']
     else: d['nasdaq'] = get_yahoo("^IXIC")
 
+    # 개별 자산 로드
     active_ids = [a['id'] for a in ASSETS_CONFIG if selected_assets[a['id']]]
     for asset in ASSETS_CONFIG:
         if asset['id'] not in active_ids: continue
@@ -175,80 +185,166 @@ def fetch_master_data_logic():
 raw, meta = fetch_master_data_logic()
 
 # -----------------------------------------------------------
-# [NEW] Stress Test Logic
+# [FUNC 1] Risk Radar (Real-Time BPS)
+# -----------------------------------------------------------
+def check_risk_radar(hy_series):
+    if hy_series.empty: return None
+    
+    last_val = hy_series.iloc[-1]
+    prev_val = hy_series.iloc[-2]
+    ma_20 = hy_series.rolling(20).mean().iloc[-1]
+    
+    daily_chg_pct = (last_val - prev_val) / prev_val * 100
+    daily_chg_bps = (last_val - prev_val) * 100
+    
+    trend_break = last_val > ma_20
+    is_danger_zone = last_val > 4.0
+    
+    status, color, msg = "Normal", "green", "안정 (Risk-On)"
+    
+    if daily_chg_pct > 5.0 or (trend_break and daily_chg_pct > 2.0):
+        status, color, msg = "Warning", "orange", "⚠️ 급등 감지 (Warning)"
+    if is_danger_zone:
+        status, color, msg = "Danger", "red", "🚨 위험 지역 (Risk-Off)"
+        
+    return {
+        "val": last_val, 
+        "daily_chg_bps": daily_chg_bps, 
+        "status": status, 
+        "color": color, 
+        "msg": msg
+    }
+
+# -----------------------------------------------------------
+# [FUNC 2] Stress Test Simulator (FIXED)
 # -----------------------------------------------------------
 def run_stress_test(hy_series, btc_series, threshold_bps, look_forward):
-    """
-    HY Spread가 threshold_bps 이상 튄 날을 찾고, 그 후 BTC 가격 변화를 추적
-    """
     try:
-        # 데이터 동기화
-        df = pd.concat([hy_series, btc_series], axis=1).dropna()
+        # [CRITICAL FIX] 인덱스를 날짜(자정) 기준으로 정렬하여 교집합 확보
+        hy = hy_series.copy()
+        btc = btc_series.copy()
+        
+        hy.index = hy.index.normalize()
+        btc.index = btc.index.normalize()
+        
+        # 교집합 데이터프레임 생성
+        df = pd.concat([hy, btc], axis=1).dropna()
         df.columns = ['Spread', 'Price']
         
-        # 일일 변동폭 (bps) 계산
+        if df.empty: return pd.DataFrame()
+        
+        # 일일 변동폭 계산 (bps)
         df['Spread_Chg_Bps'] = df['Spread'].diff() * 100
         
-        # 감지된 날짜들 (Events)
+        # 이벤트 감지
         events = df[df['Spread_Chg_Bps'] >= threshold_bps].index
         
         results = []
         for date in events:
-            # look_forward 일 후의 날짜 확인
             target_date = date + timedelta(days=look_forward)
             
-            # target_date가 데이터 범위 내에 있는지 확인
+            # 미래 데이터가 있는지 확인
             if target_date <= df.index[-1]:
                 price_at_signal = df.loc[date]['Price']
-                # target_date에 가장 가까운 미래 데이터 찾기 (주말 등 고려)
+                # target_date 이후 가장 가까운 날짜의 가격
                 future_data = df[df.index >= target_date]
+                
                 if not future_data.empty:
                     price_future = future_data.iloc[0]['Price']
                     price_chg_pct = (price_future - price_at_signal) / price_at_signal * 100
                     
-                    # 판단 (Spread 급등 -> BTC 하락해야 정상)
-                    # 하락했으면 "방어 성공(Success)", 올랐으면 "휩쏘(Whipsaw)"
                     outcome = "🛡️ 방어 성공" if price_chg_pct < 0 else "🎣 휩쏘 (False)"
                     
                     results.append({
                         "Date": date.strftime("%Y-%m-%d"),
-                        "Spike (bps)": f"+{df.loc[date]['Spread_Chg_Bps']:.1f}",
+                        "Spike": f"+{df.loc[date]['Spread_Chg_Bps']:.1f} bps",
                         "BTC Return": f"{price_chg_pct:+.2f}%",
                         "Outcome": outcome
                     })
         
         return pd.DataFrame(results).sort_values("Date", ascending=False)
         
-    except Exception as e:
+    except Exception:
         return pd.DataFrame()
+
+# -----------------------------------------------------------
+# [FUNC 3] Quant Analytics (Pure Calc)
+# -----------------------------------------------------------
+def run_quant_analysis_pure(liq_series, asset_series_daily):
+    try:
+        asset_weekly = asset_series_daily.resample('W-WED').last()
+        asset_yoy = asset_weekly.pct_change(52) * 100
+        df = pd.concat([liq_series, asset_yoy], axis=1).dropna()
+        df.columns = ['Liquidity_YoY', 'Price_YoY']
+        
+        if len(df) < 52: return None
+        
+        df['L_Smooth'] = df['Liquidity_YoY'].rolling(4).mean()
+        df['P_Smooth'] = df['Price_YoY'].rolling(4).mean()
+        df = df.dropna()
+        if df.empty: return None
+        
+        df['L_Z'] = (df['L_Smooth'] - df['L_Smooth'].mean()) / (df['L_Smooth'].std() + 1e-9)
+        df['P_Z'] = (df['P_Smooth'] - df['P_Smooth'].mean()) / (df['P_Smooth'].std() + 1e-9)
+
+        best_lag_weeks, best_corr = 0, -1.0
+        for lag in range(0, 53): 
+            corr = df['P_Z'].corr(df['L_Z'].shift(lag))
+            if corr > best_corr: best_corr, best_lag_weeks = corr, lag
+        
+        best_lag_days = best_lag_weeks * 7
+        recent_window = 4 
+        df['L_Z_Shifted'] = df['L_Z'].shift(best_lag_weeks)
+        df_recent = df.iloc[-recent_window:]
+        if len(df_recent) < recent_window: return None
+        
+        recent_corr = df_recent['P_Z'].corr(df_recent['L_Z_Shifted'])
+        last_val = df.iloc[-1]
+        gap_z = last_val['P_Z'] - last_val['L_Z_Shifted']
+        
+        if best_corr < 0: regime = "Inverse"
+        elif recent_corr > 0.5: regime = "Sync"
+        elif recent_corr < 0.0: regime = "Divergence" 
+        else: regime = "Weak"
+
+        return {
+            "optimal_lag": best_lag_days, "global_corr": best_corr,
+            "recent_corr": recent_corr, "gap_z": gap_z, "regime": regime
+        }
+    except Exception: return None
 
 # -----------------------------------------------------------
 # Main Logic
 # -----------------------------------------------------------
 try:
+    # 1. 상단: Risk Radar Display
+    if 'hy_spread' in raw and not raw['hy_spread'].empty:
+        risk_res = check_risk_radar(raw['hy_spread'])
+        if risk_res:
+            st.markdown("### ⚡ Risk Radar (HY Spread)")
+            r_col1, r_col2, r_col3 = st.columns([1, 1, 2])
+            with r_col1: 
+                st.metric("HY Spread", f"{risk_res['val']:.2f}%", f"{risk_res['daily_chg_bps']:+.0f} bps (Daily)", delta_color="inverse")
+            with r_col2: st.metric("Signal", risk_res['msg'])
+            with r_col3:
+                if risk_res['status'] == "Normal": st.success("안정적 (Risk-On)")
+                elif risk_res['status'] == "Warning": st.warning("주의 필요 (Spike)")
+                else: st.error("위험 (Risk-Off)")
+            st.divider()
+
+    # 2. 데이터 처리
     if not raw.get('fed', pd.Series()).empty:
-        # Macro & M2 Logic (Ver 18.4 Logic)
         base_idx = raw['fed'].resample('W-WED').last().index
         df_m = pd.DataFrame(index=base_idx)
+        
         for k in raw:
             if k not in [a['id'] for a in ASSETS_CONFIG] and k != 'diff':
                 try: df_m[k] = raw[k].reindex(df_m.index, method='ffill')
                 except: continue
+        
         df_m = df_m.fillna(method='ffill')
 
-        # G3 & M2 Calc (Omitted for brevity, same as Ver 18.4)
-        # ... (생략: 기존 완벽한 로직 유지) ...
-        # (실제 코드에는 Ver 18.4의 로직이 그대로 들어갑니다)
-        s_m2_us, s_m3_eu, s_m3_jp = df_m.get('m2_us'), df_m.get('m3_eu'), df_m.get('m3_jp')
-        if s_m2_us is not None and s_m3_eu is not None and s_m3_jp is not None:
-            m2_us = s_m2_us / 1000
-            m3_eu = (s_m3_eu * df_m.get('eur_usd', 1)) / 1e12
-            m3_jp = (s_m3_jp / df_m.get('usd_jpy', 1)) / 1e12
-            global_m2_sum = m2_us + m3_eu + m3_jp
-            df_m['Global_M2_Tril'] = global_m2_sum.interpolate(limit_direction='both')
-            df_m['Global_M2_YoY'] = df_m['Global_M2_Tril'].pct_change(52) * 100
-        else: df_m['Global_M2_YoY'] = pd.Series(dtype=float)
-        
+        # G3 Calc
         s_fed, s_ecb, s_boj = df_m.get('fed'), df_m.get('ecb'), df_m.get('boj')
         if s_fed is not None and s_ecb is not None and s_boj is not None:
             fed_t = s_fed / 1000000
@@ -259,10 +355,22 @@ try:
             df_m['G3_Asset_YoY'] = df_m['G3_Asset_Tril'].pct_change(52) * 100
         else: df_m['G3_Asset_YoY'] = pd.Series(dtype=float)
 
+        # Global M2 Calc (NaN Safe)
+        s_m2_us, s_m3_eu, s_m3_jp = df_m.get('m2_us'), df_m.get('m3_eu'), df_m.get('m3_jp')
+        if s_m2_us is not None and s_m3_eu is not None and s_m3_jp is not None:
+            m2_us = s_m2_us / 1000
+            m3_eu = (s_m3_eu * df_m.get('eur_usd', 1)) / 1e12
+            m3_jp = (s_m3_jp / df_m.get('usd_jpy', 1)) / 1e12
+            global_m2_sum = m2_us + m3_eu + m3_jp
+            df_m['Global_M2_Tril'] = global_m2_sum.interpolate(limit_direction='both')
+            df_m['Global_M2_YoY'] = df_m['Global_M2_Tril'].pct_change(52) * 100
+        else:
+            df_m['Global_M2_YoY'] = pd.Series(dtype=float)
+
         df_m['Fed_Net_Tril'] = (df_m.get('fed',0)/1000 - df_m.get('tga',0)/1000 - df_m.get('rrp',0)/1000000)
         df_m['Fed_Net_YoY'] = df_m['Fed_Net_Tril'].pct_change(52) * 100
 
-        # Shift
+        # Shift Logic
         def apply_shift(s, days):
             if s.empty: return pd.Series(dtype=float)
             new_s = s.copy()
@@ -276,8 +384,9 @@ try:
                 processed[asset['id']] = apply_shift(s, shift_days)
             else: processed[asset['id']] = pd.Series(dtype=float)
 
-        # Chart Render
+        # 3. Chart
         st.subheader(f"📊 Integrated Strategy Chart (Shift: {shift_days}d)")
+        
         start_viz = pd.to_datetime('2021-06-01') 
         def flt(s): return s[s.index >= start_viz] if not s.empty else s
 
@@ -309,8 +418,8 @@ try:
             legend=dict(orientation="h", y=1.12, x=0, bgcolor="rgba(0,0,0,0)"),
             hovermode="x", margin=dict(l=30, r=10, t=80, b=50)
         )
-        fig = go.Figure(layout=layout)
 
+        fig = go.Figure(layout=layout)
         if not liq_v.empty:
             h = liq_color.lstrip('#')
             rgb = tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
@@ -355,34 +464,100 @@ try:
 
         st.plotly_chart(fig, use_container_width=True, key="main_chart")
 
-        # ------------------------------------------------------------------
-        # [NEW] Stress Test & Backtest Display
-        # ------------------------------------------------------------------
+        # 4. Stress Test (시뮬레이션)
         st.markdown("---")
         st.subheader("📉 Crash Simulation (Stress Test)")
         st.caption(f"가정: HY Spread가 하루에 **{spike_threshold} bps 이상 급등**하면 즉시 매도 후 **{look_forward_days}일간 관망**했다면?")
 
         if 'hy_spread' in raw and 'btc' in raw:
-            # 원본 데이터 사용 (Shift 안 된 것)
+            # 원본(Shift 안 된) 데이터를 사용하여 시뮬레이션
             res_df = run_stress_test(raw['hy_spread'], raw['btc'], spike_threshold, look_forward_days)
             
             if not res_df.empty:
-                # 통계 계산
                 total_sigs = len(res_df)
                 success_sigs = len(res_df[res_df['Outcome'].str.contains("성공")])
                 success_rate = (success_sigs / total_sigs) * 100
                 
                 c1, c2, c3 = st.columns(3)
                 c1.metric("총 위험 신호 발생", f"{total_sigs} 회")
-                c2.metric("하락 방어 성공률", f"{success_rate:.1f}%", help="신호 발생 후 실제로 가격이 떨어진 비율")
+                c2.metric("하락 방어 성공률", f"{success_rate:.1f}%")
                 
-                # 최근 5개 사례만 보여주기 (Expandable)
                 st.dataframe(res_df.style.map(lambda x: 'color: #00FF7F' if '성공' in str(x) else ('color: #FF4500' if '휩쏘' in str(x) else ''), subset=['Outcome']), use_container_width=True)
             else:
-                st.info(f"설정하신 민감도({spike_threshold} bps)로는 지난 기간 동안 위험 신호가 감지되지 않았습니다. 민감도를 낮춰보세요.")
+                st.info(f"설정하신 민감도({spike_threshold} bps)로는 감지된 위험 신호가 없습니다.")
 
-        # ... (Quant Analytics - 생략되었으나 이전 코드와 동일) ...
+        # 5. Quant Analytics (Matrix)
+        st.markdown("---")
+        st.subheader("🛰️ Matrix Quant Analytics")
+        st.caption("비교 기준: Historical (2021~, 전체 역사) ↔ Recent (Last 30d, 최근 1달)")
+        
+        status_box = st.empty()
+        status_box.info("🚀 Starting Quant Analysis...")
+        
+        liquidity_sources = [
+            ("🇺🇸 Fed Net Liq", df_m['Fed_Net_YoY']),
+            ("🏛️ G3 Assets",    df_m.get('G3_Asset_YoY', pd.Series(dtype=float))),
+            ("🌍 Global M2",    df_m['Global_M2_YoY'])
+        ]
 
+        if active_assets:
+            asset_tabs = st.tabs([f"{a['name']}" for a in active_assets])
+            for tab, asset in zip(asset_tabs, active_assets):
+                with tab:
+                    status_box.caption(f"Analyzing {asset['name']}...")
+                    raw_asset_series = raw.get(asset['id'], pd.Series(dtype=float))
+                    
+                    if raw_asset_series.empty:
+                        st.warning("데이터 부족")
+                        continue
+                    
+                    results = []
+                    for liq_label, liq_data in liquidity_sources:
+                        if liq_data.empty: continue
+                        res = run_quant_analysis_pure(liq_data, raw_asset_series)
+                        if res:
+                            res['label'] = liq_label
+                            results.append(res)
+                    
+                    if not results:
+                        st.info("분석 데이터 부족")
+                        continue
+
+                    cols = st.columns(len(results))
+                    best_res = max(results, key=lambda x: x['global_corr'])
+                    
+                    for i, res in enumerate(results):
+                        with cols[i]:
+                            if res == best_res: st.markdown(f"#### ⭐ {res['label']}")
+                            else: st.markdown(f"#### {res['label']}")
+
+                            st.metric("Optimal Lag", f"{res['optimal_lag']} days")
+                            st.metric("Hist. Corr (4y)", f"{res['global_corr']:.2f}")
+                            st.metric("Recent Corr (30d)", f"{res['recent_corr']:.2f}", delta=f"{res['recent_corr'] - res['global_corr']:.2f}")
+                            
+                            regime_icon = "🟢" if "Sync" in res['regime'] else ("⚠️" if "Divergence" in res['regime'] else ("📉" if "Inverse" in res['regime'] else "⚪"))
+                            st.metric("Regime", f"{regime_icon} {res['regime']}")
+                            
+                            gap_state = "High" if res['gap_z'] > 1.0 else ("Low" if res['gap_z'] < -1.0 else "Fair")
+                            st.metric("Z-Gap", f"{res['gap_z']:+.2f} σ", gap_state, delta_color="inverse")
+                    
+                    if best_res['global_corr'] < 0:
+                        insight = f"**{asset['name']}**는 유동성과 **역상관(Inverse)** 관계입니다."
+                    else:
+                        insight = f"**{asset['name']}**는 **{best_res['label']}**와 밀접하며, 최근 **{best_res['regime']}** 상태입니다."
+                    st.info(f"**Insight:** {insight}")
+        
+        status_box.empty()
+
+        with st.expander("🔍 데이터 연결 리포트"):
+            active_ids_report = [a['id'] for a in ASSETS_CONFIG if selected_assets[a['id']]]
+            for asset in ASSETS_CONFIG:
+                if asset['id'] in active_ids_report:
+                    s = processed[asset['id']]
+                    if s.empty: st.error(f"❌ {asset['name']}: 로드 실패")
+                    else:
+                        extra = f" ({meta.get(asset['id'], 'OK')})" if asset['id'] in meta else ""
+                        st.success(f"✅ {asset['name']}: 로드 성공{extra}")
     else:
         st.error("❌ 데이터 로드 실패")
 
