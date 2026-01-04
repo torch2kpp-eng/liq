@@ -12,10 +12,10 @@ from datetime import date, timedelta
 
 # 1. 환경 설정
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="GM Deep Dive", layout="wide")
+st.set_page_config(page_title="GM High Sense", layout="wide")
 
-st.title("🏛️ Grand Master: Quant Deep Dive")
-st.caption("Ver 17.5 | Global(전체 역사) vs Local(최근 90일) 상관관계 비교 | 구조적 이탈 감지")
+st.title("🏛️ Grand Master: High Sensitivity Engine")
+st.caption("Ver 17.6 | 민감도 상향(30일) | G3 유동성 계산 오류(Zero-Fill) 수정 | 즉각적인 추세 감지")
 
 # -----------------------------------------------------------
 # [사이드바 설정]
@@ -193,13 +193,10 @@ def fetch_master_data_logic():
 raw, meta = fetch_master_data_logic()
 
 # -----------------------------------------------------------
-# [CORE] Quant Analytics (Comparison Engine)
+# [CORE] Quant Analytics (Deep Search + High Sense)
 # -----------------------------------------------------------
 @st.cache_data(show_spinner=False) 
 def run_quant_analysis_cached(liq_series, asset_series_daily):
-    """
-    Global(전체) vs Local(최근) 상관관계 비교 분석
-    """
     try:
         asset_weekly = asset_series_daily.resample('W-WED').last()
         asset_yoy = asset_weekly.pct_change(52) * 100
@@ -217,24 +214,21 @@ def run_quant_analysis_cached(liq_series, asset_series_daily):
         df['L_Z'] = (df['L_Smooth'] - df['L_Smooth'].mean()) / (df['L_Smooth'].std() + 1e-9)
         df['P_Z'] = (df['P_Smooth'] - df['P_Smooth'].mean()) / (df['P_Smooth'].std() + 1e-9)
 
-        # 1. Global Optimization (전체 기간 최적 시차 탐색)
+        # 1. Global (52주 탐색)
         best_lag_weeks = 0
-        best_corr = -1.0 # Global Max Corr
+        best_corr = -1.0 
         
-        # 1년(52주) 시차 탐색
         for lag in range(0, 53): 
             shifted_L = df['L_Z'].shift(lag)
             corr = df['P_Z'].corr(shifted_L)
-            # 양의 상관관계 우선 (트렌드 추종 확인)
             if corr > best_corr:
                 best_corr = corr
                 best_lag_weeks = lag
         
         best_lag_days = best_lag_weeks * 7
         
-        # 2. Local Correlation (최근 12주, 약 3달)
-        # Global에서 찾은 '최적 시차'를 적용했을 때, 최근에도 그 관계가 유효한가?
-        recent_window = 12
+        # 2. Local (최근 30일 = 4주) - [수정] 민감도 상향
+        recent_window = 4 
         df['L_Z_Shifted'] = df['L_Z'].shift(best_lag_weeks)
         df_recent = df.iloc[-recent_window:]
         
@@ -246,25 +240,20 @@ def run_quant_analysis_cached(liq_series, asset_series_daily):
         last_val = df.iloc[-1]
         gap_z = last_val['P_Z'] - last_val['L_Z_Shifted']
         
-        # 4. Regime 판단 (Global과 Recent 비교)
-        # Global이 양수인데 Recent가 음수면 -> 이탈
-        # Global 자체가 음수면 -> 역상관
-        
+        # 4. Regime (민감도에 맞춰 임계값 미세 조정 가능)
         if best_corr < 0:
             regime = "Inverse"
-        elif recent_corr > 0.6:
-            regime = "Strong Sync"
-        elif recent_corr > 0.2:
+        elif recent_corr > 0.5:
             regime = "Sync"
-        elif recent_corr < -0.2:
-            regime = "Divergence" # 이탈
+        elif recent_corr < 0.0: # 민감해진 만큼 기준을 조금 완화 (0.2 -> 0.0)
+            regime = "Divergence" 
         else:
-            regime = "Neutral"
+            regime = "Weak"
 
         return {
             "optimal_lag": best_lag_days,
-            "global_corr": best_corr,   # 전체 기간 (기준)
-            "recent_corr": recent_corr, # 최근 90일 (현재)
+            "global_corr": best_corr,
+            "recent_corr": recent_corr,
             "gap_z": gap_z,
             "regime": regime
         }
@@ -290,14 +279,43 @@ try:
         
         df_m = df_m.fillna(method='ffill')
 
+        # [수정] G3 Calculation (NaN 방어 로직)
+        # NaN을 0으로 채우지 않고, 그냥 연산하여 NaN으로 남김 -> 차트 끊김 방지
+        
+        # Fed (단위: Millions -> Trillions)
+        s_fed = df_m.get('fed')
+        if s_fed is not None: fed_t = s_fed / 1000000
+        else: fed_t = pd.Series(np.nan, index=df_m.index)
+
+        # ECB (단위: Millions Euro -> Trillions USD)
+        s_ecb = df_m.get('ecb')
+        s_eu = df_m.get('eur_usd')
+        if s_ecb is not None and s_eu is not None:
+            ecb_t = (s_ecb * s_eu) / 1000000
+        else: ecb_t = pd.Series(np.nan, index=df_m.index)
+
+        # BoJ (단위: 100 Million Yen -> Trillions USD)
+        s_boj = df_m.get('boj')
+        s_jy = df_m.get('usd_jpy')
+        if s_boj is not None and s_jy is not None:
+            # 1 (unit) = 1억엔 = 100,000,000 Yen
+            # USD = 100,000,000 / USDJPY
+            # Trillion = USD / 1,000,000,000,000
+            # Factor = 100,000,000 / 1e12 = 0.0001
+            boj_t = (s_boj * 0.0001) / s_jy
+        else: boj_t = pd.Series(np.nan, index=df_m.index)
+
+        # G3 Sum
+        df_m['G3_Asset_Tril'] = fed_t.fillna(0) + ecb_t.fillna(0) + boj_t.fillna(0)
+        # 0인 구간은 NaN 처리 (YoY 튀는 것 방지)
+        df_m['G3_Asset_Tril'] = df_m['G3_Asset_Tril'].replace(0, np.nan).interpolate()
+        
+        # 지표 생성
         df_m['Fed_Net_Tril'] = (df_m.get('fed',0)/1000 - df_m.get('tga',0)/1000 - df_m.get('rrp',0)/1000000)
         df_m['Fed_Net_YoY'] = df_m['Fed_Net_Tril'].pct_change(52) * 100
-
-        fed_t = df_m.get('fed',0)/1000
-        ecb_t = (df_m.get('ecb',0) * df_m.get('eur_usd',1)) / 1000000
-        boj_t = (df_m.get('boj',0) * 0.0001) / df_m.get('usd_jpy',1)
-        df_m['G3_Asset_YoY'] = (fed_t + ecb_t + boj_t).pct_change(52) * 100
-
+        
+        df_m['G3_Asset_YoY'] = df_m['G3_Asset_Tril'].pct_change(52) * 100
+        
         m2_us = df_m.get('m2_us',0) / 1000
         m3_eu = (df_m.get('m3_eu',0) * df_m.get('eur_usd',1)) / 1e12
         m3_jp = (df_m.get('m3_jp',0) / df_m.get('usd_jpy',1)) / 1e12
@@ -421,10 +439,10 @@ try:
         st.plotly_chart(fig, use_container_width=True, key="main_chart")
 
         st.markdown("---")
-        st.subheader("🛰️ Matrix Quant Analytics (Global vs Local)")
-        st.caption("비교 기준: Historical (2021~, 전체 역사) ↔ Recent (Last 90d, 최근 분기)")
+        st.subheader("🛰️ Matrix Quant Analytics (30-Day Sensitivity)")
+        st.caption("비교 기준: Historical (2021~, 전체 역사) ↔ Recent (Last 30d, 최근 1달)")
         
-        with st.spinner("Calculating Correlations..."):
+        with st.spinner("Analyzing with High Sensitivity..."):
             
             liquidity_sources = [
                 ("🇺🇸 Fed Net Liq", df_m['Fed_Net_YoY']),
@@ -463,28 +481,21 @@ try:
 
                                 st.metric("Optimal Lag", f"{res['optimal_lag']} days")
                                 
-                                # Global vs Recent 비교
-                                st.metric("Hist. Corr (4y)", f"{res['global_corr']:.2f}", help="2021년부터 현재까지의 전체 상관관계")
-                                st.metric("Recent Corr (90d)", f"{res['recent_corr']:.2f}", 
-                                          delta=f"{res['recent_corr'] - res['global_corr']:.2f}",
-                                          delta_color="normal",
-                                          help="최근 90일간의 상관관계 (Global 대비 변화량)")
+                                st.metric("Hist. Corr (4y)", f"{res['global_corr']:.2f}")
+                                # Recent Corr: 30 days
+                                st.metric("Recent Corr (30d)", f"{res['recent_corr']:.2f}", 
+                                          delta=f"{res['recent_corr'] - res['global_corr']:.2f}")
                                 
-                                regime_icon = "🟢" if res['regime']=="Sync" or res['regime']=="Strong Sync" else ("⚠️" if res['regime']=="Divergence" else "📉")
-                                st.metric("Regime Status", f"{regime_icon} {res['regime']}")
+                                regime_icon = "🟢" if res['regime']=="Sync" else ("⚠️" if res['regime']=="Divergence" else ("📉" if res['regime']=="Inverse" else "⚪"))
+                                st.metric("Regime", f"{regime_icon} {res['regime']}")
                                 
                                 gap_state = "High" if res['gap_z'] > 1.0 else ("Low" if res['gap_z'] < -1.0 else "Fair")
                                 st.metric("Z-Gap", f"{res['gap_z']:+.2f} σ", gap_state, delta_color="inverse")
                         
-                        # Insight Text Generation
                         if best_res['global_corr'] < 0:
-                            insight_msg = f"**{asset['name']}**는 역사적으로 유동성 지표들과 **역상관(Inverse)** 관계를 보여왔습니다. 유동성이 빠질 때 오히려 오르는 경향이 있거나, 다른 요인에 더 크게 반응합니다."
+                            insight_msg = f"**{asset['name']}**는 유동성 지표들과 **역상관(Inverse)** 관계입니다. 현재 시장이 유동성과 무관하게 움직이거나(Decoupling), 긴축에도 불구하고 상승하는 특이점(Anomaly)을 보이고 있습니다."
                         else:
-                            insight_msg = f"**{asset['name']}**는 역사적으로 **{best_res['label']}**와 가장 강한 동행(**{best_res['global_corr']:.2f}**)을 보입니다."
-                            if best_res['recent_corr'] < 0.2:
-                                insight_msg += f" 그러나 최근 90일간은 상관관계가 약화되어 **이탈(Divergence)** 조짐이 보입니다."
-                            else:
-                                insight_msg += f" 최근에도 이 관계는 견고하게 유지되고 있습니다."
+                            insight_msg = f"**{asset['name']}**는 **{best_res['label']}**와 가장 밀접하며, 최근 30일간의 움직임은 **{best_res['regime']}** 상태입니다. (반응 속도: {best_res['optimal_lag']}일)"
 
                         st.info(f"**Insight:** {insight_msg}")
 
