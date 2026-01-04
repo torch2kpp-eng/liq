@@ -12,17 +12,17 @@ from datetime import date, timedelta
 
 # 1. 환경 설정
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="GM Mobile Compact", layout="wide")
+st.set_page_config(page_title="GM Final Fix", layout="wide")
 
-st.title("🏛️ ASSET PRICE VS LIQUIDITY")
-st.caption("Ver 16.3 | MADE BY KIM EUIYOUNG | LAST UPDATE:2026.01.04")
+st.title("🏛️ Grand Master: Final Stability")
+st.caption("Ver 16.4 | 변수 스코프 에러(NameError) 수정 | 모바일 최적화 & 시각화 완료")
 
 # -----------------------------------------------------------
 # [사이드바 설정]
 # -----------------------------------------------------------
 st.sidebar.header("⚙️ Control Panel")
 
-# [핵심] 모바일 모드 토글
+# 모바일 모드 토글
 is_mobile = st.sidebar.checkbox("📱 모바일 모드 (축 공간 최소화)", value=True, help="체크 시 숫자를 짧게(150M) 표시하고 여백을 줄여 차트를 넓게 봅니다.")
 
 liq_option = st.sidebar.radio(
@@ -61,7 +61,7 @@ for asset in ASSETS_CONFIG:
     selected_assets[asset['id']] = st.sidebar.checkbox(f"{asset['name']}", value=asset['default'])
 
 # -----------------------------------------------------------
-# 데이터 수집 (안정성 유지)
+# 데이터 수집
 # -----------------------------------------------------------
 def fetch_master_data_logic():
     d = {}
@@ -198,7 +198,7 @@ def fetch_master_data_logic():
 raw, meta = fetch_master_data_logic()
 
 # -----------------------------------------------------------
-# Chart Generation
+# Logic & Chart
 # -----------------------------------------------------------
 if not raw.get('btc', pd.Series()).empty:
 
@@ -241,151 +241,4 @@ if not raw.get('btc', pd.Series()).empty:
         else:
             processed[asset['id']] = pd.Series(dtype=float)
 
-    st.subheader(f"📊 Integrated Strategy Chart (Shift: {shift_days}d)")
-    
-    start_viz = pd.to_datetime('2021-06-01') 
-    def flt(s): return s[s.index >= start_viz] if not s.empty else s
-
-    if "Global M2" in liq_option:
-        liq_v = flt(df_m['Global_M2_YoY'])
-        liq_name, liq_color = "Global M2", "#FF4500" # 이름 단축
-    elif "G3" in liq_option:
-        liq_v = flt(df_m['G3_Asset_YoY'])
-        liq_name, liq_color = "G3 Assets", "#FFD700" # 이름 단축
-    else:
-        liq_v = flt(df_m['Fed_Net_YoY'])
-        liq_name, liq_color = "Fed Net", "#00FF7F" # 이름 단축
-
-    if not liq_v.empty:
-        l_min, l_max = liq_v.min(), liq_v.max()
-        l_span = max(l_max - l_min, 10)
-        l_rng = [l_min - l_span*0.1, l_max + l_span*0.1]
-    else: l_rng = [-20, 20]
-
-    active_assets = [a for a in ASSETS_CONFIG if selected_assets[a['id']]]
-    num_active = len(active_assets)
-    
-    # -----------------------------------------------------------
-    # [핵심] 모바일 모드 설정 (조건부 레이아웃)
-    # -----------------------------------------------------------
-    if is_mobile:
-        # 모바일: 아주 좁은 간격, 숫자 축약(s)
-        tick_fmt = "s" # SI Unit (150M)
-        margin = 0.03  # 매우 좁게
-        font_size = 10
-        # 축 제목 숨김 또는 축약? -> 유지하되 작게
-    else:
-        # 데스크탑: 여유로운 간격, 전체 숫자
-        tick_fmt = "," 
-        margin = 0.05 if num_active > 5 else 0.08
-        font_size = 12
-
-    if num_active == 0: domain_end = 0.95
-    else:
-        domain_end = max(0.5, 1.0 - (num_active * margin))
-
-    spike_settings = dict(
-        showspikes=True, spikemode='across', spikesnap='cursor',
-        spikethickness=1, spikecolor='red', spikedash='dash'
-    )
-
-    layout = go.Layout(
-        template="plotly_dark", height=800,
-        xaxis=dict(
-            domain=[0.0, domain_end], 
-            showgrid=True, gridcolor='rgba(128,128,128,0.2)', 
-            **spike_settings
-        ),
-        yaxis=dict(
-            title=dict(text=liq_name, font=dict(color=liq_color, size=font_size)),
-            tickfont=dict(color=liq_color, size=font_size),
-            range=l_rng, showgrid=False, 
-            **spike_settings
-        ),
-        legend=dict(orientation="h", y=1.12, x=0, bgcolor="rgba(0,0,0,0)"),
-        hovermode="x",
-        margin=dict(l=30, r=10, t=80, b=50) # 여백 최소화
-    )
-
-    fig = go.Figure(layout=layout)
-
-    # 1. Liquidity Trace
-    if not liq_v.empty:
-        h = liq_color.lstrip('#')
-        rgb = tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
-        
-        if shift_days != 0:
-            last_date = liq_v.index.max()
-            start_date = last_date - pd.Timedelta(days=abs(shift_days))
-            fig.add_shape(
-                type="rect", x0=start_date, x1=last_date, y0=l_rng[0], y1=l_rng[1],
-                fillcolor="rgba(200, 200, 200, 0.15)", line=dict(width=0), layer="below"
-            )
-            fig.add_annotation(
-                x=last_date, y=l_rng[1], text=f"Lag:{abs(shift_days)}d",
-                showarrow=False, yshift=10, xshift=-40, font=dict(color="rgba(255,255,255,0.7)", size=10)
-            )
-
-        fig.add_trace(go.Scatter(
-            x=liq_v.index, y=liq_v, name=liq_name,
-            line=dict(color=liq_color, width=3),
-            fill='tozeroy', fillcolor=f"rgba({rgb[0]},{rgb[1]},{rgb[2]},0.15)",
-            yaxis='y', hoverinfo='none'
-        ))
-
-    # 2. Assets Trace
-    current_pos = domain_end
-    for i, asset in enumerate(active_assets):
-        data = flt(processed[asset['id']])
-        if data.empty: continue
-
-        axis_name = f'yaxis{i+2}'
-        axis_key = f'y{i+2}'
-
-        d_min, d_max = data.min(), data.max()
-        if d_min <= 0: d_min = 0.0001
-        
-        is_log = (asset['id'] == 'doge')
-        if is_log:
-            log_min, log_max = np.log10(d_min), np.log10(d_max)
-            span = log_max - log_min
-            rng = [log_min - span*0.1, log_max + span*0.1]
-            t_type = "log"
-        else:
-            span = d_max - d_min
-            rng = [d_min - span*0.2, d_max + span*0.1]
-            t_type = "linear"
-
-        # [핵심] 모바일 모드 설정 적용 (tickformat='s')
-        fig.update_layout({
-            axis_name: dict(
-                title=dict(text=asset['name'], font=dict(color=asset['color'], size=font_size)),
-                tickfont=dict(color=asset['color'], size=font_size),
-                overlaying="y", side="right", anchor="free", position=current_pos,
-                range=rng, type=t_type, showgrid=False, 
-                tickformat=tick_fmt, # 여기서 포맷 변경
-                **spike_settings
-            )
-        })
-
-        fig.add_trace(go.Scatter(
-            x=data.index, y=data, name=asset['name'],
-            line=dict(color=asset['color'], width=2),
-            yaxis=axis_key, hoverinfo='none'
-        ))
-        current_pos += margin
-
-    st.plotly_chart(fig, use_container_width=True)
-
-    with st.expander("🔍 데이터 연결 리포트"):
-        for asset in ASSETS_CONFIG:
-            if asset['id'] in active_ids:
-                s = processed[asset['id']]
-                if s.empty:
-                    st.error(f"❌ {asset['name']}: 로드 실패")
-                else:
-                    extra = f" ({meta.get(asset['id'], 'OK')})" if asset['id'] in meta else ""
-                    st.success(f"✅ {asset['name']}: 로드 성공{extra}")
-
-else:
-    st.error("❌ 비트코인 로드 실패")
+    st.subheader(f"📊
