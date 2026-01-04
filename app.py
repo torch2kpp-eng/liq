@@ -12,10 +12,10 @@ from datetime import date
 
 # 1. 환경 설정
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="GM Red Dash", layout="wide")
+st.set_page_config(page_title="GM Crosshair", layout="wide")
 
 st.title("🏛️ Grand Master: Clean View Terminal")
-st.caption("Ver 13.4 | 마우스 추적선 스타일 변경 (얇은 붉은색 파선)")
+st.caption("Ver 13.5 | 툴팁 제거 | 붉은색 십자선(Crosshair) 모드 적용")
 
 # -----------------------------------------------------------
 # [사이드바 설정]
@@ -215,25 +215,34 @@ if not raw.get('btc', pd.Series()).empty:
     domain_end = 1.0 - (num_axes * right_margin_per_axis)
     if domain_end < 0.6: domain_end = 0.6 
 
+    # [핵심] 공통 스파이크(십자선) 스타일 정의
+    common_spike = dict(
+        showspikes=True,
+        spikemode='across', # 축 끝까지 선 그리기
+        spikesnap='cursor', # 마우스 커서에 스냅
+        spikethickness=1,
+        spikecolor='red',
+        spikedash='dash'
+    )
+
     # Layout
     layout = go.Layout(
         template="plotly_dark", height=700,
-        # [핵심] Spikes 설정 수정 (세로선 스타일 변경)
+        
+        # X축 십자선 (세로)
         xaxis=dict(
             domain=[0.0, domain_end], 
             showgrid=True, 
             gridcolor='rgba(128,128,128,0.2)',
-            showspikes=True,
-            spikemode='across',
-            spikesnap='cursor',
-            spikethickness=1,      # 두께는 얇게 유지 (1px)
-            spikecolor='red',      # 선 색상: 붉은색
-            spikedash='dash'       # 선 스타일: 파선
+            **common_spike # 설정 적용
         ),
+        
+        # Y축 1 (유동성) 십자선 (가로)
         yaxis=dict(
             title=dict(text=liq_name, font=dict(color=liq_color)),
             tickfont=dict(color=liq_color),
-            range=l_rng, showgrid=False
+            range=l_rng, showgrid=False,
+            **common_spike # 설정 적용
         ),
         legend=dict(orientation="h", y=1.12, x=0, bgcolor="rgba(0,0,0,0)"),
         hovermode="x",
@@ -242,7 +251,7 @@ if not raw.get('btc', pd.Series()).empty:
     
     fig = go.Figure(layout=layout)
 
-    # Liquidity Trace (색상 계산 로직 분리 유지)
+    # Liquidity Trace
     if not liq_v.empty:
         h = liq_color.lstrip('#')
         rgb = tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
@@ -259,13 +268,15 @@ if not raw.get('btc', pd.Series()).empty:
 
     current_pos = domain_end 
 
+    # BTC Trace
     if show_btc and not btc_v.empty:
         fig.update_layout(yaxis2=dict(
             title=dict(text="BTC", font=dict(color="#00FFEE")),
             tickfont=dict(color="#00FFEE"),
             overlaying="y", side="right", 
             anchor="free", position=current_pos,
-            range=b_rng, showgrid=False, tickformat=","
+            range=b_rng, showgrid=False, tickformat=",",
+            **common_spike # 설정 적용 (가로선)
         ))
         fig.add_trace(go.Scatter(
             x=btc_v.index, y=btc_v, name="BTC", 
@@ -282,13 +293,15 @@ if not raw.get('btc', pd.Series()).empty:
             ))
         current_pos += right_margin_per_axis
 
+    # Nasdaq Trace
     if show_nasdaq and not nd_v.empty:
         fig.update_layout(yaxis3=dict(
             title=dict(text="NDX", font=dict(color="#D62780")),
             tickfont=dict(color="#D62780"),
             overlaying="y", side="right", 
             anchor="free", position=current_pos,
-            showgrid=False, tickformat=","
+            showgrid=False, tickformat=",",
+            **common_spike # 설정 적용
         ))
         fig.add_trace(go.Scatter(
             x=nd_v.index, y=nd_v, name="NDX", 
@@ -298,6 +311,7 @@ if not raw.get('btc', pd.Series()).empty:
         ))
         current_pos += right_margin_per_axis
 
+    # Doge Trace
     if show_doge and not dg_v.empty:
         fig.update_layout(yaxis4=dict(
             title=dict(text="DOGE", font=dict(color="orange")),
@@ -305,7 +319,8 @@ if not raw.get('btc', pd.Series()).empty:
             overlaying="y", side="right", 
             anchor="free", position=current_pos,
             type="log", range=d_rng,
-            showgrid=False
+            showgrid=False,
+            **common_spike # 설정 적용
         ))
         fig.add_trace(go.Scatter(
             x=dg_v.index, y=dg_v, name="DOGE", 
@@ -316,7 +331,7 @@ if not raw.get('btc', pd.Series()).empty:
         current_pos += right_margin_per_axis
 
     st.plotly_chart(fig, use_container_width=True)
-    st.success("✅ Clean View: 붉은색 파선(Dash) 가이드 적용 완료")
+    st.success("✅ Clean View: 붉은색 십자선(Crosshair) 모드 가동")
 
 else:
     st.error("데이터 로드 실패")
