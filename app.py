@@ -13,7 +13,7 @@ warnings.filterwarnings("ignore")
 
 st.set_page_config(page_title="GM Terminal Final", layout="wide")
 st.title("🏛️ Grand Master: Multi-Axis Final")
-st.caption("Ver 9.8 | ccxt + Bithumb KRW | Plotly trace 파라미터 완전 수정")
+st.caption("Ver 9.9 | 선형 스케일 + 동적 buffer 40% | 전체/확대 모두 잘 보이도록")
 
 @st.cache_data(ttl=3600, show_spinner="거래소 데이터 불러오는 중...")
 def fetch_data_final():
@@ -52,7 +52,6 @@ def fetch_data_final():
     except:
         d['doge'] = pd.Series(dtype=float)
 
-    # FRED
     def get_fred(series_id):
         try:
             url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
@@ -67,7 +66,6 @@ def fetch_data_final():
     d['tga'] = get_fred('WTREGEN')
     d['rrp'] = get_fred('RRPONTSYD')
 
-    # Nasdaq (yfinance)
     try:
         import yfinance as yf
         ns = yf.download("^IXIC", period="max", progress=False)
@@ -76,7 +74,6 @@ def fetch_data_final():
     except:
         d['nasdaq'] = pd.Series(dtype=float)
 
-    # Difficulty JSON
     try:
         with open('difficulty (1).json', 'r', encoding='utf-8') as f:
             js = json.load(f)['difficulty']
@@ -92,7 +89,6 @@ def fetch_data_final():
 raw = fetch_data_final()
 
 if not raw.get('btc', pd.Series()).empty and isinstance(raw['btc'].index, pd.DatetimeIndex):
-    # Liquidity
     df_liq = raw['fed'].resample('W-WED').last().to_frame(name='Fed')
     if not raw['tga'].empty:
         df_liq['TGA'] = raw['tga'].resample('W-WED').mean()
@@ -107,7 +103,6 @@ if not raw.get('btc', pd.Series()).empty and isinstance(raw['btc'].index, pd.Dat
     )
     df_liq['YoY'] = df_liq['Net_Tril'].pct_change(52) * 100
 
-    # Mining Cost Floor
     df_c = pd.DataFrame(index=raw['btc'].index)
     if not raw['diff'].empty:
         df_c['diff'] = raw['diff'].reindex(df_c.index).interpolate(method='time')
@@ -150,35 +145,74 @@ if not raw.get('btc', pd.Series()).empty and isinstance(raw['btc'].index, pd.Dat
     nd_v = safe_filter(nasdaq_s, start_viz_dt)
     dg_v = safe_filter(doge_s, start_viz_dt)
 
-    # BTC Y축 범위
+    # BTC Y축 동적 범위 (buffer 40%)
     if not btc_v.empty:
-        btc_max = btc_v.max()
-        btc_min_dynamic = max(btc_max * 0.05, 10_000_000)
-        btc_max_dynamic = btc_max * 1.2
+        btc_min_raw = btc_v.min()
+        btc_max_raw = btc_v.max()
+        
+        buffer = 0.40  # 40% 여유 공간
+        btc_min_dynamic = max(btc_min_raw * (1 - buffer), 1_000_000)  # 최소 100만 원
+        btc_max_dynamic = btc_max_raw * (1 + buffer)
     else:
-        btc_min_dynamic = 10_000_000
-        btc_max_dynamic = 500_000_000_000
+        btc_min_dynamic = 1_000_000
+        btc_max_dynamic = 300_000_000_000
 
     fig = go.Figure(
         layout=go.Layout(
             template="plotly_dark",
             height=800,
             xaxis=dict(domain=[0.0, 0.88], showgrid=True, gridcolor='rgba(128,128,128,0.2)'),
-            yaxis=dict(title="Liquidity YoY %", title_font_color="#FFD700", tickfont_color="#FFD700", range=[-50, 80]),
-            yaxis2=dict(title="BTC (KRW)", title_font_color="#00FFEE", tickfont_color="#00FFEE",
-                        overlaying="y", side="right", position=0.88, type="linear",
-                        range=[btc_min_dynamic, btc_max_dynamic], tickformat=",", showgrid=False),
-            yaxis3=dict(title="Nasdaq", title_font_color="#D62780", tickfont_color="#D62780",
-                        overlaying="y", side="right", anchor="free", position=0.96, tickformat=","),
-            yaxis4=dict(title="DOGE (Log)", title_font_color="orange", tickfont_color="orange",
-                        overlaying="y", side="right", anchor="free", position=1.0, type="log"),
+            
+            yaxis=dict(
+                title="Liquidity YoY %",
+                title_font_color="#FFD700",
+                tickfont_color="#FFD700",
+                range=[-50, 80]
+            ),
+            
+            yaxis2=dict(
+                title="BTC (KRW)",
+                title_font_color="#00FFEE",
+                tickfont_color="#00FFEE",
+                overlaying="y",
+                side="right",
+                position=0.88,
+                type="linear",
+                range=[btc_min_dynamic, btc_max_dynamic],
+                autorange=False,          # 우리가 직접 범위 제어
+                fixedrange=False,         # 사용자가 zoom 가능
+                tickformat=",",
+                showgrid=False
+            ),
+            
+            yaxis3=dict(
+                title="Nasdaq",
+                title_font_color="#D62780",
+                tickfont_color="#D62780",
+                overlaying="y",
+                side="right",
+                anchor="free",
+                position=0.96,
+                tickformat=","
+            ),
+            
+            yaxis4=dict(
+                title="DOGE (Log)",
+                title_font_color="orange",
+                tickfont_color="orange",
+                overlaying="y",
+                side="right",
+                anchor="free",
+                position=1.0,
+                type="log"
+            ),
+            
             legend=dict(orientation="h", y=1.15, x=0.01, bgcolor="rgba(0,0,0,0)"),
             hovermode="x unified",
             margin=dict(l=60, r=140, t=100, b=60)
         )
     )
 
-    # Liquidity trace - 여기서 line_color → line=dict(color=...) 수정 (핵심 해결)
     fig.add_trace(go.Scatter(
         x=liq_v.index,
         y=liq_v,
@@ -193,7 +227,10 @@ if not raw.get('btc', pd.Series()).empty and isinstance(raw['btc'].index, pd.Dat
     if not btc_v.empty:
         fig.add_trace(go.Scatter(
             x=btc_v.index, y=btc_v, name="BTC (-90d)",
-            line=dict(color='#00FFEE', width=4.5), yaxis='y2'
+            mode='lines',
+            line=dict(color='#00FFEE', width=4.5),
+            hovertemplate='%{x|%Y-%m-%d}<br>₩%{y:,.0f}<extra></extra>',
+            yaxis='y2'
         ))
 
     if not fl_v.empty:
@@ -215,8 +252,8 @@ if not raw.get('btc', pd.Series()).empty and isinstance(raw['btc'].index, pd.Dat
         ))
 
     st.plotly_chart(fig, use_container_width=True)
-    st.success("✅ 차트 생성 완료 (Bithumb 실거래 KRW 기준)")
+    st.success("✅ 차트 생성 완료 (선형 스케일 + 40% buffer 적용)")
 
 else:
     st.error("❌ BTC 데이터 로드 실패")
-    st.info("• ccxt 라이브러리 버전 확인 (최소 4.0 이상)\n• 인터넷 연결 상태 점검\n• Streamlit Cloud 재배포 시도")
+    st.info("• ccxt 라이브러리 버전 확인\n• 인터넷 연결 상태 점검\n• Streamlit Cloud 재배포 시도")
