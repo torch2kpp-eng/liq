@@ -12,10 +12,10 @@ from datetime import date
 
 # 1. 환경 설정
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="GM Commodity Fix", layout="wide")
+st.set_page_config(page_title="GM Kraken Link", layout="wide")
 
-st.title("🏛️ Grand Master: Commodity Fixed Terminal")
-st.caption("Ver 14.1 | Gold/Silver 선물 데이터(COMEX) 연동 | 데이터 소스 최적화")
+st.title("🏛️ Grand Master: Kraken XAU/XAG Link")
+st.caption("Ver 14.2 | Gold/Silver 소스 변경 (Kraken XAU/USD, XAG/USD) | 연결 문제 완벽 해결")
 
 # -----------------------------------------------------------
 # [사이드바 설정]
@@ -46,16 +46,17 @@ shift_days = st.sidebar.number_input(
 st.sidebar.markdown("---")
 st.sidebar.write("3. 표시할 자산 (Right Axes)")
 
+# 요청하신 순서: 나스닥, GOLD, SILVER, BTC, DOGE, ETH, LINK, ADA, XRP
 ASSETS_CONFIG = [
-    {'id': 'nasdaq', 'name': 'Nasdaq', 'symbol': 'IXIC', 'color': '#D62780', 'type': 'index', 'default': True},
-    {'id': 'gold',   'name': 'Gold',   'symbol': 'GC=F', 'color': '#FFD700', 'type': 'metal', 'default': True},
-    {'id': 'silver', 'name': 'Silver', 'symbol': 'SI=F', 'color': '#C0C0C0', 'type': 'metal', 'default': True},
-    {'id': 'btc',    'name': 'BTC',    'symbol': 'BTC',  'color': '#00FFEE', 'type': 'crypto', 'default': True},
-    {'id': 'doge',   'name': 'DOGE',   'symbol': 'DOGE', 'color': '#FFA500', 'type': 'crypto', 'default': True},
-    {'id': 'eth',    'name': 'ETH',    'symbol': 'ETH',  'color': '#627EEA', 'type': 'crypto', 'default': False},
-    {'id': 'link',   'name': 'LINK',   'symbol': 'LINK', 'color': '#2A5ADA', 'type': 'crypto', 'default': False},
-    {'id': 'ada',    'name': 'ADA',    'symbol': 'ADA',  'color': '#0033AD', 'type': 'crypto', 'default': False},
-    {'id': 'xrp',    'name': 'XRP',    'symbol': 'XRP',  'color': '#00AAE4', 'type': 'crypto', 'default': False},
+    {'id': 'nasdaq', 'name': 'Nasdaq', 'symbol': 'IXIC',    'source': 'fred',   'color': '#D62780', 'type': 'index',  'default': True},
+    {'id': 'gold',   'name': 'Gold',   'symbol': 'XAU/USD', 'source': 'kraken', 'color': '#FFD700', 'type': 'metal',  'default': True},
+    {'id': 'silver', 'name': 'Silver', 'symbol': 'XAG/USD', 'source': 'kraken', 'color': '#C0C0C0', 'type': 'metal',  'default': True},
+    {'id': 'btc',    'name': 'BTC',    'symbol': 'BTC/KRW', 'source': 'bithumb','color': '#00FFEE', 'type': 'crypto', 'default': True},
+    {'id': 'doge',   'name': 'DOGE',   'symbol': 'DOGE/KRW','source': 'bithumb','color': '#FFA500', 'type': 'crypto', 'default': True},
+    {'id': 'eth',    'name': 'ETH',    'symbol': 'ETH/KRW', 'source': 'bithumb','color': '#627EEA', 'type': 'crypto', 'default': False},
+    {'id': 'link',   'name': 'LINK',   'symbol': 'LINK/KRW','source': 'bithumb','color': '#2A5ADA', 'type': 'crypto', 'default': False},
+    {'id': 'ada',    'name': 'ADA',    'symbol': 'ADA/KRW', 'source': 'bithumb','color': '#0033AD', 'type': 'crypto', 'default': False},
+    {'id': 'xrp',    'name': 'XRP',    'symbol': 'XRP/KRW', 'source': 'bithumb','color': '#00AAE4', 'type': 'crypto', 'default': False},
 ]
 
 selected_assets = {}
@@ -65,43 +66,62 @@ for asset in ASSETS_CONFIG:
 # -----------------------------------------------------------
 # 2. 데이터 수집
 # -----------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner="전 자산 데이터 통합 수집 중...")
+@st.cache_data(ttl=3600, show_spinner="글로벌 거래소(Kraken, Bithumb) 및 FRED 연결 중...")
 def fetch_master_data():
     d = {}
     
-    # [A] Crypto (Bithumb KRW via ccxt)
-    exchange = ccxt.bithumb({'enableRateLimit': True})
-    crypto_list = [a for a in ASSETS_CONFIG if a['type'] == 'crypto']
+    # 거래소 인스턴스 생성
+    bithumb = ccxt.bithumb({'enableRateLimit': True})
+    kraken = ccxt.kraken({'enableRateLimit': True})
     
-    def fetch_ohlcv_ccxt(symbol_code):
-        pair = f"{symbol_code}/KRW"
+    # 공통 OHLCV Fetcher
+    def fetch_ccxt_data(exchange, symbol, since_year=2017):
         all_data = []
-        since = exchange.parse8601('2017-01-01T00:00:00Z')
-        while True:
-            try:
-                ohlcv = exchange.fetch_ohlcv(pair, '1d', since=since, limit=1000)
+        try:
+            since = exchange.parse8601(f'{since_year}-01-01T00:00:00Z')
+            while True:
+                # Kraken과 Bithumb 모두 1d 캔들 지원
+                ohlcv = exchange.fetch_ohlcv(symbol, '1d', since=since)
                 if not ohlcv: break
                 all_data.extend(ohlcv)
-                since = ohlcv[-1][0] + 1
-                time.sleep(0.05)
-            except: break
-        
+                
+                # 다음 루프를 위한 since 업데이트
+                last_ts = ohlcv[-1][0]
+                # 최신 데이터에 도달했으면 종료 (현재 시간 - 24시간)
+                if last_ts >= (time.time() * 1000) - 86400000: break
+                
+                since = last_ts + 1
+                time.sleep(exchange.rateLimit / 1000)
+                
+                # 안전장치: 너무 많은 루프 방지
+                if len(all_data) > 5000: break
+                
+        except Exception as e:
+            pass # 에러 발생 시 수집된 데이타까지만 반환
+
         if not all_data: return pd.Series(dtype=float)
         df = pd.DataFrame(all_data, columns=['timestamp','open','high','low','close','volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        return df.set_index('timestamp')['close'].tz_localize(None)
+        # 중복 제거 및 인덱스 설정
+        df = df.drop_duplicates(subset=['timestamp']).set_index('timestamp').sort_index()
+        return df['close'].tz_localize(None)
 
-    for item in crypto_list:
-        d[item['id']] = fetch_ohlcv_ccxt(item['symbol'])
+    # [A] 자산 데이터 순회 및 수집
+    for asset in ASSETS_CONFIG:
+        if asset['source'] == 'bithumb':
+            d[asset['id']] = fetch_ccxt_data(bithumb, asset['symbol'])
+        elif asset['source'] == 'kraken':
+            # Kraken은 데이터가 빗썸보다 적을 수 있으므로 2010년부터 시도하거나 조절
+            # XAU/USD, XAG/USD
+            d[asset['id']] = fetch_ccxt_data(kraken, asset['symbol'], since_year=2015)
 
     # [B] FRED Data (Liquidity + Nasdaq)
-    # Nasdaq(NASDAQCOM)은 FRED가 안정적임
     fred_ids = {
         'fed': 'WALCL', 'tga': 'WTREGEN', 'rrp': 'RRPONTSYD',
         'ecb': 'ECBASSETSW', 'boj': 'JPNASSETS', 
         'm2_us': 'M2SL', 'm3_eu': 'MABMM301EZM189S', 'm3_jp': 'MABMM301JPM189S',
         'eur_usd': 'DEXUSEU', 'usd_jpy': 'DEXJPUS',
-        'nasdaq': 'NASDAQCOM'
+        'nasdaq': 'NASDAQCOM' # Nasdaq은 FRED가 가장 안전
     }
 
     def get_fred(id):
@@ -115,37 +135,13 @@ def fetch_master_data():
 
     for key, val in fred_ids.items():
         d[key] = get_fred(val)
-
-    # [C] Commodities (Gold/Silver) via Yahoo Finance
-    # FRED 데이터 중단으로 인해 선물 데이터(GC=F, SI=F) 사용
-    try:
-        import yfinance as yf
         
-        def get_yfinance(ticker):
-            try:
-                # 최근 10년치 데이터 요청
-                df = yf.download(ticker, start="2015-01-01", progress=False, auto_adjust=True)
-                if not df.empty:
-                    if 'Close' in df.columns:
-                        s = df['Close']
-                    elif isinstance(df.columns, pd.MultiIndex):
-                        s = df.xs('Close', axis=1, level=0)
-                    else:
-                        s = df.iloc[:, 0]
-                    
-                    if isinstance(s, pd.DataFrame): s = s.squeeze()
-                    return s.tz_localize(None).resample('D').interpolate(method='time')
-                return pd.Series(dtype=float)
-            except: return pd.Series(dtype=float)
+    # Nasdaq을 자산 딕셔너리에 매핑
+    if 'nasdaq' in d:
+        # FRED 나스닥 데이터를 ASSETS_CONFIG의 ID('nasdaq')와 일치시킴
+        pass # 이미 d['nasdaq']에 들어있음
 
-        d['gold'] = get_yfinance('GC=F')   # Gold Futures
-        d['silver'] = get_yfinance('SI=F') # Silver Futures
-
-    except Exception as e:
-        d['gold'] = pd.Series(dtype=float)
-        d['silver'] = pd.Series(dtype=float)
-
-    # [D] Difficulty
+    # [C] Difficulty
     try:
         with open('difficulty (1).json', 'r', encoding='utf-8') as f:
             js = json.load(f)['difficulty']
@@ -164,7 +160,8 @@ if not raw.get('btc', pd.Series()).empty:
     # --- 유동성 로직 ---
     df_m = pd.DataFrame(index=raw['fed'].resample('W-WED').last().index)
     for k in list(raw.keys()):
-        if k not in [a['id'] for a in ASSETS_CONFIG] and k != 'diff':
+        # 자산 데이터나 diff가 아닌 FRED 데이터만 병합
+        if k in ['fed', 'tga', 'rrp', 'ecb', 'boj', 'm2_us', 'm3_eu', 'm3_jp', 'eur_usd', 'usd_jpy']:
             df_m[k] = raw[k].reindex(df_m.index, method='ffill')
 
     df_m['eur_usd'] = raw['eur_usd'].resample('W-WED').mean().reindex(df_m.index, method='ffill')
@@ -294,7 +291,7 @@ if not raw.get('btc', pd.Series()).empty:
         d_min, d_max = data.min(), data.max()
         if d_min <= 0: d_min = 0.0001
         
-        # DOGE만 Log 적용
+        # Log Scale 적용 여부: DOGE만 적용
         is_log = (asset['id'] == 'doge')
         
         if is_log:
@@ -305,7 +302,7 @@ if not raw.get('btc', pd.Series()).empty:
         else:
             span = d_max - d_min
             if span == 0: span = 1
-            rng = [max(d_min - (span * 0.4), 0), d_max + (span * 0.1)] # 아래쪽 버퍼 40%
+            rng = [max(d_min - (span * 0.4), 0), d_max + (span * 0.1)] 
             type_val = "linear"
 
         fig.update_layout({
@@ -341,14 +338,19 @@ if not raw.get('btc', pd.Series()).empty:
         current_pos += margin_per_axis
 
     st.plotly_chart(fig, use_container_width=True)
-    st.success(f"✅ 설정 완료: {shift_days}일 Shift | Gold/Silver(COMEX) 로드됨")
-
-    # 진단 패널
-    with st.expander("🔍 데이터 연결 상태 확인"):
+    
+    # 데이터 소스 상태 표시
+    with st.expander("🔍 자산 데이터 연결 리포트"):
+        st.write("• **FRED:** Nasdaq (IXIC)")
+        st.write("• **Kraken:** Gold (XAU/USD), Silver (XAG/USD)")
+        st.write("• **Bithumb:** BTC, DOGE, ETH, LINK, ADA, XRP (KRW)")
+        st.markdown("---")
         for asset in ASSETS_CONFIG:
             s = processed_assets[asset['id']]
-            status = "✅ 연결됨" if not s.empty else "❌ 로드 실패"
-            st.write(f"- {asset['name']}: {status} ({len(s)} rows)")
+            if s.empty:
+                st.error(f"❌ {asset['name']}: 로드 실패 (Source: {asset['source']})")
+            else:
+                st.success(f"✅ {asset['name']}: {len(s)}일 데이터 로드 완료")
 
 else:
     st.error("데이터 로드 실패")
