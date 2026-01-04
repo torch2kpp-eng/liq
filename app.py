@@ -12,10 +12,10 @@ from datetime import date
 
 # 1. 환경 설정
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="GM Clean View", layout="wide")
+st.set_page_config(page_title="GM Red Dash", layout="wide")
 
 st.title("🏛️ Grand Master: Clean View Terminal")
-st.caption("Ver 13.3 | 구문 오류(Syntax Error) 수정 | 툴팁 제거 & 스파이크 라인 적용")
+st.caption("Ver 13.4 | 마우스 추적선 스타일 변경 (얇은 붉은색 파선)")
 
 # -----------------------------------------------------------
 # [사이드바 설정]
@@ -218,6 +218,7 @@ if not raw.get('btc', pd.Series()).empty:
     # Layout
     layout = go.Layout(
         template="plotly_dark", height=700,
+        # [핵심] Spikes 설정 수정 (세로선 스타일 변경)
         xaxis=dict(
             domain=[0.0, domain_end], 
             showgrid=True, 
@@ -225,9 +226,9 @@ if not raw.get('btc', pd.Series()).empty:
             showspikes=True,
             spikemode='across',
             spikesnap='cursor',
-            spikethickness=1,
-            spikecolor='white',
-            spikedash='solid'
+            spikethickness=1,      # 두께는 얇게 유지 (1px)
+            spikecolor='red',      # 선 색상: 붉은색
+            spikedash='dash'       # 선 스타일: 파선
         ),
         yaxis=dict(
             title=dict(text=liq_name, font=dict(color=liq_color)),
@@ -241,9 +242,8 @@ if not raw.get('btc', pd.Series()).empty:
     
     fig = go.Figure(layout=layout)
 
-    # 1. Liquidity Trace (구문 오류 수정: 색상 계산 로직 분리)
+    # Liquidity Trace (색상 계산 로직 분리 유지)
     if not liq_v.empty:
-        # [수정됨] 색상 변환을 미리 수행하여 f-string 복잡도 제거
         h = liq_color.lstrip('#')
         rgb = tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
         fill_rgba = f"rgba({rgb[0]}, {rgb[1]}, {rgb[2]}, 0.15)"
@@ -252,14 +252,13 @@ if not raw.get('btc', pd.Series()).empty:
             x=liq_v.index, y=liq_v, name=liq_name, 
             line=dict(color=liq_color, width=3), 
             fill='tozeroy', 
-            fillcolor=fill_rgba, # 수정된 변수 사용
+            fillcolor=fill_rgba,
             yaxis='y',
             hoverinfo='none'
         ))
 
     current_pos = domain_end 
 
-    # 2. Bitcoin Trace
     if show_btc and not btc_v.empty:
         fig.update_layout(yaxis2=dict(
             title=dict(text="BTC", font=dict(color="#00FFEE")),
@@ -283,7 +282,6 @@ if not raw.get('btc', pd.Series()).empty:
             ))
         current_pos += right_margin_per_axis
 
-    # 3. Nasdaq Trace
     if show_nasdaq and not nd_v.empty:
         fig.update_layout(yaxis3=dict(
             title=dict(text="NDX", font=dict(color="#D62780")),
@@ -300,7 +298,6 @@ if not raw.get('btc', pd.Series()).empty:
         ))
         current_pos += right_margin_per_axis
 
-    # 4. Doge Trace
     if show_doge and not dg_v.empty:
         fig.update_layout(yaxis4=dict(
             title=dict(text="DOGE", font=dict(color="orange")),
@@ -319,7 +316,7 @@ if not raw.get('btc', pd.Series()).empty:
         current_pos += right_margin_per_axis
 
     st.plotly_chart(fig, use_container_width=True)
-    st.success("✅ Clean View: 박스 제거 및 스파이크 라인 적용 완료")
+    st.success("✅ Clean View: 붉은색 파선(Dash) 가이드 적용 완료")
 
 else:
     st.error("데이터 로드 실패")
