@@ -12,10 +12,10 @@ from datetime import date, timedelta
 
 # 1. 환경 설정
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="GM Ultimate", layout="wide")
+st.set_page_config(page_title="GM Z-Gap Trend", layout="wide")
 
 st.title("🏛️ Grand Master: Analytics Engine")
-st.caption("Ver 19.5 | Z-Gap 가이드 탑재 | 정밀 시차(112일) 적용 | 완전 무결성 버전")
+st.caption("Ver 19.6 | Z-Gap Trend Chart 탑재 | 4대 자산(BTC, DOGE, ETH, LINK) 심리 궤적 추적")
 
 # -----------------------------------------------------------
 # [사이드바 설정]
@@ -349,7 +349,66 @@ try:
                     elif "Inverse" in regime: st.error(f"📉 역상관 (Inverse)")
                     else: st.info(f"⚪ 약세 (Weak)")
     
-    # [NEW] Z-Gap Guide Expander (상단 배치)
+    # [NEW] Z-Gap Trend Chart
+    st.markdown("#### 🌊 Z-Gap Trend Monitor (BTC, ETH, DOGE, LINK)")
+    
+    target_z_assets = ['btc', 'eth', 'doge', 'link']
+    z_chart_data = {}
+    
+    # 4개 종목에 대해 Z-Gap 시리즈 계산
+    for t_asset in target_z_assets:
+        if t_asset in raw and not raw[t_asset].empty and not df_m['Global_M2_YoY'].empty:
+            # 로컬 계산 (시리즈 확보용)
+            asset_series_daily = raw[t_asset]
+            asset_weekly = asset_series_daily.resample('W-WED').last()
+            asset_yoy = asset_weekly.pct_change(52) * 100
+            df_z = pd.concat([df_m['Global_M2_YoY'], asset_yoy], axis=1).dropna()
+            df_z.columns = ['Liquidity_YoY', 'Price_YoY']
+            
+            if len(df_z) > 20:
+                df_z['L_Smooth'] = df_z['Liquidity_YoY'].rolling(4).mean()
+                df_z['P_Smooth'] = df_z['Price_YoY'].rolling(4).mean()
+                df_z = df_z.dropna()
+                
+                df_z['L_Z'] = (df_z['L_Smooth'] - df_z['L_Smooth'].mean()) / (df_z['L_Smooth'].std() + 1e-9)
+                df_z['P_Z'] = (df_z['P_Smooth'] - df_z['P_Smooth'].mean()) / (df_z['P_Smooth'].std() + 1e-9)
+                
+                # [Shift 112 Days = 16 Weeks]
+                df_z['L_Z_Shifted'] = df_z['L_Z'].shift(16)
+                df_z['Gap_Z'] = df_z['P_Z'] - df_z['L_Z_Shifted']
+                z_chart_data[t_asset] = df_z['Gap_Z'].dropna()
+
+    if z_chart_data:
+        # 차트 그리기
+        fig_z = go.Figure()
+        
+        # 기준선 (Zones)
+        x_min = min([s.index.min() for s in z_chart_data.values()])
+        x_max = max([s.index.max() for s in z_chart_data.values()])
+        
+        fig_z.add_shape(type="rect", x0=x_min, x1=x_max, y0=-2.0, y1=-5.0, fillcolor="rgba(0, 255, 127, 0.1)", line=dict(width=0), layer="below") # Green Zone
+        fig_z.add_shape(type="rect", x0=x_min, x1=x_max, y0=1.5, y1=5.0, fillcolor="rgba(255, 69, 0, 0.1)", line=dict(width=0), layer="below")   # Red Zone
+        
+        fig_z.add_hline(y=0, line_dash="dot", line_color="gray", opacity=0.5)
+        fig_z.add_hline(y=1.5, line_dash="dash", line_color="red", annotation_text="Overheat (+1.5σ)", annotation_position="top right")
+        fig_z.add_hline(y=-2.0, line_dash="dash", line_color="#00FF7F", annotation_text="Deep Value (-2.0σ)", annotation_position="bottom right")
+
+        # 자산별 라인 추가
+        colors = {'btc': '#00FFEE', 'eth': '#627EEA', 'doge': '#FFA500', 'link': '#2A5ADA'}
+        names = {'btc': 'BTC', 'eth': 'ETH', 'doge': 'DOGE', 'link': 'LINK'}
+        
+        for t_asset, series in z_chart_data.items():
+            fig_z.add_trace(go.Scatter(x=series.index, y=series, name=names[t_asset], line=dict(color=colors[t_asset], width=2)))
+
+        fig_z.update_layout(
+            template="plotly_dark", height=350, margin=dict(l=20, r=20, t=30, b=20),
+            yaxis=dict(title="Z-Gap (Sigma)", range=[-3.5, 3.5]),
+            xaxis=dict(showgrid=True, gridcolor='rgba(128,128,128,0.2)'),
+            legend=dict(orientation="h", y=1.1, x=0.5, xanchor="center")
+        )
+        st.plotly_chart(fig_z, use_container_width=True)
+
+    # Z-Gap Guide
     with st.expander("ℹ️ Z-Gap 해석 가이드 (Signal Traffic Light) - 클릭하여 펼치기"):
         st.markdown("""
         | 구간 (Sigma) | 상태 | 의미 (Meaning) | 행동 요령 (Action) |
