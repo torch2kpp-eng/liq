@@ -15,7 +15,7 @@ warnings.filterwarnings("ignore")
 st.set_page_config(page_title="GM Mobile Optimized", layout="wide")
 
 st.title("🏛️ Grand Master: Dynamic Mobile View")
-st.caption("Ver 12.0 | 자산 선택 기능 | 도지코인 스케일 완벽 보정 | 모바일 최적화")
+st.caption("Ver 12.1 | Nasdaq 차트 출력 오류 수정 | 데이터 로드 현황판 추가")
 
 # -----------------------------------------------------------
 # [사이드바 설정]
@@ -29,17 +29,17 @@ liq_option = st.sidebar.radio(
     index=1
 )
 
-# 2. 자산 선택 (멀티 셀렉트) - 사용자가 보고 싶은 것만 선택
+# 2. 자산 선택 (멀티 셀렉트)
 st.sidebar.markdown("---")
 st.sidebar.write("2. 표시할 자산 (Right Axes)")
 show_btc = st.sidebar.checkbox("Bitcoin (BTC)", value=True)
 show_doge = st.sidebar.checkbox("Dogecoin (DOGE)", value=True)
-show_nasdaq = st.sidebar.checkbox("Nasdaq", value=False) # 모바일 공간 절약을 위해 기본은 끔
+show_nasdaq = st.sidebar.checkbox("Nasdaq (IXIC)", value=True) # 기본값을 True로 변경
 
 # -----------------------------------------------------------
-# 2. 데이터 수집 (캐시 적용)
+# 2. 데이터 수집
 # -----------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner="데이터 동기화 및 스케일 조정 중...")
+@st.cache_data(ttl=3600, show_spinner="데이터 동기화 중...")
 def fetch_master_data():
     d = {}
     
@@ -77,7 +77,7 @@ def fetch_master_data():
     def get_fred(id):
         try:
             url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={id}"
-            r = requests.get(url, timeout=12)
+            r = requests.get(url, timeout=10)
             df = pd.read_csv(io.StringIO(r.text), index_col=0, parse_dates=True)
             return df.squeeze().resample('D').interpolate(method='time').tz_localize(None)
         except: return pd.Series(dtype=float)
@@ -85,13 +85,30 @@ def fetch_master_data():
     for key, val in fred_ids.items():
         d[key] = get_fred(val)
 
-    # [C] Nasdaq
+    # [C] Nasdaq (yfinance 강화)
     try:
         import yfinance as yf
-        ns = yf.download("^IXIC", period="max", progress=False)
-        close = ns['Close'] if 'Close' in ns.columns else ns
-        d['nasdaq'] = close.tz_localize(None) if not close.empty else pd.Series(dtype=float)
-    except: d['nasdaq'] = pd.Series(dtype=float)
+        # period='max' 대신 구체적 날짜 지정이 더 안정적일 수 있음
+        ns = yf.download("^IXIC", start="2010-01-01", progress=False, auto_adjust=True)
+        
+        # DataFrame인지 확인하고 Close 컬럼 추출
+        if not ns.empty:
+            if 'Close' in ns.columns:
+                d['nasdaq'] = ns['Close']
+            elif isinstance(ns.columns, pd.MultiIndex): # MultiIndex 처리
+                try: d['nasdaq'] = ns.xs('Close', axis=1, level=0)
+                except: d['nasdaq'] = ns.iloc[:, 0] # 첫번째 컬럼 강제 사용
+            else:
+                d['nasdaq'] = ns.iloc[:, 0] # 최후의 수단
+            
+            # Series로 변환 및 타임존 제거
+            if isinstance(d['nasdaq'], pd.DataFrame):
+                d['nasdaq'] = d['nasdaq'].squeeze()
+            d['nasdaq'] = d['nasdaq'].tz_localize(None)
+        else:
+            d['nasdaq'] = pd.Series(dtype=float)
+    except Exception as e:
+        d['nasdaq'] = pd.Series(dtype=float)
 
     # [D] Difficulty
     try:
@@ -136,9 +153,8 @@ if not raw.get('btc', pd.Series()).empty:
         df_c['reward'] = df_c.index.map(lambda x: 3.125 if x.date() >= halving_date else 6.25)
         df_c['cost'] = df_c['diff'] / df_c['reward']
         sub = pd.concat([raw['btc'], df_c['cost']], axis=1).dropna()
-        sub.columns = ['btc', 'cost']
         target = sub[(sub.index >= '2022-11-01') & (sub.index <= '2023-01-31')]
-        k = (target['btc'] / target['cost']).min() if not target.empty else 0.0000001
+        k = (target.iloc[:,0] / target.iloc[:,1]).min() if not target.empty else 0.0000001
         df_c['floor'] = df_c['cost'] * k
 
     # --- Shift -90d ---
@@ -155,6 +171,7 @@ if not raw.get('btc', pd.Series()).empty:
 
     # 4. 차트 생성 로직 (Dynamic Layout)
     st.subheader("📊 Integrated Strategy Chart")
+    
     start_viz = pd.to_datetime('2018-01-01')
     def flt(s): return s[s.index >= start_viz] if not s.empty else s
 
@@ -173,119 +190,112 @@ if not raw.get('btc', pd.Series()).empty:
     nd_v = flt(nasdaq_s)
     dg_v = flt(doge_s)
 
+    # [디버깅용] 데이터 상태 확인 (사이드바)
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🔍 데이터 진단")
+    st.sidebar.text(f"BTC 로드: {'성공' if not btc_v.empty else '실패'}")
+    st.sidebar.text(f"DOGE 로드: {'성공' if not dg_v.empty else '실패'}")
+    
+    # Nasdaq 상태 표시 (중요)
+    if nd_v.empty:
+        st.sidebar.error(f"Nasdaq 로드: 실패 (0 rows)")
+        if show_nasdaq:
+            st.warning("⚠️ Nasdaq 데이터가 로드되지 않았습니다. yfinance 연결 상태를 확인하세요.")
+    else:
+        st.sidebar.success(f"Nasdaq 로드: 성공 ({len(nd_v)} rows)")
+
     # -----------------------------------------------------------
-    # [핵심 1] 동적 범위 계산 (스케일 잘림 방지)
+    # [Dynamic Axes Logic]
     # -----------------------------------------------------------
-    # BTC Range (Linear)
+    # BTC Range
     if not btc_v.empty:
         b_min, b_max = btc_v.min(), btc_v.max()
-        b_rng = [max(b_min * 0.6, 1_000_000), b_max * 1.4] # 40% 여유
+        b_rng = [max(b_min * 0.6, 1_000_000), b_max * 1.4]
     else: b_rng = [0, 1]
 
-    # DOGE Range (Log scale calculation)
+    # DOGE Range (Log)
     if not dg_v.empty:
-        # 로그 스케일에서는 np.log10 값을 기준으로 범위를 잡아야 함
         d_min, d_max = dg_v.min(), dg_v.max()
-        if d_min <= 0: d_min = 0.0001 # 0 이하 방지
-        
-        # 로그 공간에서의 버퍼 계산 (위아래 10% 여유)
+        if d_min <= 0: d_min = 0.0001
         log_min, log_max = np.log10(d_min), np.log10(d_max)
         span = log_max - log_min
-        d_rng = [log_min - (span * 0.1), log_max + (span * 0.2)] # 위쪽을 조금 더 여유있게
+        d_rng = [log_min - (span * 0.1), log_max + (span * 0.2)]
     else: d_rng = [-1, 1]
 
-    # -----------------------------------------------------------
-    # [핵심 2] 동적 축 배치 (Dynamic Axis Positioning)
-    # -----------------------------------------------------------
-    # 선택된 자산의 개수를 셉니다.
+    # 활성 축 개수 계산
     active_axes = []
     if show_btc: active_axes.append('btc')
     if show_nasdaq: active_axes.append('nasdaq')
     if show_doge: active_axes.append('doge')
     
     num_axes = len(active_axes)
-    
-    # 오른쪽 축들이 차지할 공간 계산 (축 하나당 0.07 정도의 공간 할당)
-    # 모바일에서는 화면이 좁으므로 이 값을 최소화하는 것이 핵심
     right_margin_per_axis = 0.08
     domain_end = 1.0 - (num_axes * right_margin_per_axis)
-    if domain_end < 0.6: domain_end = 0.6 # 최소 차트 영역 확보
+    if domain_end < 0.6: domain_end = 0.6 
 
     # Layout 초기화
     layout = go.Layout(
         template="plotly_dark", height=700,
-        # 차트 그리는 영역 (Domain)을 동적으로 조절하여 축과 겹치지 않게 함
         xaxis=dict(domain=[0.0, domain_end], showgrid=True, gridcolor='rgba(128,128,128,0.2)'),
-        
-        # 왼쪽 축 (유동성) - 항상 고정
         yaxis=dict(
             title=dict(text=liq_name, font=dict(color=liq_color)),
             tickfont=dict(color=liq_color),
-            range=[-30, 60],
-            showgrid=False
+            range=[-30, 60], showgrid=False
         ),
         legend=dict(orientation="h", y=1.12, x=0, bgcolor="rgba(0,0,0,0)"),
         hovermode="x unified",
-        margin=dict(l=50, r=20, t=80, b=50) # r=20: 오른쪽 여백 최소화 (축이 차지하므로)
+        margin=dict(l=50, r=20, t=80, b=50)
     )
     
     fig = go.Figure(layout=layout)
 
-    # -----------------------------------------------------------
-    # [핵심 3] 선택된 자산만 축 생성 및 Trace 추가
-    # -----------------------------------------------------------
-    
-    # 1. 유동성 (항상 표시)
+    # Trace 추가
     if not liq_v.empty:
         fig.add_trace(go.Scatter(x=liq_v.index, y=liq_v, name=liq_name, line=dict(color=liq_color, width=3), fill='tozeroy', fillcolor=f"rgba{tuple(int(liq_color.lstrip('#')[i:i+2], 16) for i in (0, 2, 4)) + (0.15,)}", yaxis='y'))
 
-    # 오른쪽 축 위치 포인터 (도메인 끝에서부터 시작)
     current_pos = domain_end 
 
-    # 2. Bitcoin
+    # 1. Bitcoin
     if show_btc and not btc_v.empty:
-        # 축 정의
         fig.update_layout(yaxis2=dict(
             title=dict(text="BTC", font=dict(color="#00FFEE")),
             tickfont=dict(color="#00FFEE"),
             overlaying="y", side="right", 
-            anchor="free", position=current_pos, # 동적 위치 할당
+            anchor="free", position=current_pos,
             range=b_rng, showgrid=False, tickformat=","
         ))
-        # 그래프 추가
         fig.add_trace(go.Scatter(x=btc_v.index, y=btc_v, name="BTC", line=dict(color='#00FFEE', width=3), yaxis='y2'))
         if not fl_v.empty:
             fig.add_trace(go.Scatter(x=fl_v.index, y=fl_v, name="Cost", line=dict(color='red', width=1, dash='dot'), yaxis='y2'))
-        
-        current_pos += right_margin_per_axis # 다음 축을 위해 위치 이동
+        current_pos += right_margin_per_axis
 
-    # 3. Nasdaq
+    # 2. Nasdaq (수정됨: 데이터가 있고 체크되었을 때만 축 생성)
     if show_nasdaq and not nd_v.empty:
         fig.update_layout(yaxis3=dict(
             title=dict(text="NDX", font=dict(color="#D62780")),
             tickfont=dict(color="#D62780"),
             overlaying="y", side="right", 
             anchor="free", position=current_pos,
-            showgrid=False
+            showgrid=False, tickformat=","
         ))
         fig.add_trace(go.Scatter(x=nd_v.index, y=nd_v, name="NDX", line=dict(color='#D62780', width=2), yaxis='y3'))
         current_pos += right_margin_per_axis
 
-    # 4. Dogecoin
+    # 3. Dogecoin
     if show_doge and not dg_v.empty:
         fig.update_layout(yaxis4=dict(
             title=dict(text="DOGE", font=dict(color="orange")),
             tickfont=dict(color="orange"),
             overlaying="y", side="right", 
             anchor="free", position=current_pos,
-            type="log", range=d_rng, # [해결] 계산된 로그 범위 적용
+            type="log", range=d_rng,
             showgrid=False
         ))
         fig.add_trace(go.Scatter(x=dg_v.index, y=dg_v, name="DOGE", line=dict(color='orange', width=2), yaxis='y4'))
         current_pos += right_margin_per_axis
 
     st.plotly_chart(fig, use_container_width=True)
-    st.success("✅ Display Updated")
+    st.success("✅ 차트 생성 완료")
 
 else:
     st.error("데이터 로드 실패")
