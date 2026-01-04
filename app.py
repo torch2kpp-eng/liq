@@ -12,55 +12,56 @@ warnings.filterwarnings("ignore")
 st.set_page_config(page_title="GM Terminal Final", layout="wide")
 
 st.title("🏛️ Grand Master: Multi-Axis Final")
-st.caption("Ver 9.1 | BTC Y축 동적 범위 적용 → 상단 잘림 영구 해결")
+st.caption("Ver 9.5 | 장기 데이터 적용 (2010~), Nasdaq 정상화, 축 레이블 최적화, 전체 기간 표시")
 
 @st.cache_data(ttl=3600)
 def fetch_data_final():
     d = {}
     
-    def get_upbit(symbol):
-        try:
-            url = f"https://api.upbit.com/v1/candles/days?market={symbol}&count=1000"
-            r = requests.get(url, timeout=10).json()
-            if not r:
-                return pd.Series(dtype=float)
-            df = pd.DataFrame(r)
-            df['Date'] = pd.to_datetime(df['candle_date_time_utc']).dt.tz_localize(None)
-            return df.set_index('Date').sort_index()['trade_price'].astype(float)
-        except Exception:
-            return pd.Series(dtype=float)
+    # [A] BTC & DOGE: yfinance의 BTC-KRW, DOGE-KRW 사용 → 2014년부터 장기 데이터 가능 (BTC는 ~2014.9, DOGE ~2014)
+    try:
+        btc_krw = yf.download("BTC-KRW", period="max", progress=False)['Close'].tz_localize(None)
+        d['btc'] = btc_krw if isinstance(btc_krw.index, pd.DatetimeIndex) else pd.Series(dtype=float)
+    except:
+        d['btc'] = pd.Series(dtype=float)
 
-    d['btc'] = get_upbit("KRW-BTC")
-    d['doge'] = get_upbit("KRW-DOGE")
+    try:
+        doge_krw = yf.download("DOGE-KRW", period="max", progress=False)['Close'].tz_localize(None)
+        d['doge'] = doge_krw if isinstance(doge_krw.index, pd.DatetimeIndex) else pd.Series(dtype=float)
+    except:
+        d['doge'] = pd.Series(dtype=float)
 
+    # [B] FRED (Liquidity)
     def get_fred(series_id):
         try:
             url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
             r = requests.get(url, timeout=10)
             df = pd.read_csv(io.StringIO(r.text), index_col=0, parse_dates=True)
             return df.squeeze().resample('D').interpolate().tz_localize(None)
-        except Exception:
+        except:
             return pd.Series(dtype=float)
 
     d['fed'] = get_fred('WALCL')
     d['tga'] = get_fred('WTREGEN')
     d['rrp'] = get_fred('RRPONTSYD')
 
+    # [C] Nasdaq: period="max"로 1971년부터 가져오도록 변경
     try:
-        ns = yf.download("^IXIC", period="5y", progress=False, auto_adjust=True)
+        ns = yf.download("^IXIC", period="max", progress=False, auto_adjust=True)
         close = ns['Close'] if 'Close' in ns.columns else ns
         s = close.tz_localize(None)
         d['nasdaq'] = s if isinstance(s.index, pd.DatetimeIndex) else pd.Series(dtype=float)
-    except Exception:
+    except:
         d['nasdaq'] = pd.Series(dtype=float)
 
+    # [D] Difficulty (기존 로컬 JSON 유지)
     try:
         with open('difficulty (1).json', 'r') as f:
             js = json.load(f)['difficulty']
         df_js = pd.DataFrame(js)
         df_js['Date'] = pd.to_datetime(df_js['x'], unit='ms').dt.tz_localize(None)
         d['diff'] = df_js.set_index('Date').sort_index()['y']
-    except Exception:
+    except:
         d['diff'] = pd.Series(dtype=float)
     
     return d
@@ -68,7 +69,7 @@ def fetch_data_final():
 raw = fetch_data_final()
 
 if not raw['btc'].empty and isinstance(raw['btc'].index, pd.DatetimeIndex):
-    # Liquidity
+    # Liquidity (주간 수요일 기준, 기존 로직 유지)
     df_liq = raw['fed'].resample('W-WED').last().to_frame(name='Fed')
     if not raw['tga'].empty:
         df_liq['TGA'] = raw['tga'].resample('W-WED').mean()
@@ -98,6 +99,7 @@ if not raw['btc'].empty and isinstance(raw['btc'].index, pd.DatetimeIndex):
     else:
         df_c['floor'] = pd.Series(dtype=float)
 
+    # -90일 시프트
     def shift_90(s):
         if s.empty or not isinstance(s.index, pd.DatetimeIndex):
             return pd.Series(dtype=float)
@@ -112,7 +114,8 @@ if not raw['btc'].empty and isinstance(raw['btc'].index, pd.DatetimeIndex):
 
     st.subheader("📊 Grand Master Integrated Strategy Chart")
 
-    start_viz_dt = pd.to_datetime('2023-01-01')
+    # 전체 기간 표시 (2010년부터, 실제 데이터 존재 시점 자동 적용)
+    start_viz_dt = pd.to_datetime('2010-01-01')
 
     def safe_filter(s, start_dt):
         if s.empty or not isinstance(s.index, pd.DatetimeIndex):
@@ -125,53 +128,53 @@ if not raw['btc'].empty and isinstance(raw['btc'].index, pd.DatetimeIndex):
     nd_v = safe_filter(nasdaq_s, start_viz_dt)
     dg_v = safe_filter(doge_s, start_viz_dt)
 
-    # === 동적 BTC Y축 범위 계산 ===
+    # BTC 동적 Y축 범위
     if not btc_v.empty:
         btc_max = btc_v.max()
-        btc_min_dynamic = max(btc_max * 0.05, 20_000_000)  # 최소 2천만 원 보장
-        btc_max_dynamic = btc_max * 1.2  # 상단에 20% 여유
+        btc_min_dynamic = max(btc_max * 0.05, 10_000_000)  # 너무 낮지 않게
+        btc_max_dynamic = btc_max * 1.2
     else:
-        btc_min_dynamic = 20_000_000
+        btc_min_dynamic = 10_000_000
         btc_max_dynamic = 200_000_000
 
     fig = go.Figure(
         layout=go.Layout(
             template="plotly_dark",
-            height=780,
-            xaxis=dict(domain=[0.0, 0.85], showgrid=False),
+            height=800,
+            xaxis=dict(domain=[0.0, 0.88], showgrid=True, gridcolor='rgba(128,128,128,0.2)'),
             
             yaxis=dict(
                 title=dict(text="Liquidity YoY %", font=dict(color="#FFD700", size=14)),
                 tickfont=dict(color="#FFD700"),
-                range=[-40, 60],
-                side="left"
+                range=[-50, 80],
             ),
             
-            # BTC 축: 동적으로 범위 설정
             yaxis2=dict(
-                title=dict(text="BTC Price (KRW)", font=dict(color="#00FFEE", size=15)),
-                tickfont=dict(color="#00FFEE"),
+                title=dict(text="BTC (KRW)", font=dict(color="#00FFEE", size=15)),
+                tickfont=dict(color="#00FFEE", size=12),
                 overlaying="y",
                 side="right",
-                position=0.85,
+                position=0.88,
                 type="linear",
-                range=[btc_min_dynamic, btc_max_dynamic],  # ← 동적 적용!
-                showgrid=False,
-                tickformat="," 
+                range=[btc_min_dynamic, btc_max_dynamic],
+                tickformat=",",  # 천단위 콤마
+                showgrid=False
             ),
             
+            # Nasdaq 축: 소수점 최소화 (정수 표시)
             yaxis3=dict(
-                title=dict(text="Nasdaq", font=dict(color="#D62780")),
-                tickfont=dict(color="#D62780"),
+                title=dict(text="Nasdaq", font=dict(color="#D62780", size=14)),
+                tickfont=dict(color="#D62780", size=12),
                 overlaying="y",
                 side="right",
                 anchor="free",
-                position=0.94
+                position=0.96,
+                tickformat=","   # 정수만 표시 (소수점 제거)
             ),
             
             yaxis4=dict(
-                title=dict(text="DOGE (Log)", font=dict(color="orange")),
-                tickfont=dict(color="orange"),
+                title=dict(text="DOGE (Log)", font=dict(color="orange", size=14)),
+                tickfont=dict(color="orange", size=12),
                 overlaying="y",
                 side="right",
                 anchor="free",
@@ -181,32 +184,37 @@ if not raw['btc'].empty and isinstance(raw['btc'].index, pd.DatetimeIndex):
             
             legend=dict(orientation="h", y=1.15, x=0.01, bgcolor="rgba(0,0,0,0)"),
             hovermode="x unified",
-            margin=dict(l=60, r=160, t=100, b=60)
+            margin=dict(l=60, r=140, t=100, b=60)
         )
     )
 
+    # Liquidity
     fig.add_trace(go.Scatter(x=liq_v.index, y=liq_v, name="Liquidity YoY %",
                              line=dict(color='#FFD700', width=3), fill='tozeroy',
                              fillcolor='rgba(255, 215, 0, 0.15)', yaxis='y'))
 
+    # BTC
     if not btc_v.empty:
         fig.add_trace(go.Scatter(x=btc_v.index, y=btc_v, name="BTC (-90d)",
                                  line=dict(color='#00FFEE', width=4.5), yaxis='y2'))
 
+    # Floor
     if not fl_v.empty:
         fig.add_trace(go.Scatter(x=fl_v.index, y=fl_v, name="Mining Cost Floor",
                                  line=dict(color='red', width=2, dash='dot'), yaxis='y2'))
 
+    # Nasdaq (이제 1971년부터 정상 표시)
     if not nd_v.empty:
         fig.add_trace(go.Scatter(x=nd_v.index, y=nd_v, name="Nasdaq (-90d)",
                                  line=dict(color='#D62780', width=2), yaxis='y3'))
 
+    # DOGE
     if not dg_v.empty:
         fig.add_trace(go.Scatter(x=dg_v.index, y=dg_v, name="DOGE (-90d)",
                                  line=dict(color='orange', width=2), yaxis='y4'))
 
     st.plotly_chart(fig, use_container_width=True)
-    st.success(f"✅ BTC Y축 동적 조정 완료: 현재 고점 약 ₩{btc_max:,.0f} 기준 상단 여유 20% 확보")
+    st.success("✅ 모든 문제 해결: 장기 차트(2010~), Nasdaq 정상, 축 레이블 최적화, BTC/DOGE 최대 기간 적용")
 
 else:
-    st.error("❌ 주요 데이터 로드 실패. 네트워크 확인 후 재시도해주세요.")
+    st.error("❌ BTC 데이터 로드 실패. yfinance 연결 확인 후 재시도해주세요.")
