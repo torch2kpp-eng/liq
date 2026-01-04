@@ -8,14 +8,14 @@ import warnings
 import time
 import ccxt
 import numpy as np
-from datetime import date
+from datetime import date, timedelta
 
 # 1. 환경 설정
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="GM Gold Fix", layout="wide")
+st.set_page_config(page_title="GM Visual Lag", layout="wide")
 
-st.title("🏛️ Grand Master: Gold Connection Fix")
-st.caption("Ver 15.5 | Gold/Silver 이중화(Futures -> ETF 백업) | 데이터 연결 100% 보장")
+st.title("🏛️ Grand Master: Visual Lag Terminal")
+st.caption("Ver 16.0 | Time Shift 구간 시각화(Lag Box) | Futures & ETF Hybrid Engine")
 
 # -----------------------------------------------------------
 # [사이드바 설정]
@@ -35,13 +35,14 @@ liq_option = st.sidebar.radio(
 st.sidebar.markdown("---")
 st.sidebar.write("2. Time Shift (Days)")
 shift_days = st.sidebar.number_input(
-    "자산 가격 이동 (일)", min_value=-365, max_value=365, value=90, step=7
+    "자산 가격 이동 (일)", min_value=-365, max_value=365, value=90, step=7,
+    help="양수(+) 입력 시 자산 차트를 과거로 이동시킵니다. (오른쪽에 생기는 박스는 유동성이 선행하는 구간입니다)"
 )
 
 st.sidebar.markdown("---")
 st.sidebar.write("3. 표시할 자산 (Right Axes)")
 
-# source: 'hybrid_metal'로 변경하여 별도 로직 적용
+# Gold/Silver Hybrid Source
 ASSETS_CONFIG = [
     {'id': 'nasdaq', 'name': 'Nasdaq', 'symbol': 'IXIC', 'source': 'hybrid', 'color': '#D62780', 'type': 'index', 'default': True},
     {'id': 'gold',   'name': 'Gold',   'symbol': 'GC=F', 'source': 'hybrid_metal', 'color': '#FFD700', 'type': 'metal', 'default': True},
@@ -59,9 +60,9 @@ for asset in ASSETS_CONFIG:
     selected_assets[asset['id']] = st.sidebar.checkbox(f"{asset['name']}", value=asset['default'])
 
 # -----------------------------------------------------------
-# 데이터 수집
+# 데이터 수집 (안정화 버전)
 # -----------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner="데이터 소스 연결 및 백업망 가동 중...")
+@st.cache_data(ttl=3600, show_spinner="데이터 소스 연결 및 시각화 준비 중...")
 def fetch_master_data():
     d = {}
     START_YEAR = 2021
@@ -70,7 +71,7 @@ def fetch_master_data():
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36'
     }
 
-    # 1. FRED Fetcher
+    # Fetchers
     def get_fred(id):
         try:
             url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={id}"
@@ -80,7 +81,6 @@ def fetch_master_data():
             return df.squeeze().resample('D').interpolate(method='time').tz_localize(None)
         except: return pd.Series(dtype=float)
 
-    # 2. Yahoo Fetcher (General)
     def get_yahoo(ticker):
         try:
             import yfinance as yf
@@ -91,30 +91,21 @@ def fetch_master_data():
                     except: s = df.iloc[:, 0]
                 elif 'Close' in df.columns: s = df['Close']
                 else: s = df.iloc[:, 0]
-                
                 if isinstance(s, pd.DataFrame): s = s.squeeze()
-                s = s.tz_localize(None)
-                return s.resample('D').interpolate(method='time') # 주말 보간
+                return s.tz_localize(None).resample('D').interpolate(method='time')
             return pd.Series(dtype=float)
         except: return pd.Series(dtype=float)
 
-    # 3. [핵심] Metal Hybrid Fetcher (Futures -> ETF Backup)
     def get_metal_hybrid(symbol):
-        # 1차 시도: 선물 (Futures)
+        # 1. Futures
         data = get_yahoo(symbol)
-        if not data.empty:
-            return data, "Futures"
-        
-        # 2차 시도: ETF (Backup)
-        # Gold -> GLD, Silver -> SLV
-        backup_ticker = "GLD" if "GC" in symbol else "SLV"
-        data_backup = get_yahoo(backup_ticker)
-        if not data_backup.empty:
-            return data_backup, "ETF(Backup)"
-            
+        if not data.empty: return data, "Futures"
+        # 2. ETF Backup
+        backup = "GLD" if "GC" in symbol else "SLV"
+        data_b = get_yahoo(backup)
+        if not data_b.empty: return data_b, "ETF(Backup)"
         return pd.Series(dtype=float), "Fail"
 
-    # 4. Bithumb Fetcher
     bithumb = ccxt.bithumb({'enableRateLimit': True, 'timeout': 3000})
     def fetch_bithumb(symbol_code):
         all_data = []
@@ -129,15 +120,12 @@ def fetch_master_data():
                 since = last_ts + 1
                 time.sleep(0.1)
         except: pass
-        
         if not all_data: return pd.Series(dtype=float)
         df = pd.DataFrame(all_data, columns=['timestamp','open','high','low','close','volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         return df.drop_duplicates('timestamp').set_index('timestamp')['close'].tz_localize(None)
 
-    # === 실행 ===
-
-    # [A] FRED
+    # Execution
     fred_ids = {
         'fed': 'WALCL', 'tga': 'WTREGEN', 'rrp': 'RRPONTSYD',
         'ecb': 'ECBASSETSW', 'boj': 'JPNASSETS',
@@ -145,33 +133,21 @@ def fetch_master_data():
         'eur_usd': 'DEXUSEU', 'usd_jpy': 'DEXJPUS',
         'nasdaq_fred': 'NASDAQCOM'
     }
-    for k, v in fred_ids.items():
-        d[k] = get_fred(v)
+    for k, v in fred_ids.items(): d[k] = get_fred(v)
 
-    # [B] Nasdaq Hybrid
-    if not d['nasdaq_fred'].empty:
-        d['nasdaq'] = d['nasdaq_fred']
-    else:
-        d['nasdaq'] = get_yahoo("^IXIC")
+    if not d['nasdaq_fred'].empty: d['nasdaq'] = d['nasdaq_fred']
+    else: d['nasdaq'] = get_yahoo("^IXIC")
 
-    # [C] Assets Fetching
-    meta_info = {} # 메타 정보 저장 (소스 출처 등)
-
+    meta_info = {}
     for asset in ASSETS_CONFIG:
         if asset['id'] == 'nasdaq': continue
-        
         if asset['source'] == 'hybrid_metal':
-            data, src_type = get_metal_hybrid(asset['symbol'])
+            data, src = get_metal_hybrid(asset['symbol'])
             d[asset['id']] = data
-            meta_info[asset['id']] = src_type
-        
-        elif asset['source'] == 'yahoo':
-            d[asset['id']] = get_yahoo(asset['symbol'])
-        
-        elif asset['source'] == 'bithumb':
-            d[asset['id']] = fetch_bithumb(asset['symbol'])
+            meta_info[asset['id']] = src
+        elif asset['source'] == 'yahoo': d[asset['id']] = get_yahoo(asset['symbol'])
+        elif asset['source'] == 'bithumb': d[asset['id']] = fetch_bithumb(asset['symbol'])
 
-    # [D] Difficulty
     try:
         with open('difficulty (1).json', 'r') as f:
             js = json.load(f)['difficulty']
@@ -185,11 +161,11 @@ def fetch_master_data():
 raw, meta = fetch_master_data()
 
 # -----------------------------------------------------------
-# 차트 생성
+# Logic & Chart
 # -----------------------------------------------------------
 if not raw.get('btc', pd.Series()).empty:
 
-    # 1. Macro Logic
+    # Macro
     base_idx = raw['fed'].resample('W-WED').last().index
     df_m = pd.DataFrame(index=base_idx)
     for k in raw:
@@ -197,7 +173,7 @@ if not raw.get('btc', pd.Series()).empty:
             df_m[k] = raw[k].reindex(df_m.index, method='ffill')
     df_m = df_m.fillna(method='ffill')
 
-    # Liquidity Formulas
+    # Liquidity
     df_m['Fed_Net_Tril'] = (df_m.get('fed',0)/1000 - df_m.get('tga',0)/1000 - df_m.get('rrp',0)/1000000)
     df_m['Fed_Net_YoY'] = df_m['Fed_Net_Tril'].pct_change(52) * 100
 
@@ -211,7 +187,7 @@ if not raw.get('btc', pd.Series()).empty:
     m3_jp = (df_m.get('m3_jp',0) / df_m.get('usd_jpy',1)) / 1e12
     df_m['Global_M2_YoY'] = (m2_us + m3_eu + m3_jp).pct_change(52) * 100
 
-    # 2. Shift Logic
+    # Asset Shift
     def apply_shift(s, days):
         if s.empty: return pd.Series(dtype=float)
         new_s = s.copy()
@@ -222,7 +198,7 @@ if not raw.get('btc', pd.Series()).empty:
     for asset in ASSETS_CONFIG:
         processed[asset['id']] = apply_shift(raw.get(asset['id'], pd.Series(dtype=float)), shift_days)
 
-    # 3. Chart
+    # Chart
     st.subheader(f"📊 Integrated Strategy Chart (Shift: {shift_days}d)")
     
     start_viz = pd.to_datetime('2021-06-01') 
@@ -246,7 +222,6 @@ if not raw.get('btc', pd.Series()).empty:
 
     active_assets = [a for a in ASSETS_CONFIG if selected_assets[a['id']]]
     num_active = len(active_assets)
-    
     if num_active == 0: domain_end = 0.95
     else:
         margin = 0.05 if num_active > 5 else 0.08
@@ -268,6 +243,7 @@ if not raw.get('btc', pd.Series()).empty:
 
     fig = go.Figure(layout=layout)
 
+    # 1. Liquidity Trace
     if not liq_v.empty:
         h = liq_color.lstrip('#')
         rgb = tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
@@ -277,7 +253,29 @@ if not raw.get('btc', pd.Series()).empty:
             fill='tozeroy', fillcolor=f"rgba({rgb[0]},{rgb[1]},{rgb[2]},0.15)",
             yaxis='y', hoverinfo='none'
         ))
+        
+        # -------------------------------------------------------
+        # [핵심 기능] Visual Lag Box 추가
+        # -------------------------------------------------------
+        if shift_days != 0:
+            last_date = liq_v.index.max()
+            # Shift Days가 양수면, 자산 데이터가 과거로 밀리므로
+            # 현재 시점 기준 [최근 N일]은 "자산 가격은 아직 오지 않았고, 유동성은 이미 나와있는" 구간임
+            start_date = last_date - pd.Timedelta(days=abs(shift_days))
+            
+            fig.add_vrect(
+                x0=start_date,
+                x1=last_date,
+                fillcolor="rgba(255, 255, 255, 0.08)", # 아주 연한 투명 회색/흰색
+                layer="below",
+                line_width=0,
+                annotation_text=f"Lag Period: {abs(shift_days)}d",
+                annotation_position="top left",
+                annotation_font_color="rgba(255,255,255,0.5)"
+            )
+        # -------------------------------------------------------
 
+    # 2. Assets Trace
     current_pos = domain_end
     for i, asset in enumerate(active_assets):
         data = flt(processed[asset['id']])
@@ -315,20 +313,18 @@ if not raw.get('btc', pd.Series()).empty:
             line=dict(color=asset['color'], width=2),
             yaxis=axis_key, hoverinfo='none'
         ))
-        
         current_pos += margin
 
     st.plotly_chart(fig, use_container_width=True)
 
-    with st.expander("🔍 데이터 연결 상태 리포트"):
+    with st.expander("🔍 데이터 연결 리포트"):
         for asset in ASSETS_CONFIG:
             s = processed[asset['id']]
             if s.empty:
                 st.error(f"❌ {asset['name']}: 로드 실패")
             else:
-                # 메타 정보가 있으면 표시 (예: Futures, ETF)
-                extra_info = f" ({meta.get(asset['id'], 'Success')})" if asset['id'] in meta else ""
-                st.success(f"✅ {asset['name']}: 로드 성공 ({len(s)} rows){extra_info}")
+                extra = f" ({meta.get(asset['id'], 'OK')})" if asset['id'] in meta else ""
+                st.success(f"✅ {asset['name']}: 로드 성공{extra}")
 
 else:
     st.error("데이터 로드 실패")
