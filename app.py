@@ -12,10 +12,10 @@ from datetime import date, timedelta
 
 # 1. 환경 설정
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="GM Level Hunter", layout="wide")
+st.set_page_config(page_title="GM Dual Core", layout="wide")
 
 st.title("🏛️ Grand Master: Analytics Engine")
-st.caption("Ver 20.0 | Log-Level Z-Gap 엔진 탑재 | 직관적 사이클 분석 (High Price = High Gap)")
+st.caption("Ver 20.1 | Dual-Core Logic | Lag 탐지는 YoY(안정성), Z-Gap은 Log(직관성) 적용 | 값 흔들림 해결")
 
 # -----------------------------------------------------------
 # [사이드바 설정]
@@ -42,7 +42,7 @@ liq_option = st.sidebar.radio(
 st.sidebar.markdown("---")
 shift_days = st.sidebar.number_input(
     "2. Time Shift (Days)", min_value=-365, max_value=365, value=112, step=7,
-    help="0이면 자산별 최적 시차 자동 적용, 그 외엔 설정값 강제 적용"
+    help="0이면 자산별 최적 시차(Optimal Lag)를 자동으로 찾아 적용합니다."
 )
 
 st.sidebar.markdown("---")
@@ -189,47 +189,51 @@ def check_risk_radar(hy_series):
     return {"val": last_val, "daily_chg_bps": daily_chg_bps, "status": status, "color": color, "msg": msg}
 
 # -----------------------------------------------------------
-# [FUNC 2] Quant Engine (Log-Level Update)
+# [FUNC 2] Quant Engine (Dual-Core: YoY for Lag, Log for Gap)
 # -----------------------------------------------------------
 def run_quant_analysis_pure(liq_series_raw, asset_series_raw, manual_lag_days):
     try:
-        # [NEW Logic] YoY가 아니라 Log Level을 사용
-        # 그래야 "가격이 높으면 Z-Gap도 높다"는 직관과 일치함
+        # 1. 전처리 (Weekly)
+        liq_weekly = liq_series_raw.resample('W-WED').last().interpolate(limit_direction='both')
+        asset_weekly = asset_series_raw.resample('W-WED').last().interpolate(limit_direction='both')
         
-        # 1. 전처리 (Weekly Resample)
-        liq_weekly = liq_series_raw.resample('W-WED').last()
-        asset_weekly = asset_series_raw.resample('W-WED').last()
-        
-        # 2. Log 변환 (데이터 정규화를 위해 필수)
-        # 0이나 음수가 있을 수 있으므로 처리
-        liq_log = np.log(liq_weekly.replace(0, np.nan).dropna())
-        asset_log = np.log(asset_weekly.replace(0, np.nan).dropna())
-        
-        # 3. 데이터 병합
-        df = pd.concat([liq_log, asset_log], axis=1).dropna()
-        df.columns = ['L_Log', 'P_Log']
+        # 교집합 구간 확보
+        df = pd.concat([liq_weekly, asset_weekly], axis=1).dropna()
+        df.columns = ['L_Raw', 'P_Raw']
         if len(df) < 52: return None
-        
-        # 4. Smoothing (노이즈 제거)
-        df['L_Smooth'] = df['L_Log'].rolling(4).mean()
-        df['P_Smooth'] = df['P_Log'].rolling(4).mean()
-        df = df.dropna()
-        
-        # 5. Z-Score 산출 (전체 기간 기준 정규화)
-        # 이것이 핵심입니다. "과거 평균 대비 현재 레벨이 얼마나 높은가?"
-        df['L_Z'] = (df['L_Smooth'] - df['L_Smooth'].mean()) / (df['L_Smooth'].std() + 1e-9)
-        df['P_Z'] = (df['P_Smooth'] - df['P_Smooth'].mean()) / (df['P_Smooth'].std() + 1e-9)
 
-        # 6. Correlation Check (Lag 찾기용으로는 차분(Diff) 데이터 사용이 더 정확함)
-        # 레벨 변수끼리는 무조건 상관계수가 높게 나오므로(Spurious Regression),
-        # Lag를 찾을 때만 잠시 1주 차분 데이터를 씁니다.
-        df_diff = df[['L_Z', 'P_Z']].diff().dropna()
+        # -------------------------------------------------------
+        # Core A: Lag Detection (using YoY) - 안정적인 시차 찾기
+        # -------------------------------------------------------
+        df['L_YoY'] = df['L_Raw'].pct_change(52).replace([np.inf, -np.inf], np.nan)
+        df['P_YoY'] = df['P_Raw'].pct_change(52).replace([np.inf, -np.inf], np.nan)
+        
+        # Smoothing for correlation stability
+        L_YoY_Smooth = df['L_YoY'].rolling(4).mean()
+        P_YoY_Smooth = df['P_YoY'].rolling(4).mean()
+        
+        # 임시 DF로 상관계수 계산
+        df_corr = pd.concat([L_YoY_Smooth, P_YoY_Smooth], axis=1).dropna()
+        df_corr.columns = ['L', 'P']
+        
         best_lag_weeks, best_corr = 0, -1.0
+        # 0주 ~ 52주(1년) 사이에서 최적 시차 탐색
         for lag in range(0, 53): 
-            corr = df_diff['P_Z'].corr(df_diff['L_Z'].shift(lag))
+            # YoY끼리 비교하면 사이클(추세)의 시차를 더 정확히 찾음
+            corr = df_corr['P'].corr(df_corr['L'].shift(lag))
             if corr > best_corr: best_corr, best_lag_weeks = corr, lag
-            
-        # 7. Lag 적용 및 Gap 계산
+
+        # -------------------------------------------------------
+        # Core B: Z-Gap Calculation (using Log Level) - 직관적인 높이 비교
+        # -------------------------------------------------------
+        df['L_Log'] = np.log(df['L_Raw'])
+        df['P_Log'] = np.log(df['P_Raw'])
+        
+        # Z-Score (전체 기간 기준)
+        df['L_Z'] = (df['L_Log'] - df['L_Log'].mean()) / (df['L_Log'].std() + 1e-9)
+        df['P_Z'] = (df['P_Log'] - df['P_Log'].mean()) / (df['P_Log'].std() + 1e-9)
+        
+        # Hybrid Shift Decision
         if manual_lag_days != 0:
             calc_lag_weeks = int(manual_lag_days / 7)
             used_mode = "Manual"
@@ -237,23 +241,21 @@ def run_quant_analysis_pure(liq_series_raw, asset_series_raw, manual_lag_days):
             calc_lag_weeks = best_lag_weeks
             used_mode = "Auto"
         
-        # 유동성 지표를 Shift (미래로 밀어서 현재 가격과 매칭)
+        # 유동성 지표 Shift (Core A에서 찾은 시차 적용)
         df['L_Z_Shifted'] = df['L_Z'].shift(calc_lag_weeks)
         
-        # 최근 데이터 확인
-        df_recent = df.iloc[-4:]
-        
-        # 최근 상관관계 (레벨 기준)
-        recent_corr = df_recent['P_Z'].corr(df_recent['L_Z_Shifted'])
+        # Z-Gap 계산
         last_val = df.iloc[-1]
-        
-        # [핵심] Z-Gap = Price Z - Liquidity Z
         gap_z = last_val['P_Z'] - last_val['L_Z_Shifted']
         
+        # 최근 상관관계 (Log Level 기준, 최근 8주)
+        df_recent = df.iloc[-8:]
+        recent_corr = df_recent['P_Z'].corr(df_recent['L_Z_Shifted'])
+        
         # Regime 판단
-        if best_corr < 0: regime = "Inverse" # 장기 역상관
-        elif gap_z > 1.5: regime = "Overheat" # 과열
-        elif gap_z < -1.5: regime = "Undervalued" # 저평가
+        if best_corr < 0: regime = "Inverse"
+        elif gap_z > 1.5: regime = "Overheat"
+        elif gap_z < -1.5: regime = "Undervalued"
         else: regime = "Fair"
 
         return {
@@ -317,25 +319,19 @@ try:
                 except: continue
         df_m = df_m.fillna(method='ffill')
 
-        # [Level Data 사용] YoY가 아닌 Raw Trillion Data를 준비
         s_m2_us, s_m3_eu, s_m3_jp = df_m.get('m2_us'), df_m.get('m3_eu'), df_m.get('m3_jp')
         if s_m2_us is not None and s_m3_eu is not None and s_m3_jp is not None:
             global_m2_sum = (s_m2_us/1000) + ((s_m3_eu * df_m.get('eur_usd', 1))/1e12) + ((s_m3_jp / df_m.get('usd_jpy', 1))/1e12)
             df_m['Global_M2_Tril'] = global_m2_sum.interpolate(limit_direction='both')
-            # YoY는 차트용으로 남겨둠
             df_m['Global_M2_YoY'] = df_m['Global_M2_Tril'].pct_change(52) * 100
-        else: 
-            df_m['Global_M2_Tril'] = pd.Series(dtype=float)
-            df_m['Global_M2_YoY'] = pd.Series(dtype=float)
+        else: df_m['Global_M2_YoY'] = pd.Series(dtype=float)
 
         s_fed, s_ecb, s_boj = df_m.get('fed'), df_m.get('ecb'), df_m.get('boj')
         if s_fed is not None and s_ecb is not None and s_boj is not None:
             g3_sum = (s_fed/1e6) + ((s_ecb * df_m.get('eur_usd', 1))/1e6) + ((s_boj * 0.0001) / df_m.get('usd_jpy', 1))
             df_m['G3_Asset_Tril'] = g3_sum.replace(0, np.nan).interpolate()
             df_m['G3_Asset_YoY'] = df_m['G3_Asset_Tril'].pct_change(52) * 100
-        else: 
-            df_m['G3_Asset_Tril'] = pd.Series(dtype=float)
-            df_m['G3_Asset_YoY'] = pd.Series(dtype=float)
+        else: df_m['G3_Asset_YoY'] = pd.Series(dtype=float)
 
         df_m['Fed_Net_Tril'] = (df_m.get('fed',0)/1000 - df_m.get('tga',0)/1000 - df_m.get('rrp',0)/1000000)
         df_m['Fed_Net_YoY'] = df_m['Fed_Net_Tril'].pct_change(52) * 100
@@ -357,13 +353,13 @@ try:
                     elif risk_res['status'] == "Warning": st.warning(f"{risk_res['msg']}")
                     else: st.error(f"{risk_res['msg']}")
 
-    # [Radar 2] M2 Divergence (Level Based)
+    # [Radar 2] M2 Divergence
     if 'btc' in raw and not raw['btc'].empty and not df_m['Global_M2_Tril'].empty:
-        # [수정] Log-Level 엔진에 Raw Price와 Raw M2 전달
+        # [수정] Raw Level Data 전달
         m2_res = run_quant_analysis_pure(df_m['Global_M2_Tril'], raw['btc'], shift_days)
         if m2_res:
             with r_cols[1]:
-                st.markdown("#### 🌊 Liquidity Z-Gap (Log-Level)")
+                st.markdown("#### 🌊 Liquidity Z-Gap (Level)")
                 c1, c2 = st.columns([1.5, 2])
                 with c1:
                     gap_state = "High" if m2_res['gap_z'] > 1.0 else ("Low" if m2_res['gap_z'] < -1.0 else "Fair")
@@ -372,12 +368,12 @@ try:
                     regime = m2_res['regime']
                     lag_msg = f"Lag: {m2_res['calc_lag']}d ({m2_res['mode']})"
                     
-                    if "Overheat" in regime: st.error(f"🔴 과열 (Overheat)\n({lag_msg})")
-                    elif "Undervalued" in regime: st.success(f"🟢 저평가 (Value)\n({lag_msg})")
-                    elif "Fair" in regime: st.info(f"⚪ 적정 (Fair)\n({lag_msg})")
+                    if "Overheat" in regime: st.error(f"🔴 과열\n({lag_msg})")
+                    elif "Undervalued" in regime: st.success(f"🟢 저평가\n({lag_msg})")
+                    elif "Fair" in regime: st.info(f"⚪ 적정\n({lag_msg})")
                     else: st.warning(f"⚠️ {regime}\n({lag_msg})")
     
-    # [NEW] Z-Gap Trend Chart (Level Based)
+    # [NEW] Z-Gap Trend Chart (Using Dual Core)
     st.markdown("#### 🌊 Z-Gap Trend Monitor (All Selected Assets)")
     
     target_z_assets = [a['id'] for a in ASSETS_CONFIG if selected_assets[a['id']] and a['id'] != 'hy_spread']
@@ -385,38 +381,33 @@ try:
     
     for t_asset in target_z_assets:
         if t_asset in raw and not raw[t_asset].empty and not df_m['Global_M2_Tril'].empty:
-            # [수정] Log Level 로직 직접 구현 (차트용)
-            asset_series_daily = raw[t_asset]
-            asset_weekly = asset_series_daily.resample('W-WED').last()
+            # Dual Core 로직 수동 구현 (차트용 시계열 생성)
+            asset_series = raw[t_asset]
+            res = run_quant_analysis_pure(df_m['Global_M2_Tril'], asset_series, shift_days)
             
-            # Log 변환
-            s_liq = np.log(df_m['Global_M2_Tril'].replace(0, np.nan).dropna())
-            s_price = np.log(asset_weekly.replace(0, np.nan).dropna())
-            
-            df_z = pd.concat([s_liq, s_price], axis=1).dropna()
-            df_z.columns = ['L_Log', 'P_Log']
-            
-            if len(df_z) > 10:
+            # run_quant_analysis_pure는 최근 1개 값만 주므로, 시계열을 다시 만듦 (로직 동일)
+            if res:
+                # 1. Prepare
+                l_weekly = df_m['Global_M2_Tril'].resample('W-WED').last().interpolate()
+                p_weekly = asset_series.resample('W-WED').last().interpolate()
+                df_z = pd.concat([l_weekly, p_weekly], axis=1).dropna()
+                df_z.columns = ['L', 'P']
+                
+                # 2. Log & Smooth
+                df_z['L_Log'] = np.log(df_z['L'])
+                df_z['P_Log'] = np.log(df_z['P'])
                 df_z['L_Smooth'] = df_z['L_Log'].rolling(4).mean()
                 df_z['P_Smooth'] = df_z['P_Log'].rolling(4).mean()
-                df_z = df_z.dropna()
                 
+                # 3. Z-Score
                 df_z['L_Z'] = (df_z['L_Smooth'] - df_z['L_Smooth'].mean()) / (df_z['L_Smooth'].std() + 1e-9)
                 df_z['P_Z'] = (df_z['P_Smooth'] - df_z['P_Smooth'].mean()) / (df_z['P_Smooth'].std() + 1e-9)
                 
-                # Hybrid Shift Logic (Chart)
-                if shift_days != 0:
-                    final_lag_weeks = int(shift_days / 7)
-                else:
-                    # Auto Lag (Diff Correlation)
-                    df_diff = df_z[['L_Z', 'P_Z']].diff().dropna()
-                    best_lag_w, best_r = 0, -1.0
-                    for lg in range(0, 53):
-                        r = df_diff['P_Z'].corr(df_diff['L_Z'].shift(lg))
-                        if r > best_r: best_r, best_lag_w = r, lg
-                    final_lag_weeks = best_lag_w
+                # 4. Lag Apply (함수에서 찾은 Lag 그대로 사용)
+                lag_weeks = int(res['calc_lag'] / 7)
+                df_z['L_Z_Shifted'] = df_z['L_Z'].shift(lag_weeks)
                 
-                df_z['L_Z_Shifted'] = df_z['L_Z'].shift(final_lag_weeks)
+                # 5. Gap
                 df_z['Gap_Z'] = df_z['P_Z'] - df_z['L_Z_Shifted']
                 z_chart_data[t_asset] = df_z['Gap_Z'].dropna()
 
@@ -465,7 +456,7 @@ try:
 
     st.divider()
 
-    # 2. Shift Logic (Main Chart - Still uses YoY for Momentum View)
+    # 2. Shift Logic & Processing (Main Chart)
     if not raw.get('fed', pd.Series()).empty:
         def apply_shift(s, days):
             if s.empty: return pd.Series(dtype=float)
@@ -580,20 +571,17 @@ try:
             else:
                 st.info(f"선택하신 기간 동안 감지된 위험 신호가 없습니다.")
 
-        # 5. Quant Analytics (Table - also Updated)
+        # 5. Quant Analytics
         st.markdown("---")
         st.subheader("🛰️ Matrix Quant Analytics")
         st.caption("비교 기준: Log Levels (Abs Value) ↔ Recent (Last 30d)")
         
-        # [수정] 표도 Log-Level 로직 사용
         if active_assets:
             asset_tabs = st.tabs([f"{a['name']}" for a in active_assets])
             for tab, asset in zip(asset_tabs, active_assets):
                 with tab:
                     raw_asset_series = raw.get(asset['id'], pd.Series(dtype=float))
                     if raw_asset_series.empty: continue
-                    
-                    # 사용할 유동성 소스들 (Raw Level 전달)
                     sources = []
                     if not df_m['Fed_Net_Tril'].empty: sources.append(("🇺🇸 Fed Net Liq", df_m['Fed_Net_Tril']))
                     if not df_m['G3_Asset_Tril'].empty: sources.append(("🏛️ G3 Assets", df_m['G3_Asset_Tril']))
@@ -605,11 +593,9 @@ try:
                         if res:
                             res['label'] = liq_label
                             results.append(res)
-                    
                     if not results: continue
                     cols = st.columns(len(results))
-                    best_res = max(results, key=lambda x: x['global_corr']) # 상관계수는 여전히 Diff 기준
-                    
+                    best_res = max(results, key=lambda x: x['global_corr'])
                     for i, res in enumerate(results):
                         with cols[i]:
                             if res == best_res: st.markdown(f"#### ⭐ {res['label']}")
