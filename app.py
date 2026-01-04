@@ -12,10 +12,10 @@ from datetime import date, timedelta
 
 # 1. 환경 설정
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="GM Turbo", layout="wide")
+st.set_page_config(page_title="GM Deep Dive", layout="wide")
 
-st.title("🏛️ Grand Master: Turbo Matrix Engine")
-st.caption("Ver 17.3 | 퀀트 연산 캐싱(Turbo Caching) | 와치독 시간 연장(60s) | 무한 로딩 해결")
+st.title("🏛️ Grand Master: Quant Deep Dive")
+st.caption("Ver 17.5 | Global(전체 역사) vs Local(최근 90일) 상관관계 비교 | 구조적 이탈 감지")
 
 # -----------------------------------------------------------
 # [사이드바 설정]
@@ -61,14 +61,13 @@ for asset in ASSETS_CONFIG:
     selected_assets[asset['id']] = st.sidebar.checkbox(f"{asset['name']}", value=asset['default'])
 
 # -----------------------------------------------------------
-# 데이터 수집 (Watchdog 60s & Caching)
+# 데이터 수집 (Logic)
 # -----------------------------------------------------------
 def fetch_master_data_logic():
     d = {}
     meta_info = {}
     
     GLOBAL_START = time.time()
-    # [수정] 와치독 시간 60초로 연장
     MAX_EXECUTION_TIME = 60 
     
     progress_bar = st.progress(0)
@@ -132,7 +131,7 @@ def fetch_master_data_logic():
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         return df.drop_duplicates('timestamp').set_index('timestamp')['close'].tz_localize(None)
 
-    status_text.text("📡 Initializing Macro Data...")
+    status_text.text("📡 Initializing...")
     fred_ids = {
         'fed': 'WALCL', 'tga': 'WTREGEN', 'rrp': 'RRPONTSYD',
         'ecb': 'ECBASSETSW', 'boj': 'JPNASSETS',
@@ -177,7 +176,7 @@ def fetch_master_data_logic():
         current_step += 1
         progress_bar.progress(min(int((current_step / total_steps) * 100), 100))
 
-    status_text.text("✅ Data Loaded")
+    status_text.text("✅ Data Ready")
     progress_bar.empty()
     status_text.empty()
 
@@ -194,13 +193,12 @@ def fetch_master_data_logic():
 raw, meta = fetch_master_data_logic()
 
 # -----------------------------------------------------------
-# [CORE] Quant Analytics Engine (Cached)
+# [CORE] Quant Analytics (Comparison Engine)
 # -----------------------------------------------------------
-# [수정] 무거운 퀀트 연산 결과를 캐싱하여 무한 로딩 방지
 @st.cache_data(show_spinner=False) 
 def run_quant_analysis_cached(liq_series, asset_series_daily):
     """
-    캐싱된 퀀트 분석 함수
+    Global(전체) vs Local(최근) 상관관계 비교 분석
     """
     try:
         asset_weekly = asset_series_daily.resample('W-WED').last()
@@ -214,53 +212,72 @@ def run_quant_analysis_cached(liq_series, asset_series_daily):
         df['L_Smooth'] = df['Liquidity_YoY'].rolling(4).mean()
         df['P_Smooth'] = df['Price_YoY'].rolling(4).mean()
         df = df.dropna()
-        
         if df.empty: return None
         
         df['L_Z'] = (df['L_Smooth'] - df['L_Smooth'].mean()) / (df['L_Smooth'].std() + 1e-9)
         df['P_Z'] = (df['P_Smooth'] - df['P_Smooth'].mean()) / (df['P_Smooth'].std() + 1e-9)
 
+        # 1. Global Optimization (전체 기간 최적 시차 탐색)
         best_lag_weeks = 0
-        best_corr = -1.0
+        best_corr = -1.0 # Global Max Corr
         
-        # 0~26주 탐색
-        for lag in range(0, 27): 
+        # 1년(52주) 시차 탐색
+        for lag in range(0, 53): 
             shifted_L = df['L_Z'].shift(lag)
             corr = df['P_Z'].corr(shifted_L)
+            # 양의 상관관계 우선 (트렌드 추종 확인)
             if corr > best_corr:
                 best_corr = corr
                 best_lag_weeks = lag
         
         best_lag_days = best_lag_weeks * 7
         
+        # 2. Local Correlation (최근 12주, 약 3달)
+        # Global에서 찾은 '최적 시차'를 적용했을 때, 최근에도 그 관계가 유효한가?
         recent_window = 12
         df['L_Z_Shifted'] = df['L_Z'].shift(best_lag_weeks)
         df_recent = df.iloc[-recent_window:]
+        
         if len(df_recent) < recent_window: return None
         
         recent_corr = df_recent['P_Z'].corr(df_recent['L_Z_Shifted'])
         
+        # 3. 괴리율
         last_val = df.iloc[-1]
         gap_z = last_val['P_Z'] - last_val['L_Z_Shifted']
         
+        # 4. Regime 판단 (Global과 Recent 비교)
+        # Global이 양수인데 Recent가 음수면 -> 이탈
+        # Global 자체가 음수면 -> 역상관
+        
+        if best_corr < 0:
+            regime = "Inverse"
+        elif recent_corr > 0.6:
+            regime = "Strong Sync"
+        elif recent_corr > 0.2:
+            regime = "Sync"
+        elif recent_corr < -0.2:
+            regime = "Divergence" # 이탈
+        else:
+            regime = "Neutral"
+
         return {
             "optimal_lag": best_lag_days,
-            "max_corr": best_corr,
-            "recent_corr": recent_corr,
+            "global_corr": best_corr,   # 전체 기간 (기준)
+            "recent_corr": recent_corr, # 최근 90일 (현재)
             "gap_z": gap_z,
-            "regime": "Sync" if recent_corr > 0.5 else ("Divergence" if recent_corr < 0.2 else "Weak")
+            "regime": regime
         }
 
     except Exception:
         return None
 
 # -----------------------------------------------------------
-# Main Logic & Rendering
+# Rendering
 # -----------------------------------------------------------
 try:
     if not raw.get('btc', pd.Series()).empty:
 
-        # Macro Processing
         base_idx = raw['fed'].resample('W-WED').last().index
         df_m = pd.DataFrame(index=base_idx)
         
@@ -286,7 +303,6 @@ try:
         m3_jp = (df_m.get('m3_jp',0) / df_m.get('usd_jpy',1)) / 1e12
         df_m['Global_M2_YoY'] = (m2_us + m3_eu + m3_jp).pct_change(52) * 100
 
-        # Shift Processing
         def apply_shift(s, days):
             if s.empty: return pd.Series(dtype=float)
             new_s = s.copy()
@@ -301,7 +317,6 @@ try:
             else:
                 processed[asset['id']] = pd.Series(dtype=float)
 
-        # Chart Render
         st.subheader(f"📊 Integrated Strategy Chart (Shift: {shift_days}d)")
         
         start_viz = pd.to_datetime('2021-06-01') 
@@ -405,15 +420,11 @@ try:
 
         st.plotly_chart(fig, use_container_width=True, key="main_chart")
 
-        # ------------------------------------------------------------------
-        # Matrix Quant Analytics (Optimized)
-        # ------------------------------------------------------------------
         st.markdown("---")
-        st.subheader("🛰️ Matrix Quant Analytics")
-        st.caption("분석 기준: YoY vs YoY | 자산별 유동성 민감도 및 3대 지표 비교")
+        st.subheader("🛰️ Matrix Quant Analytics (Global vs Local)")
+        st.caption("비교 기준: Historical (2021~, 전체 역사) ↔ Recent (Last 90d, 최근 분기)")
         
-        # 분석 상태 메시지
-        with st.spinner("Calculating Quant Matrix... (This may take a moment)"):
+        with st.spinner("Calculating Correlations..."):
             
             liquidity_sources = [
                 ("🇺🇸 Fed Net Liq", df_m['Fed_Net_YoY']),
@@ -427,25 +438,23 @@ try:
                 for tab, asset in zip(asset_tabs, active_assets):
                     with tab:
                         raw_asset_series = raw.get(asset['id'], pd.Series(dtype=float))
-                        
                         if raw_asset_series.empty:
-                            st.warning("데이터가 부족합니다.")
+                            st.warning("데이터 부족")
                             continue
                         
                         results = []
                         for liq_label, liq_data in liquidity_sources:
-                            # [핵심] 캐싱된 함수 호출
                             res = run_quant_analysis_cached(liq_data, raw_asset_series)
                             if res:
                                 res['label'] = liq_label
                                 results.append(res)
                         
                         if not results:
-                            st.info("분석 데이터 부족")
+                            st.info("분석 불가")
                             continue
 
                         cols = st.columns(len(results))
-                        best_res = max(results, key=lambda x: x['max_corr'])
+                        best_res = max(results, key=lambda x: x['global_corr'])
                         
                         for i, res in enumerate(results):
                             with cols[i]:
@@ -453,17 +462,31 @@ try:
                                 else: st.markdown(f"#### {res['label']}")
 
                                 st.metric("Optimal Lag", f"{res['optimal_lag']} days")
-                                st.metric("Max Corr", f"{res['max_corr']:.2f}")
                                 
-                                regime_icon = "🟢" if res['regime']=="Sync" else ("⚠️" if res['regime']=="Divergence" else "⚪")
-                                st.metric("Regime", f"{regime_icon} {res['regime']}", f"Rec: {res['recent_corr']:.2f}")
+                                # Global vs Recent 비교
+                                st.metric("Hist. Corr (4y)", f"{res['global_corr']:.2f}", help="2021년부터 현재까지의 전체 상관관계")
+                                st.metric("Recent Corr (90d)", f"{res['recent_corr']:.2f}", 
+                                          delta=f"{res['recent_corr'] - res['global_corr']:.2f}",
+                                          delta_color="normal",
+                                          help="최근 90일간의 상관관계 (Global 대비 변화량)")
+                                
+                                regime_icon = "🟢" if res['regime']=="Sync" or res['regime']=="Strong Sync" else ("⚠️" if res['regime']=="Divergence" else "📉")
+                                st.metric("Regime Status", f"{regime_icon} {res['regime']}")
                                 
                                 gap_state = "High" if res['gap_z'] > 1.0 else ("Low" if res['gap_z'] < -1.0 else "Fair")
                                 st.metric("Z-Gap", f"{res['gap_z']:+.2f} σ", gap_state, delta_color="inverse")
                         
-                        st.info(f"""
-                        **Insight:** **{asset['name']}**는 **{best_res['label']}**와 가장 높은 상관관계(**{best_res['max_corr']:.2f}**)를 보이며, 약 **{best_res['optimal_lag']}일** 후행합니다.
-                        """)
+                        # Insight Text Generation
+                        if best_res['global_corr'] < 0:
+                            insight_msg = f"**{asset['name']}**는 역사적으로 유동성 지표들과 **역상관(Inverse)** 관계를 보여왔습니다. 유동성이 빠질 때 오히려 오르는 경향이 있거나, 다른 요인에 더 크게 반응합니다."
+                        else:
+                            insight_msg = f"**{asset['name']}**는 역사적으로 **{best_res['label']}**와 가장 강한 동행(**{best_res['global_corr']:.2f}**)을 보입니다."
+                            if best_res['recent_corr'] < 0.2:
+                                insight_msg += f" 그러나 최근 90일간은 상관관계가 약화되어 **이탈(Divergence)** 조짐이 보입니다."
+                            else:
+                                insight_msg += f" 최근에도 이 관계는 견고하게 유지되고 있습니다."
+
+                        st.info(f"**Insight:** {insight_msg}")
 
         with st.expander("🔍 데이터 연결 리포트"):
             active_ids_report = [a['id'] for a in ASSETS_CONFIG if selected_assets[a['id']]]
