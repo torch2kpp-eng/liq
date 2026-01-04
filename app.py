@@ -12,10 +12,10 @@ from datetime import date, timedelta
 
 # 1. 환경 설정
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="GM Dual Core", layout="wide")
+st.set_page_config(page_title="GM Macro Filter", layout="wide")
 
 st.title("🏛️ Grand Master: Analytics Engine")
-st.caption("Ver 20.1 | Dual-Core Logic | Lag 탐지는 YoY(안정성), Z-Gap은 Log(직관성) 적용 | 값 흔들림 해결")
+st.caption("Ver 20.2 | Macro Filter 적용 | 최소 4주(28일) 이상 시차만 탐색하여 '7일 노이즈' 제거")
 
 # -----------------------------------------------------------
 # [사이드바 설정]
@@ -189,7 +189,7 @@ def check_risk_radar(hy_series):
     return {"val": last_val, "daily_chg_bps": daily_chg_bps, "status": status, "color": color, "msg": msg}
 
 # -----------------------------------------------------------
-# [FUNC 2] Quant Engine (Dual-Core: YoY for Lag, Log for Gap)
+# [FUNC 2] Quant Engine (With Macro Filter)
 # -----------------------------------------------------------
 def run_quant_analysis_pure(liq_series_raw, asset_series_raw, manual_lag_days):
     try:
@@ -203,37 +203,35 @@ def run_quant_analysis_pure(liq_series_raw, asset_series_raw, manual_lag_days):
         if len(df) < 52: return None
 
         # -------------------------------------------------------
-        # Core A: Lag Detection (using YoY) - 안정적인 시차 찾기
+        # Core A: Lag Detection (YoY + Macro Filter)
         # -------------------------------------------------------
         df['L_YoY'] = df['L_Raw'].pct_change(52).replace([np.inf, -np.inf], np.nan)
         df['P_YoY'] = df['P_Raw'].pct_change(52).replace([np.inf, -np.inf], np.nan)
         
-        # Smoothing for correlation stability
+        # Smoothing
         L_YoY_Smooth = df['L_YoY'].rolling(4).mean()
         P_YoY_Smooth = df['P_YoY'].rolling(4).mean()
         
-        # 임시 DF로 상관계수 계산
         df_corr = pd.concat([L_YoY_Smooth, P_YoY_Smooth], axis=1).dropna()
         df_corr.columns = ['L', 'P']
         
         best_lag_weeks, best_corr = 0, -1.0
-        # 0주 ~ 52주(1년) 사이에서 최적 시차 탐색
-        for lag in range(0, 53): 
-            # YoY끼리 비교하면 사이클(추세)의 시차를 더 정확히 찾음
+        
+        # [Macro Filter] 4주(28일) 미만의 시차는 경제적 노이즈로 간주하고 무시함
+        # Start searching from lag=4 instead of lag=0
+        for lag in range(4, 53): 
             corr = df_corr['P'].corr(df_corr['L'].shift(lag))
             if corr > best_corr: best_corr, best_lag_weeks = corr, lag
 
         # -------------------------------------------------------
-        # Core B: Z-Gap Calculation (using Log Level) - 직관적인 높이 비교
+        # Core B: Z-Gap Calculation (Log Level)
         # -------------------------------------------------------
         df['L_Log'] = np.log(df['L_Raw'])
         df['P_Log'] = np.log(df['P_Raw'])
         
-        # Z-Score (전체 기간 기준)
         df['L_Z'] = (df['L_Log'] - df['L_Log'].mean()) / (df['L_Log'].std() + 1e-9)
         df['P_Z'] = (df['P_Log'] - df['P_Log'].mean()) / (df['P_Log'].std() + 1e-9)
         
-        # Hybrid Shift Decision
         if manual_lag_days != 0:
             calc_lag_weeks = int(manual_lag_days / 7)
             used_mode = "Manual"
@@ -241,18 +239,14 @@ def run_quant_analysis_pure(liq_series_raw, asset_series_raw, manual_lag_days):
             calc_lag_weeks = best_lag_weeks
             used_mode = "Auto"
         
-        # 유동성 지표 Shift (Core A에서 찾은 시차 적용)
         df['L_Z_Shifted'] = df['L_Z'].shift(calc_lag_weeks)
         
-        # Z-Gap 계산
         last_val = df.iloc[-1]
         gap_z = last_val['P_Z'] - last_val['L_Z_Shifted']
         
-        # 최근 상관관계 (Log Level 기준, 최근 8주)
         df_recent = df.iloc[-8:]
         recent_corr = df_recent['P_Z'].corr(df_recent['L_Z_Shifted'])
         
-        # Regime 판단
         if best_corr < 0: regime = "Inverse"
         elif gap_z > 1.5: regime = "Overheat"
         elif gap_z < -1.5: regime = "Undervalued"
@@ -309,7 +303,6 @@ def run_stress_test(hy_series, btc_series, threshold_bps, look_forward, start_d,
 # Main Logic
 # -----------------------------------------------------------
 try:
-    # 0. 매크로 데이터 선행 계산
     if not raw.get('fed', pd.Series()).empty:
         base_idx = raw['fed'].resample('W-WED').last().index
         df_m = pd.DataFrame(index=base_idx)
@@ -336,11 +329,9 @@ try:
         df_m['Fed_Net_Tril'] = (df_m.get('fed',0)/1000 - df_m.get('tga',0)/1000 - df_m.get('rrp',0)/1000000)
         df_m['Fed_Net_YoY'] = df_m['Fed_Net_Tril'].pct_change(52) * 100
 
-    # 1. 상단: Integrated Risk Radar
     st.markdown("### ⚡ Integrated Risk Radar")
     r_cols = st.columns(2)
 
-    # [Radar 1] HY Spread
     if 'hy_spread' in raw and not raw['hy_spread'].empty:
         risk_res = check_risk_radar(raw['hy_spread'])
         if risk_res:
@@ -353,9 +344,7 @@ try:
                     elif risk_res['status'] == "Warning": st.warning(f"{risk_res['msg']}")
                     else: st.error(f"{risk_res['msg']}")
 
-    # [Radar 2] M2 Divergence
     if 'btc' in raw and not raw['btc'].empty and not df_m['Global_M2_Tril'].empty:
-        # [수정] Raw Level Data 전달
         m2_res = run_quant_analysis_pure(df_m['Global_M2_Tril'], raw['btc'], shift_days)
         if m2_res:
             with r_cols[1]:
@@ -367,47 +356,32 @@ try:
                 with c2:
                     regime = m2_res['regime']
                     lag_msg = f"Lag: {m2_res['calc_lag']}d ({m2_res['mode']})"
-                    
                     if "Overheat" in regime: st.error(f"🔴 과열\n({lag_msg})")
                     elif "Undervalued" in regime: st.success(f"🟢 저평가\n({lag_msg})")
                     elif "Fair" in regime: st.info(f"⚪ 적정\n({lag_msg})")
                     else: st.warning(f"⚠️ {regime}\n({lag_msg})")
     
-    # [NEW] Z-Gap Trend Chart (Using Dual Core)
     st.markdown("#### 🌊 Z-Gap Trend Monitor (All Selected Assets)")
-    
     target_z_assets = [a['id'] for a in ASSETS_CONFIG if selected_assets[a['id']] and a['id'] != 'hy_spread']
     z_chart_data = {}
     
     for t_asset in target_z_assets:
         if t_asset in raw and not raw[t_asset].empty and not df_m['Global_M2_Tril'].empty:
-            # Dual Core 로직 수동 구현 (차트용 시계열 생성)
             asset_series = raw[t_asset]
             res = run_quant_analysis_pure(df_m['Global_M2_Tril'], asset_series, shift_days)
-            
-            # run_quant_analysis_pure는 최근 1개 값만 주므로, 시계열을 다시 만듦 (로직 동일)
             if res:
-                # 1. Prepare
                 l_weekly = df_m['Global_M2_Tril'].resample('W-WED').last().interpolate()
                 p_weekly = asset_series.resample('W-WED').last().interpolate()
                 df_z = pd.concat([l_weekly, p_weekly], axis=1).dropna()
                 df_z.columns = ['L', 'P']
-                
-                # 2. Log & Smooth
                 df_z['L_Log'] = np.log(df_z['L'])
                 df_z['P_Log'] = np.log(df_z['P'])
                 df_z['L_Smooth'] = df_z['L_Log'].rolling(4).mean()
                 df_z['P_Smooth'] = df_z['P_Log'].rolling(4).mean()
-                
-                # 3. Z-Score
                 df_z['L_Z'] = (df_z['L_Smooth'] - df_z['L_Smooth'].mean()) / (df_z['L_Smooth'].std() + 1e-9)
                 df_z['P_Z'] = (df_z['P_Smooth'] - df_z['P_Smooth'].mean()) / (df_z['P_Smooth'].std() + 1e-9)
-                
-                # 4. Lag Apply (함수에서 찾은 Lag 그대로 사용)
                 lag_weeks = int(res['calc_lag'] / 7)
                 df_z['L_Z_Shifted'] = df_z['L_Z'].shift(lag_weeks)
-                
-                # 5. Gap
                 df_z['Gap_Z'] = df_z['P_Z'] - df_z['L_Z_Shifted']
                 z_chart_data[t_asset] = df_z['Gap_Z'].dropna()
 
@@ -415,34 +389,19 @@ try:
         fig_z = go.Figure()
         x_min = min([s.index.min() for s in z_chart_data.values()])
         x_max = max([s.index.max() for s in z_chart_data.values()])
-        
         fig_z.add_shape(type="rect", x0=x_min, x1=x_max, y0=-2.0, y1=-6.0, fillcolor="rgba(0, 255, 127, 0.1)", line=dict(width=0), layer="below")
         fig_z.add_shape(type="rect", x0=x_min, x1=x_max, y0=1.5, y1=6.0, fillcolor="rgba(255, 69, 0, 0.1)", line=dict(width=0), layer="below")
-        
         fig_z.add_hline(y=0, line_dash="dot", line_color="gray", opacity=0.5)
         fig_z.add_hline(y=1.5, line_dash="dash", line_color="red", annotation_text="Overheat (+1.5σ)", annotation_position="top left")
         fig_z.add_hline(y=-2.0, line_dash="dash", line_color="#00FF7F", annotation_text="Deep Value (-2.0σ)", annotation_position="bottom left")
-
-        colors = {
-            'btc': '#00FFEE', 'eth': '#627EEA', 'doge': '#FFA500', 'link': '#2A5ADA',
-            'nasdaq': '#D62780', 'gold': '#FFD700', 'silver': '#C0C0C0',
-            'ada': '#0033AD', 'xrp': '#00AAE4'
-        }
-        
+        colors = {'btc': '#00FFEE', 'eth': '#627EEA', 'doge': '#FFA500', 'link': '#2A5ADA', 'nasdaq': '#D62780', 'gold': '#FFD700', 'silver': '#C0C0C0', 'ada': '#0033AD', 'xrp': '#00AAE4'}
         for t_asset, series in z_chart_data.items():
             c = colors.get(t_asset, '#FFFFFF')
             name = next((a['name'] for a in ASSETS_CONFIG if a['id'] == t_asset), t_asset.upper())
             fig_z.add_trace(go.Scatter(x=series.index, y=series, name=name, line=dict(color=c, width=2)))
-
-        fig_z.update_layout(
-            template="plotly_dark", height=350, margin=dict(l=20, r=20, t=30, b=20),
-            yaxis=dict(title="Z-Gap (Sigma)", range=[-4.0, 4.0]),
-            xaxis=dict(showgrid=True, gridcolor='rgba(128,128,128,0.2)'),
-            legend=dict(orientation="h", y=1.1, x=0.5, xanchor="center")
-        )
+        fig_z.update_layout(template="plotly_dark", height=350, margin=dict(l=20, r=20, t=30, b=20), yaxis=dict(title="Z-Gap (Sigma)", range=[-4.0, 4.0]), xaxis=dict(showgrid=True, gridcolor='rgba(128,128,128,0.2)'), legend=dict(orientation="h", y=1.1, x=0.5, xanchor="center"))
         st.plotly_chart(fig_z, use_container_width=True)
 
-    # Z-Gap Guide
     with st.expander("ℹ️ Z-Gap 해석 가이드 (Signal Traffic Light)"):
         st.markdown("""
         | 구간 (Sigma) | 상태 | 의미 (Meaning) | 행동 요령 (Action) |
@@ -456,14 +415,12 @@ try:
 
     st.divider()
 
-    # 2. Shift Logic & Processing (Main Chart)
     if not raw.get('fed', pd.Series()).empty:
         def apply_shift(s, days):
             if s.empty: return pd.Series(dtype=float)
             new_s = s.copy()
             new_s.index = new_s.index - pd.Timedelta(days=days)
             return new_s
-
         processed = {}
         for asset in ASSETS_CONFIG:
             s = raw.get(asset['id'], pd.Series(dtype=float))
@@ -471,40 +428,25 @@ try:
                 processed[asset['id']] = apply_shift(s, shift_days)
             else: processed[asset['id']] = pd.Series(dtype=float)
 
-        # 3. Chart
         st.subheader(f"📊 Integrated Strategy Chart (Momentum View)")
         start_viz = pd.to_datetime('2021-06-01') 
         def flt(s): return s[s.index >= start_viz] if not s.empty else s
-
-        if "Global M2" in liq_option:
-            liq_v, liq_name, liq_color = flt(df_m['Global_M2_YoY']), "Global M2", "#FF4500"
-        elif "G3" in liq_option:
-            liq_v, liq_name, liq_color = flt(df_m['G3_Asset_YoY']), "G3 Assets", "#FFD700"
-        else:
-            liq_v, liq_name, liq_color = flt(df_m['Fed_Net_YoY']), "Fed Net", "#00FF7F"
-
+        if "Global M2" in liq_option: liq_v, liq_name, liq_color = flt(df_m['Global_M2_YoY']), "Global M2", "#FF4500"
+        elif "G3" in liq_option: liq_v, liq_name, liq_color = flt(df_m['G3_Asset_YoY']), "G3 Assets", "#FFD700"
+        else: liq_v, liq_name, liq_color = flt(df_m['Fed_Net_YoY']), "Fed Net", "#00FF7F"
         liq_v = liq_v.replace([np.inf, -np.inf], np.nan).dropna()
         if not liq_v.empty:
             l_min, l_max = liq_v.min(), liq_v.max()
             if pd.isna(l_min) or pd.isna(l_max): l_rng = [-20, 20]
             else: l_rng = [l_min - (l_max-l_min)*0.1, l_max + (l_max-l_min)*0.1]
         else: l_rng = [-20, 20]
-
         active_assets = [a for a in ASSETS_CONFIG if selected_assets[a['id']]]
         num_active = len(active_assets)
         if is_mobile: tick_fmt, margin, font_size = "s", 0.03, 10
         else: tick_fmt, margin, font_size = ",", 0.05 if num_active > 5 else 0.08, 12
         if num_active == 0: domain_end = 0.95
         else: domain_end = max(0.5, 1.0 - (num_active * margin))
-
-        layout = go.Layout(
-            template="plotly_dark", height=600,
-            xaxis=dict(domain=[0.0, domain_end], showgrid=True, gridcolor='rgba(128,128,128,0.2)'),
-            yaxis=dict(title=dict(text=liq_name, font=dict(color=liq_color, size=font_size)), tickfont=dict(color=liq_color, size=font_size), range=l_rng, showgrid=False),
-            legend=dict(orientation="h", y=1.12, x=0, bgcolor="rgba(0,0,0,0)"),
-            hovermode="x", margin=dict(l=30, r=10, t=80, b=50)
-        )
-
+        layout = go.Layout(template="plotly_dark", height=600, xaxis=dict(domain=[0.0, domain_end], showgrid=True, gridcolor='rgba(128,128,128,0.2)'), yaxis=dict(title=dict(text=liq_name, font=dict(color=liq_color, size=font_size)), tickfont=dict(color=liq_color, size=font_size), range=l_rng, showgrid=False), legend=dict(orientation="h", y=1.12, x=0, bgcolor="rgba(0,0,0,0)"), hovermode="x", margin=dict(l=30, r=10, t=80, b=50))
         fig = go.Figure(layout=layout)
         if not liq_v.empty:
             h = liq_color.lstrip('#')
@@ -515,7 +457,6 @@ try:
                 fig.add_shape(type="rect", x0=start_date, x1=last_date, y0=l_rng[0], y1=l_rng[1], fillcolor="rgba(200, 200, 200, 0.15)", line=dict(width=0), layer="below")
                 fig.add_annotation(x=last_date, y=l_rng[1], text=f"Lag:{abs(shift_days)}d", showarrow=False, yshift=10, xshift=-40, font=dict(color="rgba(255,255,255,0.7)", size=10))
             fig.add_trace(go.Scatter(x=liq_v.index, y=liq_v, name=liq_name, line=dict(color=liq_color, width=3), fill='tozeroy', fillcolor=f"rgba({rgb[0]},{rgb[1]},{rgb[2]},0.15)", yaxis='y', hoverinfo='none'))
-
         current_pos = domain_end
         for i, asset in enumerate(active_assets):
             data = flt(processed[asset['id']])
@@ -545,33 +486,8 @@ try:
             })
             fig.add_trace(go.Scatter(x=data.index, y=data, name=asset['name'], line=dict(color=asset['color'], width=2), yaxis=axis_key, hoverinfo='none'))
             current_pos += margin
-
         st.plotly_chart(fig, use_container_width=True, key="main_chart")
 
-        # 4. Stress Test
-        st.markdown("---")
-        st.subheader("📉 Crash Simulation (Stress Test)")
-        st.caption(f"기간: **{sim_start_date} ~ {sim_end_date}** | 감지 조건: Spread Spike **≥ {spike_threshold} bps**")
-
-        if 'hy_spread' in raw and 'btc' in raw:
-            res_df = run_stress_test(raw['hy_spread'], raw['btc'], spike_threshold, look_forward_days, sim_start_date, sim_end_date)
-            if not res_df.empty:
-                success_cases = res_df[res_df['Raw_Return'] < 0]
-                fail_cases = res_df[res_df['Raw_Return'] >= 0]
-                total_sigs = len(res_df)
-                success_rate = (len(success_cases) / total_sigs) * 100
-                avg_saved = success_cases['Raw_Return'].mean() if not success_cases.empty else 0
-                avg_missed = fail_cases['Raw_Return'].mean() if not fail_cases.empty else 0
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("위험 감지 횟수", f"{total_sigs} 회")
-                c2.metric("방어 확률 (Win Rate)", f"{success_rate:.1f}%")
-                c3.metric("평균 방어 수익률", f"{avg_saved:.2f}%")
-                c4.metric("평균 기회비용", f"{avg_missed:.2f}%")
-                st.dataframe(res_df[['Date', 'Spike', 'BTC Return', 'Outcome']].style.map(lambda x: 'color: #00FF7F' if '성공' in str(x) else ('color: #FF4500' if '휩쏘' in str(x) else ''), subset=['Outcome']), use_container_width=True)
-            else:
-                st.info(f"선택하신 기간 동안 감지된 위험 신호가 없습니다.")
-
-        # 5. Quant Analytics
         st.markdown("---")
         st.subheader("🛰️ Matrix Quant Analytics")
         st.caption("비교 기준: Log Levels (Abs Value) ↔ Recent (Last 30d)")
@@ -586,7 +502,6 @@ try:
                     if not df_m['Fed_Net_Tril'].empty: sources.append(("🇺🇸 Fed Net Liq", df_m['Fed_Net_Tril']))
                     if not df_m['G3_Asset_Tril'].empty: sources.append(("🏛️ G3 Assets", df_m['G3_Asset_Tril']))
                     if not df_m['Global_M2_Tril'].empty: sources.append(("🌍 Global M2", df_m['Global_M2_Tril']))
-                    
                     results = []
                     for liq_label, liq_data in sources:
                         res = run_quant_analysis_pure(liq_data, raw_asset_series, shift_days)
