@@ -12,18 +12,17 @@ from datetime import date, timedelta
 
 # 1. 환경 설정
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="GM Final Polish", layout="wide")
+st.set_page_config(page_title="GM Bulletproof", layout="wide")
 
-st.title("🏛️ Grand Master: Final Polish")
-st.caption("Ver 16.5 | 구문 오류(Syntax Error) 수정 | 모바일 최적화 & 시각화 완성")
+st.title("🏛️ Grand Master: Bulletproof Renderer")
+st.caption("Ver 16.6 | 렌더링 충돌 방지(Try-Except) | NaN/Inf 데이터 자동 세탁 | 차트 강제 출력")
 
 # -----------------------------------------------------------
 # [사이드바 설정]
 # -----------------------------------------------------------
 st.sidebar.header("⚙️ Control Panel")
 
-# 모바일 모드 토글
-is_mobile = st.sidebar.checkbox("📱 모바일 모드 (축 공간 최소화)", value=True, help="체크 시 숫자를 짧게(150M) 표시하고 여백을 줄여 차트를 넓게 봅니다.")
+is_mobile = st.sidebar.checkbox("📱 모바일 모드 (축 공간 최소화)", value=True)
 
 liq_option = st.sidebar.radio(
     "1. 유동성 지표 (Left Axis)",
@@ -39,7 +38,7 @@ st.sidebar.markdown("---")
 st.sidebar.write("2. Time Shift (Days)")
 shift_days = st.sidebar.number_input(
     "자산 가격 이동 (일)", min_value=-365, max_value=365, value=90, step=7,
-    help="양수(+) 입력 시 자산 차트를 과거로 이동시킵니다. (오른쪽 회색 박스는 유동성이 선행하는 구간입니다)"
+    help="양수(+) 입력 시 자산 차트를 과거로 이동시킵니다."
 )
 
 st.sidebar.markdown("---")
@@ -78,8 +77,7 @@ def fetch_master_data_logic():
     headers = {'User-Agent': 'Mozilla/5.0'}
 
     def check_timeout():
-        if time.time() - GLOBAL_START > MAX_EXECUTION_TIME: return True
-        return False
+        return (time.time() - GLOBAL_START > MAX_EXECUTION_TIME)
 
     def get_fred(id):
         if check_timeout(): return pd.Series(dtype=float)
@@ -135,7 +133,6 @@ def fetch_master_data_logic():
         return df.drop_duplicates('timestamp').set_index('timestamp')['close'].tz_localize(None)
 
     status_text.text("📡 Initializing...")
-    
     fred_ids = {
         'fed': 'WALCL', 'tga': 'WTREGEN', 'rrp': 'RRPONTSYD',
         'ecb': 'ECBASSETSW', 'boj': 'JPNASSETS',
@@ -163,11 +160,9 @@ def fetch_master_data_logic():
         if asset['id'] not in active_ids:
             d[asset['id']] = pd.Series(dtype=float)
             continue
-
         if check_timeout(): 
             d[asset['id']] = pd.Series(dtype=float)
             continue
-            
         if asset['id'] == 'nasdaq': continue
         
         if asset['source'] == 'hybrid_metal':
@@ -199,51 +194,192 @@ def fetch_master_data_logic():
 raw, meta = fetch_master_data_logic()
 
 # -----------------------------------------------------------
-# Logic & Chart
+# Logic & Chart (Safety Wrapped)
 # -----------------------------------------------------------
-if not raw.get('btc', pd.Series()).empty:
+try:
+    if not raw.get('btc', pd.Series()).empty:
 
-    base_idx = raw['fed'].resample('W-WED').last().index
-    df_m = pd.DataFrame(index=base_idx)
-    
-    for k in raw:
-        if k not in [a['id'] for a in ASSETS_CONFIG] and k != 'diff':
-            series = raw[k]
-            if not series.empty and isinstance(series.index, pd.DatetimeIndex):
-                try: df_m[k] = series.reindex(df_m.index, method='ffill')
-                except: continue
-    
-    df_m = df_m.fillna(method='ffill')
+        base_idx = raw['fed'].resample('W-WED').last().index
+        df_m = pd.DataFrame(index=base_idx)
+        
+        for k in raw:
+            if k not in [a['id'] for a in ASSETS_CONFIG] and k != 'diff':
+                series = raw[k]
+                if not series.empty and isinstance(series.index, pd.DatetimeIndex):
+                    try: df_m[k] = series.reindex(df_m.index, method='ffill')
+                    except: continue
+        
+        df_m = df_m.fillna(method='ffill')
 
-    df_m['Fed_Net_Tril'] = (df_m.get('fed',0)/1000 - df_m.get('tga',0)/1000 - df_m.get('rrp',0)/1000000)
-    df_m['Fed_Net_YoY'] = df_m['Fed_Net_Tril'].pct_change(52) * 100
+        df_m['Fed_Net_Tril'] = (df_m.get('fed',0)/1000 - df_m.get('tga',0)/1000 - df_m.get('rrp',0)/1000000)
+        df_m['Fed_Net_YoY'] = df_m['Fed_Net_Tril'].pct_change(52) * 100
 
-    fed_t = df_m.get('fed',0)/1000
-    ecb_t = (df_m.get('ecb',0) * df_m.get('eur_usd',1)) / 1000000
-    boj_t = (df_m.get('boj',0) * 0.0001) / df_m.get('usd_jpy',1)
-    df_m['G3_Asset_YoY'] = (fed_t + ecb_t + boj_t).pct_change(52) * 100
+        fed_t = df_m.get('fed',0)/1000
+        ecb_t = (df_m.get('ecb',0) * df_m.get('eur_usd',1)) / 1000000
+        boj_t = (df_m.get('boj',0) * 0.0001) / df_m.get('usd_jpy',1)
+        df_m['G3_Asset_YoY'] = (fed_t + ecb_t + boj_t).pct_change(52) * 100
 
-    m2_us = df_m.get('m2_us',0) / 1000
-    m3_eu = (df_m.get('m3_eu',0) * df_m.get('eur_usd',1)) / 1e12
-    m3_jp = (df_m.get('m3_jp',0) / df_m.get('usd_jpy',1)) / 1e12
-    df_m['Global_M2_YoY'] = (m2_us + m3_eu + m3_jp).pct_change(52) * 100
+        m2_us = df_m.get('m2_us',0) / 1000
+        m3_eu = (df_m.get('m3_eu',0) * df_m.get('eur_usd',1)) / 1e12
+        m3_jp = (df_m.get('m3_jp',0) / df_m.get('usd_jpy',1)) / 1e12
+        df_m['Global_M2_YoY'] = (m2_us + m3_eu + m3_jp).pct_change(52) * 100
 
-    def apply_shift(s, days):
-        if s.empty: return pd.Series(dtype=float)
-        new_s = s.copy()
-        new_s.index = new_s.index - pd.Timedelta(days=days)
-        return new_s
+        def apply_shift(s, days):
+            if s.empty: return pd.Series(dtype=float)
+            new_s = s.copy()
+            new_s.index = new_s.index - pd.Timedelta(days=days)
+            return new_s
 
-    processed = {}
-    for asset in ASSETS_CONFIG:
-        s = raw.get(asset['id'], pd.Series(dtype=float))
-        if isinstance(s.index, pd.DatetimeIndex):
-            processed[asset['id']] = apply_shift(s, shift_days)
+        processed = {}
+        for asset in ASSETS_CONFIG:
+            s = raw.get(asset['id'], pd.Series(dtype=float))
+            if isinstance(s.index, pd.DatetimeIndex):
+                processed[asset['id']] = apply_shift(s, shift_days)
+            else:
+                processed[asset['id']] = pd.Series(dtype=float)
+
+        st.subheader(f"📊 Integrated Strategy Chart (Shift: {shift_days}d)")
+        
+        start_viz = pd.to_datetime('2021-06-01') 
+        def flt(s): return s[s.index >= start_viz] if not s.empty else s
+
+        if "Global M2" in liq_option:
+            liq_v = flt(df_m['Global_M2_YoY'])
+            liq_name, liq_color = "Global M2", "#FF4500"
+        elif "G3" in liq_option:
+            liq_v = flt(df_m['G3_Asset_YoY'])
+            liq_name, liq_color = "G3 Assets", "#FFD700"
         else:
-            processed[asset['id']] = pd.Series(dtype=float)
+            liq_v = flt(df_m['Fed_Net_YoY'])
+            liq_name, liq_color = "Fed Net", "#00FF7F"
 
-    # [수정] f-string 안전하게 처리
-    st.subheader(f"📊 Integrated Strategy Chart (Shift: {shift_days}d)")
-    
-    start_viz = pd.to_datetime('2021-06-01') 
-    def flt(s): return s[s.index >= start_viz] if not s.empty else s
+        # [Safety] Clean Liquidity Data
+        liq_v = liq_v.replace([np.inf, -np.inf], np.nan).dropna()
+
+        if not liq_v.empty:
+            l_min, l_max = liq_v.min(), liq_v.max()
+            if pd.isna(l_min) or pd.isna(l_max): l_rng = [-20, 20]
+            else:
+                l_span = max(l_max - l_min, 10)
+                l_rng = [l_min - l_span*0.1, l_max + l_span*0.1]
+        else: l_rng = [-20, 20]
+
+        active_assets = [a for a in ASSETS_CONFIG if selected_assets[a['id']]]
+        num_active = len(active_assets)
+        
+        if is_mobile:
+            tick_fmt = "s" 
+            margin = 0.03  
+            font_size = 10
+        else:
+            tick_fmt = "," 
+            margin = 0.05 if num_active > 5 else 0.08
+            font_size = 12
+
+        if num_active == 0: domain_end = 0.95
+        else:
+            domain_end = max(0.5, 1.0 - (num_active * margin))
+
+        spike_settings = dict(
+            showspikes=True, spikemode='across', spikesnap='cursor',
+            spikethickness=1, spikecolor='red', spikedash='dash'
+        )
+
+        layout = go.Layout(
+            template="plotly_dark", height=800,
+            xaxis=dict(domain=[0.0, domain_end], showgrid=True, gridcolor='rgba(128,128,128,0.2)', **spike_settings),
+            yaxis=dict(title=dict(text=liq_name, font=dict(color=liq_color, size=font_size)),
+                       tickfont=dict(color=liq_color, size=font_size),
+                       range=l_rng, showgrid=False, **spike_settings),
+            legend=dict(orientation="h", y=1.12, x=0, bgcolor="rgba(0,0,0,0)"),
+            hovermode="x",
+            margin=dict(l=30, r=10, t=80, b=50)
+        )
+
+        fig = go.Figure(layout=layout)
+
+        if not liq_v.empty:
+            h = liq_color.lstrip('#')
+            rgb = tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+            
+            if shift_days != 0:
+                last_date = liq_v.index.max()
+                start_date = last_date - pd.Timedelta(days=abs(shift_days))
+                fig.add_shape(
+                    type="rect", x0=start_date, x1=last_date, y0=l_rng[0], y1=l_rng[1],
+                    fillcolor="rgba(200, 200, 200, 0.15)", line=dict(width=0), layer="below"
+                )
+                fig.add_annotation(
+                    x=last_date, y=l_rng[1], text=f"Lag:{abs(shift_days)}d",
+                    showarrow=False, yshift=10, xshift=-40, font=dict(color="rgba(255,255,255,0.7)", size=10)
+                )
+
+            fig.add_trace(go.Scatter(
+                x=liq_v.index, y=liq_v, name=liq_name,
+                line=dict(color=liq_color, width=3),
+                fill='tozeroy', fillcolor=f"rgba({rgb[0]},{rgb[1]},{rgb[2]},0.15)",
+                yaxis='y', hoverinfo='none'
+            ))
+
+        current_pos = domain_end
+        for i, asset in enumerate(active_assets):
+            # [Safety] Data Cleaning
+            data = flt(processed[asset['id']])
+            data = data.replace([np.inf, -np.inf], np.nan).dropna()
+            
+            if data.empty: continue
+
+            axis_name = f'yaxis{i+2}'
+            axis_key = f'y{i+2}'
+
+            d_min, d_max = data.min(), data.max()
+            if pd.isna(d_min) or pd.isna(d_max) or d_min <= 0: d_min = 0.0001
+            
+            is_log = (asset['id'] == 'doge')
+            if is_log:
+                log_min, log_max = np.log10(d_min), np.log10(d_max)
+                span = log_max - log_min
+                rng = [log_min - span*0.1, log_max + span*0.1]
+                t_type = "log"
+            else:
+                span = d_max - d_min
+                rng = [d_min - span*0.2, d_max + span*0.1]
+                t_type = "linear"
+
+            fig.update_layout({
+                axis_name: dict(
+                    title=dict(text=asset['name'], font=dict(color=asset['color'], size=font_size)),
+                    tickfont=dict(color=asset['color'], size=font_size),
+                    overlaying="y", side="right", anchor="free", position=current_pos,
+                    range=rng, type=t_type, showgrid=False, tickformat=tick_fmt,
+                    **spike_settings
+                )
+            })
+
+            fig.add_trace(go.Scatter(
+                x=data.index, y=data, name=asset['name'],
+                line=dict(color=asset['color'], width=2),
+                yaxis=axis_key, hoverinfo='none'
+            ))
+            current_pos += margin
+
+        # [핵심] 차트 출력 (여기서 멈추면 catch로 이동)
+        st.plotly_chart(fig, use_container_width=True, key="main_chart")
+
+        with st.expander("🔍 데이터 연결 리포트"):
+            active_ids_report = [a['id'] for a in ASSETS_CONFIG if selected_assets[a['id']]]
+            for asset in ASSETS_CONFIG:
+                if asset['id'] in active_ids_report:
+                    s = processed[asset['id']]
+                    if s.empty:
+                        st.error(f"❌ {asset['name']}: 로드 실패")
+                    else:
+                        extra = f" ({meta.get(asset['id'], 'OK')})" if asset['id'] in meta else ""
+                        st.success(f"✅ {asset['name']}: 로드 성공{extra}")
+
+    else:
+        st.error("❌ 비트코인 로드 실패")
+
+except Exception as e:
+    st.error(f"⚠️ 차트 렌더링 중 오류 발생: {str(e)}")
+    st.info("데이터에 문제가 있거나 일시적인 연결 오류일 수 있습니다. 잠시 후 다시 시도해주세요.")
