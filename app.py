@@ -12,10 +12,10 @@ from datetime import date, timedelta
 
 # 1. 환경 설정
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="GM Risk Radar Pro", layout="wide")
+st.set_page_config(page_title="GM Ultimate", layout="wide")
 
 st.title("🏛️ Grand Master: Analytics Engine")
-st.caption("Ver 19.4 | Risk Radar 확장 (HY Spread + Liquidity Div) | 정밀해진 퀀트 연산 (112일 Lag)")
+st.caption("Ver 19.5 | Z-Gap 가이드 탑재 | 정밀 시차(112일) 적용 | 완전 무결성 버전")
 
 # -----------------------------------------------------------
 # [사이드바 설정]
@@ -53,8 +53,8 @@ liq_option = st.sidebar.radio(
 st.sidebar.markdown("---")
 st.sidebar.write("2. Time Shift (Days)")
 shift_days = st.sidebar.number_input(
-    "자산/지표 이동 (일)", min_value=-365, max_value=365, value=112, step=7, # [업데이트] 기본값 112일로 변경
-    help="최근 분석된 Optimal Lag(112일)를 반영하여 기본값을 수정했습니다."
+    "자산/지표 이동 (일)", min_value=-365, max_value=365, value=112, step=7,
+    help="최적 시차(Optimal Lag)인 112일을 기본값으로 설정했습니다."
 )
 
 st.sidebar.markdown("---")
@@ -201,7 +201,7 @@ def check_risk_radar(hy_series):
     return {"val": last_val, "daily_chg_bps": daily_chg_bps, "status": status, "color": color, "msg": msg}
 
 # -----------------------------------------------------------
-# [FUNC 2] Quant Engine (Pure Calc)
+# [FUNC 2] Quant Engine
 # -----------------------------------------------------------
 def run_quant_analysis_pure(liq_series, asset_series_daily):
     try:
@@ -288,7 +288,7 @@ def run_stress_test(hy_series, btc_series, threshold_bps, look_forward, start_d,
 # Main Logic
 # -----------------------------------------------------------
 try:
-    # 0. 매크로 데이터 선행 계산 (Risk Radar 표시를 위해)
+    # 0. 매크로 데이터 선행 계산
     if not raw.get('fed', pd.Series()).empty:
         base_idx = raw['fed'].resample('W-WED').last().index
         df_m = pd.DataFrame(index=base_idx)
@@ -298,7 +298,6 @@ try:
                 except: continue
         df_m = df_m.fillna(method='ffill')
 
-        # Global M2 & G3 & Fed Net Calculation (NaN Safe Ver 18.3)
         s_m2_us, s_m3_eu, s_m3_jp = df_m.get('m2_us'), df_m.get('m3_eu'), df_m.get('m3_jp')
         if s_m2_us is not None and s_m3_eu is not None and s_m3_jp is not None:
             global_m2_sum = (s_m2_us/1000) + ((s_m3_eu * df_m.get('eur_usd', 1))/1e12) + ((s_m3_jp / df_m.get('usd_jpy', 1))/1e12)
@@ -316,9 +315,9 @@ try:
         df_m['Fed_Net_Tril'] = (df_m.get('fed',0)/1000 - df_m.get('tga',0)/1000 - df_m.get('rrp',0)/1000000)
         df_m['Fed_Net_YoY'] = df_m['Fed_Net_Tril'].pct_change(52) * 100
 
-    # 1. 상단: Integrated Risk Radar (HY + Liquidity Divergence)
+    # 1. 상단: Integrated Risk Radar
     st.markdown("### ⚡ Integrated Risk Radar")
-    r_cols = st.columns(2) # 2개 컬럼
+    r_cols = st.columns(2)
 
     # [Radar 1] HY Spread
     if 'hy_spread' in raw and not raw['hy_spread'].empty:
@@ -333,7 +332,7 @@ try:
                     elif risk_res['status'] == "Warning": st.warning(f"{risk_res['msg']}")
                     else: st.error(f"{risk_res['msg']}")
 
-    # [Radar 2] M2 Divergence (for BTC)
+    # [Radar 2] M2 Divergence
     if 'btc' in raw and not raw['btc'].empty and not df_m['Global_M2_YoY'].empty:
         m2_res = run_quant_analysis_pure(df_m['Global_M2_YoY'], raw['btc'])
         if m2_res:
@@ -341,22 +340,27 @@ try:
                 st.markdown("#### 🌊 Liquidity Divergence (BTC vs M2)")
                 c1, c2 = st.columns([1.5, 2])
                 with c1:
-                    # 현재 BTC 가격 모멘텀과 M2 모멘텀의 Z-Score 차이 표시
                     gap_state = "High" if m2_res['gap_z'] > 1.0 else ("Low" if m2_res['gap_z'] < -1.0 else "Fair")
                     st.metric("Z-Gap", f"{m2_res['gap_z']:+.2f} σ", gap_state, delta_color="inverse")
                 with c2:
                     regime = m2_res['regime']
-                    recent_corr = m2_res['recent_corr']
-                    if "Sync" in regime: 
-                        st.success(f"🟢 동행 (Sync)\n(Corr: {recent_corr:.2f})")
-                    elif "Divergence" in regime: 
-                        st.warning(f"⚠️ 이탈 (Divergence)\n(Corr: {recent_corr:.2f})")
-                    elif "Inverse" in regime:
-                        st.error(f"📉 역상관 (Inverse)\n(Corr: {recent_corr:.2f})")
-                    else:
-                        st.info(f"⚪ 약세 (Weak)\n(Corr: {recent_corr:.2f})")
+                    if "Sync" in regime: st.success(f"🟢 동행 (Sync)")
+                    elif "Divergence" in regime: st.warning(f"⚠️ 이탈 (Divergence)")
+                    elif "Inverse" in regime: st.error(f"📉 역상관 (Inverse)")
+                    else: st.info(f"⚪ 약세 (Weak)")
     
-    st.caption("※ 자세한 분석 내용은 하단 **Matrix Quant Analytics** 섹션에서 확인하세요.")
+    # [NEW] Z-Gap Guide Expander (상단 배치)
+    with st.expander("ℹ️ Z-Gap 해석 가이드 (Signal Traffic Light) - 클릭하여 펼치기"):
+        st.markdown("""
+        | 구간 (Sigma) | 상태 | 의미 (Meaning) | 행동 요령 (Action) |
+        | :--- | :--- | :--- | :--- |
+        | **+1.5 이상** | 🔴 **High (과열)** | 유동성 대비 가격이 너무 높음. 고무줄이 팽팽함. | **매도/관망** (조정 가능성 높음) |
+        | **+1.0 ~ +1.5** | 🟠 **Warn (주의)** | 가격이 유동성을 앞서가기 시작함. | 추격 매수 자제 |
+        | **-1.0 ~ +1.0** | ⚪ **Fair (적정)** | 가격과 유동성이 **비슷한 속도**로 동행 중. | **추세 추종 (Hold)** |
+        | **-1.5 ~ -1.0** | 🔵 **Low (기회)** | 돈은 풀렸는데 가격이 아직 덜 오름. (저평가) | **분할 매수 (Buy)** |
+        | **-2.0 이하** | 🟢 **Deep Value** | 극심한 공포/투매 구간. 절호의 기회. | **강력 매수 (Strong Buy)** |
+        """)
+
     st.divider()
 
     # 2. Shift Logic & Processing
