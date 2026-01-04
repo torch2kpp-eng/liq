@@ -5,3 +5,8 @@ plotly>=5.15
 requests
 yfinance==0.2.40          # ← 2024년 중반~후반 가장 안정적이었던 버전
 ccxt>=4.4.0
+ccxt>=4.0.0
+streamlit
+pandas
+plotly
+requests
