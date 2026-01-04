@@ -12,10 +12,10 @@ from datetime import date, timedelta
 
 # 1. 환경 설정
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="GM Final UX", layout="wide")
+st.set_page_config(page_title="GM Stability", layout="wide")
 
-st.title("🏛️ Grand Master: Analytics Engine")
-st.caption("Ver 18.1 | Spread Shift 적용 | 색상 구분 강화 | 차트 높이 최적화 | 단독 실행 버그 수정")
+st.title("🏛️ Grand Master: Final Stability Engine")
+st.caption("Ver 18.2 | 모바일 초기 로딩(M2) 버그 수정 | Zero-Fill 로직 제거 | 데이터 안정성 강화")
 
 # -----------------------------------------------------------
 # [사이드바 설정]
@@ -44,7 +44,6 @@ shift_days = st.sidebar.number_input(
 st.sidebar.markdown("---")
 st.sidebar.write("3. 표시할 자산 (Right Axes)")
 
-# [설정] HY Spread 색상 변경 (#FF4500 -> #E040FB 네온 퍼플)
 ASSETS_CONFIG = [
     {'id': 'hy_spread', 'name': '⚡ HY Spread', 'symbol': 'BAMLH0A0HYM2', 'source': 'fred', 'color': '#E040FB', 'type': 'risk', 'default': True},
     {'id': 'nasdaq', 'name': 'Nasdaq', 'symbol': 'IXIC', 'source': 'hybrid', 'color': '#D62780', 'type': 'index', 'default': False},
@@ -198,7 +197,7 @@ def fetch_master_data_logic():
 raw, meta = fetch_master_data_logic()
 
 # -----------------------------------------------------------
-# [CORE] Risk Radar Logic (Real-time)
+# [CORE] Risk Radar Logic
 # -----------------------------------------------------------
 def check_risk_radar(hy_series):
     if hy_series.empty: return None
@@ -218,7 +217,7 @@ def check_risk_radar(hy_series):
     return {"val": last_val, "daily_chg": daily_chg, "ma_20": ma_20, "status": status, "color": color, "msg": msg}
 
 # -----------------------------------------------------------
-# [CORE] Quant Analytics (Pure Calc)
+# [CORE] Quant Analytics
 # -----------------------------------------------------------
 def run_quant_analysis_pure(liq_series, asset_series_daily):
     try:
@@ -267,7 +266,6 @@ def run_quant_analysis_pure(liq_series, asset_series_daily):
 # Main Logic
 # -----------------------------------------------------------
 try:
-    # 1. Risk Radar (Uses Raw Data for Real-time Check)
     if 'hy_spread' in raw and not raw['hy_spread'].empty:
         risk_res = check_risk_radar(raw['hy_spread'])
         if risk_res:
@@ -281,10 +279,7 @@ try:
                 else: st.error("스프레드가 위험 수위(4.0%)를 넘었습니다. 현금 비중 확대를 고려하십시오.")
             st.divider()
 
-    # [FIX] BTC 의존성 제거 -> 매크로 데이터(Fed)가 있으면 실행
     if not raw.get('fed', pd.Series()).empty:
-        
-        # Macro Data
         base_idx = raw['fed'].resample('W-WED').last().index
         df_m = pd.DataFrame(index=base_idx)
         
@@ -295,26 +290,40 @@ try:
         
         df_m = df_m.fillna(method='ffill')
 
-        # G3 & Liquidity Calc
+        # [FIX] G3 Calculation (NaN Safe)
         s_fed, s_ecb, s_boj = df_m.get('fed'), df_m.get('ecb'), df_m.get('boj')
         if s_fed is not None and s_ecb is not None and s_boj is not None:
             fed_t = s_fed / 1000000
             ecb_t = (s_ecb * df_m.get('eur_usd', 1)) / 1000000
             boj_t = (s_boj * 0.0001) / df_m.get('usd_jpy', 1)
             g3_sum = fed_t.fillna(0) + ecb_t.fillna(0) + boj_t.fillna(0)
+            # [Fix] 0을 NaN으로 치환 후 Interpolate
             df_m['G3_Asset_Tril'] = g3_sum.replace(0, np.nan).interpolate()
             df_m['G3_Asset_YoY'] = df_m['G3_Asset_Tril'].pct_change(52) * 100
         else: df_m['G3_Asset_YoY'] = pd.Series(dtype=float)
 
+        # [FIX] Global M2 Calculation (NaN Safe for Mobile)
+        # 이전에는 get(..., 0) 때문에 초기 로딩 시 0이 들어가서 그래프가 깨짐
+        s_m2_us = df_m.get('m2_us') # Default None
+        s_m3_eu = df_m.get('m3_eu')
+        s_m3_jp = df_m.get('m3_jp')
+        
+        if s_m2_us is not None and s_m3_eu is not None and s_m3_jp is not None:
+            m2_us = s_m2_us / 1000
+            m3_eu = (s_m3_eu * df_m.get('eur_usd', 1)) / 1e12
+            m3_jp = (s_m3_jp / df_m.get('usd_jpy', 1)) / 1e12
+            
+            # 합산 전 0을 NaN으로 처리하여 안전하게 Sum
+            global_m2_sum = m2_us.fillna(0) + m3_eu.fillna(0) + m3_jp.fillna(0)
+            df_m['Global_M2_Tril'] = global_m2_sum.replace(0, np.nan).interpolate()
+            df_m['Global_M2_YoY'] = df_m['Global_M2_Tril'].pct_change(52) * 100
+        else:
+            df_m['Global_M2_YoY'] = pd.Series(dtype=float)
+
         df_m['Fed_Net_Tril'] = (df_m.get('fed',0)/1000 - df_m.get('tga',0)/1000 - df_m.get('rrp',0)/1000000)
         df_m['Fed_Net_YoY'] = df_m['Fed_Net_Tril'].pct_change(52) * 100
-        
-        m2_us = df_m.get('m2_us',0) / 1000
-        m3_eu = (df_m.get('m3_eu',0) * df_m.get('eur_usd',1)) / 1e12
-        m3_jp = (df_m.get('m3_jp',0) / df_m.get('usd_jpy',1)) / 1e12
-        df_m['Global_M2_YoY'] = (m2_us + m3_eu + m3_jp).pct_change(52) * 100
 
-        # Shift Processing
+        # Shift Logic
         def apply_shift(s, days):
             if s.empty: return pd.Series(dtype=float)
             new_s = s.copy()
@@ -324,13 +333,12 @@ try:
         processed = {}
         for asset in ASSETS_CONFIG:
             s = raw.get(asset['id'], pd.Series(dtype=float))
-            # [FIX] HY Spread도 이제 Shift 적용 (차트 비교용)
             if isinstance(s.index, pd.DatetimeIndex):
                 processed[asset['id']] = apply_shift(s, shift_days)
             else:
                 processed[asset['id']] = pd.Series(dtype=float)
 
-        # Chart Render
+        # Chart Logic
         st.subheader(f"📊 Integrated Strategy Chart (Shift: {shift_days}d)")
         
         start_viz = pd.to_datetime('2021-06-01') 
@@ -359,17 +367,15 @@ try:
         active_assets = [a for a in ASSETS_CONFIG if selected_assets[a['id']]]
         num_active = len(active_assets)
         
-        if is_mobile:
-            tick_fmt, margin, font_size = "s", 0.03, 10
-        else:
-            tick_fmt, margin, font_size = ",", 0.05 if num_active > 5 else 0.08, 12
+        if is_mobile: tick_fmt, margin, font_size = "s", 0.03, 10
+        else: tick_fmt, margin, font_size = ",", 0.05 if num_active > 5 else 0.08, 12
 
         if num_active == 0: domain_end = 0.95
         else: domain_end = max(0.5, 1.0 - (num_active * margin))
 
         layout = go.Layout(
             template="plotly_dark", 
-            height=600, # [FIX] 차트 높이 축소 (800 -> 600)
+            height=600,
             xaxis=dict(domain=[0.0, domain_end], showgrid=True, gridcolor='rgba(128,128,128,0.2)'),
             yaxis=dict(title=dict(text=liq_name, font=dict(color=liq_color, size=font_size)), tickfont=dict(color=liq_color, size=font_size), range=l_rng, showgrid=False),
             legend=dict(orientation="h", y=1.12, x=0, bgcolor="rgba(0,0,0,0)"),
@@ -403,7 +409,6 @@ try:
             d_min, d_max = data.min(), data.max()
             if pd.isna(d_min) or pd.isna(d_max) or d_min <= 0: d_min = 0.0001
             
-            # [설정] 축 범위 및 타입 설정
             t_type = "linear"
             if asset['id'] == 'hy_spread': rng = [d_min - 0.5, d_max + 0.5]
             elif asset['id'] == 'doge': 
@@ -429,7 +434,6 @@ try:
 
         st.plotly_chart(fig, use_container_width=True, key="main_chart")
 
-        # Quant Analytics
         st.markdown("---")
         st.subheader("🛰️ Matrix Quant Analytics")
         st.caption("비교 기준: Historical (2021~, 전체 역사) ↔ Recent (Last 30d, 최근 1달)")
