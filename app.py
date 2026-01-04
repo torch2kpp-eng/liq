@@ -12,10 +12,10 @@ from datetime import date, timedelta
 
 # 1. 환경 설정
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="GM Matrix Engine", layout="wide")
+st.set_page_config(page_title="GM Turbo", layout="wide")
 
-st.title("🏛️ Grand Master: Matrix Quant Engine")
-st.caption("Ver 17.2 | Multi-Asset x 3-Factor Liquidity Analysis | 자산별 유동성 민감도 매트릭스")
+st.title("🏛️ Grand Master: Turbo Matrix Engine")
+st.caption("Ver 17.3 | 퀀트 연산 캐싱(Turbo Caching) | 와치독 시간 연장(60s) | 무한 로딩 해결")
 
 # -----------------------------------------------------------
 # [사이드바 설정]
@@ -38,7 +38,7 @@ st.sidebar.markdown("---")
 st.sidebar.write("2. Time Shift (Days)")
 shift_days = st.sidebar.number_input(
     "자산 가격 이동 (일)", min_value=-365, max_value=365, value=90, step=7,
-    help="차트 시각화용 수동 이동입니다. (하단 퀀트 분석은 자동으로 최적값을 찾습니다)"
+    help="차트 시각화용 수동 이동입니다."
 )
 
 st.sidebar.markdown("---")
@@ -61,14 +61,15 @@ for asset in ASSETS_CONFIG:
     selected_assets[asset['id']] = st.sidebar.checkbox(f"{asset['name']}", value=asset['default'])
 
 # -----------------------------------------------------------
-# 데이터 수집 (Logic)
+# 데이터 수집 (Watchdog 60s & Caching)
 # -----------------------------------------------------------
 def fetch_master_data_logic():
     d = {}
     meta_info = {}
     
     GLOBAL_START = time.time()
-    MAX_EXECUTION_TIME = 25 
+    # [수정] 와치독 시간 60초로 연장
+    MAX_EXECUTION_TIME = 60 
     
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -82,7 +83,7 @@ def fetch_master_data_logic():
         if check_timeout(): return pd.Series(dtype=float)
         try:
             url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={id}"
-            r = requests.get(url, headers=headers, timeout=3)
+            r = requests.get(url, headers=headers, timeout=5)
             df = pd.read_csv(io.StringIO(r.text), index_col=0, parse_dates=True)
             return df.squeeze().resample('D').interpolate(method='time').tz_localize(None)
         except: return pd.Series(dtype=float)
@@ -131,7 +132,7 @@ def fetch_master_data_logic():
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         return df.drop_duplicates('timestamp').set_index('timestamp')['close'].tz_localize(None)
 
-    status_text.text("📡 Initializing...")
+    status_text.text("📡 Initializing Macro Data...")
     fred_ids = {
         'fed': 'WALCL', 'tga': 'WTREGEN', 'rrp': 'RRPONTSYD',
         'ecb': 'ECBASSETSW', 'boj': 'JPNASSETS',
@@ -152,7 +153,7 @@ def fetch_master_data_logic():
     if not d.get('nasdaq_fred', pd.Series()).empty: d['nasdaq'] = d['nasdaq_fred']
     else: d['nasdaq'] = get_yahoo("^IXIC")
 
-    status_text.text("💰 Fetching Active Assets...")
+    status_text.text("💰 Fetching Assets...")
     active_ids = [a['id'] for a in ASSETS_CONFIG if selected_assets[a['id']]]
     
     for asset in ASSETS_CONFIG:
@@ -176,7 +177,7 @@ def fetch_master_data_logic():
         current_step += 1
         progress_bar.progress(min(int((current_step / total_steps) * 100), 100))
 
-    status_text.text("✅ Data Ready")
+    status_text.text("✅ Data Loaded")
     progress_bar.empty()
     status_text.empty()
 
@@ -193,27 +194,23 @@ def fetch_master_data_logic():
 raw, meta = fetch_master_data_logic()
 
 # -----------------------------------------------------------
-# [CORE] Quant Analytics Engine (Matrix Mode)
+# [CORE] Quant Analytics Engine (Cached)
 # -----------------------------------------------------------
-def run_quant_analysis(liq_series, asset_series_daily):
+# [수정] 무거운 퀀트 연산 결과를 캐싱하여 무한 로딩 방지
+@st.cache_data(show_spinner=False) 
+def run_quant_analysis_cached(liq_series, asset_series_daily):
     """
-    유동성(YoY)과 자산가격(YoY)을 동기화하여 분석
+    캐싱된 퀀트 분석 함수
     """
     try:
-        # 1. 데이터 동기화
         asset_weekly = asset_series_daily.resample('W-WED').last()
-        
-        # 2. YoY 변환 (52주)
         asset_yoy = asset_weekly.pct_change(52) * 100
         
-        # 교집합 병합
         df = pd.concat([liq_series, asset_yoy], axis=1).dropna()
         df.columns = ['Liquidity_YoY', 'Price_YoY']
         
-        # 최소 1년치 데이터 확인
         if len(df) < 52: return None
         
-        # 3. 스무딩 & 정규화
         df['L_Smooth'] = df['Liquidity_YoY'].rolling(4).mean()
         df['P_Smooth'] = df['Price_YoY'].rolling(4).mean()
         df = df.dropna()
@@ -223,11 +220,11 @@ def run_quant_analysis(liq_series, asset_series_daily):
         df['L_Z'] = (df['L_Smooth'] - df['L_Smooth'].mean()) / (df['L_Smooth'].std() + 1e-9)
         df['P_Z'] = (df['P_Smooth'] - df['P_Smooth'].mean()) / (df['P_Smooth'].std() + 1e-9)
 
-        # 4. 최적 시차 탐색
         best_lag_weeks = 0
         best_corr = -1.0
         
-        for lag in range(0, 27): # 0~26 weeks (6 months)
+        # 0~26주 탐색
+        for lag in range(0, 27): 
             shifted_L = df['L_Z'].shift(lag)
             corr = df['P_Z'].corr(shifted_L)
             if corr > best_corr:
@@ -236,7 +233,6 @@ def run_quant_analysis(liq_series, asset_series_daily):
         
         best_lag_days = best_lag_weeks * 7
         
-        # 5. 국면 감지 (최근 12주)
         recent_window = 12
         df['L_Z_Shifted'] = df['L_Z'].shift(best_lag_weeks)
         df_recent = df.iloc[-recent_window:]
@@ -244,7 +240,6 @@ def run_quant_analysis(liq_series, asset_series_daily):
         
         recent_corr = df_recent['P_Z'].corr(df_recent['L_Z_Shifted'])
         
-        # 6. 괴리율 (Gap)
         last_val = df.iloc[-1]
         gap_z = last_val['P_Z'] - last_val['L_Z_Shifted']
         
@@ -265,6 +260,7 @@ def run_quant_analysis(liq_series, asset_series_daily):
 try:
     if not raw.get('btc', pd.Series()).empty:
 
+        # Macro Processing
         base_idx = raw['fed'].resample('W-WED').last().index
         df_m = pd.DataFrame(index=base_idx)
         
@@ -277,23 +273,20 @@ try:
         
         df_m = df_m.fillna(method='ffill')
 
-        # 3대 유동성 지표 계산
-        # 1. Fed Net
         df_m['Fed_Net_Tril'] = (df_m.get('fed',0)/1000 - df_m.get('tga',0)/1000 - df_m.get('rrp',0)/1000000)
         df_m['Fed_Net_YoY'] = df_m['Fed_Net_Tril'].pct_change(52) * 100
-        
-        # 2. G3 Assets
+
         fed_t = df_m.get('fed',0)/1000
         ecb_t = (df_m.get('ecb',0) * df_m.get('eur_usd',1)) / 1000000
         boj_t = (df_m.get('boj',0) * 0.0001) / df_m.get('usd_jpy',1)
         df_m['G3_Asset_YoY'] = (fed_t + ecb_t + boj_t).pct_change(52) * 100
-        
-        # 3. Global M2
+
         m2_us = df_m.get('m2_us',0) / 1000
         m3_eu = (df_m.get('m3_eu',0) * df_m.get('eur_usd',1)) / 1e12
         m3_jp = (df_m.get('m3_jp',0) / df_m.get('usd_jpy',1)) / 1e12
         df_m['Global_M2_YoY'] = (m2_us + m3_eu + m3_jp).pct_change(52) * 100
 
+        # Shift Processing
         def apply_shift(s, days):
             if s.empty: return pd.Series(dtype=float)
             new_s = s.copy()
@@ -308,12 +301,12 @@ try:
             else:
                 processed[asset['id']] = pd.Series(dtype=float)
 
+        # Chart Render
         st.subheader(f"📊 Integrated Strategy Chart (Shift: {shift_days}d)")
         
         start_viz = pd.to_datetime('2021-06-01') 
         def flt(s): return s[s.index >= start_viz] if not s.empty else s
 
-        # 차트 표시용 유동성 선택
         if "Global M2" in liq_option:
             liq_v = flt(df_m['Global_M2_YoY'])
             liq_name, liq_color = "Global M2", "#FF4500"
@@ -413,81 +406,71 @@ try:
         st.plotly_chart(fig, use_container_width=True, key="main_chart")
 
         # ------------------------------------------------------------------
-        # [NEW] Matrix Quant Analytics (Multi-Asset x Multi-Factor)
+        # Matrix Quant Analytics (Optimized)
         # ------------------------------------------------------------------
         st.markdown("---")
-        st.subheader("🛰️ Matrix Quant Analytics (All Assets x 3-Liquidity)")
-        st.caption("분석 기준: YoY vs YoY | 자산별로 모든 유동성 지표(Fed, G3, M2)에 대한 반응성을 검증합니다.")
-
-        # 분석할 유동성 지표들 정의
-        liquidity_sources = [
-            ("🇺🇸 Fed Net Liq", df_m['Fed_Net_YoY']),
-            ("🏛️ G3 Assets",    df_m['G3_Asset_YoY']),
-            ("🌍 Global M2",    df_m['Global_M2_YoY'])
-        ]
-
-        # 활성 자산이 있을 경우 탭 생성
-        if active_assets:
-            # 1. 자산별 탭 생성
-            asset_tabs = st.tabs([f"{a['name']}" for a in active_assets])
+        st.subheader("🛰️ Matrix Quant Analytics")
+        st.caption("분석 기준: YoY vs YoY | 자산별 유동성 민감도 및 3대 지표 비교")
+        
+        # 분석 상태 메시지
+        with st.spinner("Calculating Quant Matrix... (This may take a moment)"):
             
-            for tab, asset in zip(asset_tabs, active_assets):
-                with tab:
-                    raw_asset_series = raw.get(asset['id'], pd.Series(dtype=float))
-                    
-                    if raw_asset_series.empty:
-                        st.warning("데이터가 부족합니다.")
-                        continue
-                    
-                    # 2. 3대 유동성 지표 루프 분석
-                    results = []
-                    for liq_label, liq_data in liquidity_sources:
-                        res = run_quant_analysis(liq_data, raw_asset_series)
-                        if res:
-                            res['label'] = liq_label
-                            results.append(res)
-                    
-                    if not results:
-                        st.info("충분한 기간의 데이터가 없어 분석할 수 없습니다.")
-                        continue
+            liquidity_sources = [
+                ("🇺🇸 Fed Net Liq", df_m['Fed_Net_YoY']),
+                ("🏛️ G3 Assets",    df_m['G3_Asset_YoY']),
+                ("🌍 Global M2",    df_m['Global_M2_YoY'])
+            ]
 
-                    # 3. 결과 표시 (컬럼으로 나열)
-                    cols = st.columns(len(results))
-                    
-                    # 가장 높은 상관계수를 가진 지표 찾기 (Winner)
-                    best_res = max(results, key=lambda x: x['max_corr'])
-                    
-                    for i, res in enumerate(results):
-                        with cols[i]:
-                            # 하이라이트 (Winner 표시)
-                            if res == best_res:
-                                st.markdown(f"#### ⭐ {res['label']}")
-                            else:
-                                st.markdown(f"#### {res['label']}")
+            if active_assets:
+                asset_tabs = st.tabs([f"{a['name']}" for a in active_assets])
+                
+                for tab, asset in zip(asset_tabs, active_assets):
+                    with tab:
+                        raw_asset_series = raw.get(asset['id'], pd.Series(dtype=float))
+                        
+                        if raw_asset_series.empty:
+                            st.warning("데이터가 부족합니다.")
+                            continue
+                        
+                        results = []
+                        for liq_label, liq_data in liquidity_sources:
+                            # [핵심] 캐싱된 함수 호출
+                            res = run_quant_analysis_cached(liq_data, raw_asset_series)
+                            if res:
+                                res['label'] = liq_label
+                                results.append(res)
+                        
+                        if not results:
+                            st.info("분석 데이터 부족")
+                            continue
 
-                            st.metric("Optimal Lag", f"{res['optimal_lag']} days")
-                            st.metric("Max Corr", f"{res['max_corr']:.2f}")
-                            
-                            regime_icon = "🟢" if res['regime']=="Sync" else ("⚠️" if res['regime']=="Divergence" else "⚪")
-                            st.metric("Regime", f"{regime_icon} {res['regime']}", f"Rec: {res['recent_corr']:.2f}")
-                            
-                            gap_state = "High" if res['gap_z'] > 1.0 else ("Low" if res['gap_z'] < -1.0 else "Fair")
-                            st.metric("Z-Gap", f"{res['gap_z']:+.2f} σ", gap_state, delta_color="inverse")
-                    
-                    # 4. Insight 요약
-                    st.info(f"""
-                    **💡 Insight for {asset['name']}:**
-                    **{asset['name']}** 가격은 **{best_res['label']}** 지표와 가장 높은 상관관계(**{best_res['max_corr']:.2f}**)를 보이며, 
-                    약 **{best_res['optimal_lag']}일** 후행하여 반응합니다. 현재 국면은 **{best_res['regime']}** 상태입니다.
-                    """)
+                        cols = st.columns(len(results))
+                        best_res = max(results, key=lambda x: x['max_corr'])
+                        
+                        for i, res in enumerate(results):
+                            with cols[i]:
+                                if res == best_res: st.markdown(f"#### ⭐ {res['label']}")
+                                else: st.markdown(f"#### {res['label']}")
+
+                                st.metric("Optimal Lag", f"{res['optimal_lag']} days")
+                                st.metric("Max Corr", f"{res['max_corr']:.2f}")
+                                
+                                regime_icon = "🟢" if res['regime']=="Sync" else ("⚠️" if res['regime']=="Divergence" else "⚪")
+                                st.metric("Regime", f"{regime_icon} {res['regime']}", f"Rec: {res['recent_corr']:.2f}")
+                                
+                                gap_state = "High" if res['gap_z'] > 1.0 else ("Low" if res['gap_z'] < -1.0 else "Fair")
+                                st.metric("Z-Gap", f"{res['gap_z']:+.2f} σ", gap_state, delta_color="inverse")
+                        
+                        st.info(f"""
+                        **Insight:** **{asset['name']}**는 **{best_res['label']}**와 가장 높은 상관관계(**{best_res['max_corr']:.2f}**)를 보이며, 약 **{best_res['optimal_lag']}일** 후행합니다.
+                        """)
 
         with st.expander("🔍 데이터 연결 리포트"):
             active_ids_report = [a['id'] for a in ASSETS_CONFIG if selected_assets[a['id']]]
             for asset in ASSETS_CONFIG:
                 if asset['id'] in active_ids_report:
                     s = processed[asset['id']]
-                    if s.empty:
-                        st.error(f"❌ {asset['name']}: 로드 실패")
+                    if s.empty: st.error(f"❌ {asset['name']}: 로드 실패")
                     else:
                         extra = f" ({meta.get(asset['id'], 'OK')})" if asset['id'] in meta else ""
                         st.success(f"✅ {asset['name']}: 로드 성공{extra}")
