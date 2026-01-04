@@ -14,7 +14,7 @@ warnings.filterwarnings("ignore")
 
 st.set_page_config(page_title="GM Anti-Block", layout="wide")
 st.title("🏛️ Grand Master: Anti-Block Terminal")
-st.caption("Ver 15.1 | Mining Cost 제거 | Kraken 정상 페이징 | 축 위치 동적 | 로그 안전 처리")
+st.caption("Ver 15.2 | Mining Cost 제거 | Kraken 안전 페이징 강화 | 축 위치 동적")
 
 # -----------------------------------------------------------
 # [사이드바 설정]
@@ -35,7 +35,7 @@ st.sidebar.markdown("---")
 st.sidebar.write("2. Time Shift (Days)")
 shift_days = st.sidebar.number_input(
     "자산 가격 이동 (일)", min_value=-365, max_value=365, value=90, step=7,
-    help="양수(+)는 과거 데이터를 현재와 매칭, 음수(-)는 미래 예측 시뮬레이션."
+    help="양수(+) 과거 매칭, 음수(-) 미래 시뮬레이션"
 )
 
 st.sidebar.markdown("---")
@@ -58,11 +58,14 @@ for asset in ASSETS_CONFIG:
     selected_assets[asset['id']] = st.sidebar.checkbox(f"{asset['name']}", value=asset['default'])
 
 # -----------------------------------------------------------
-# 데이터 수집 (개선 적용)
+# 데이터 수집
 # -----------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner="데이터 보안 접속 중...")
 def fetch_master_data():
     d = {}
+    start_time = time.time()
+    max_total_time = 120  # 2분 초과 시 부분 성공이라도 반환
+
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36'
     }
@@ -70,7 +73,7 @@ def fetch_master_data():
     bithumb = ccxt.bithumb({'enableRateLimit': True})
     kraken = ccxt.kraken({'enableRateLimit': True})
 
-    # 1. Bithumb Fetcher (기존 유지)
+    # Bithumb Fetcher
     def fetch_bithumb(symbol_code):
         all_data = []
         try:
@@ -80,40 +83,58 @@ def fetch_master_data():
                 if not ohlcv: break
                 all_data.extend(ohlcv)
                 last_ts = ohlcv[-1][0]
-                if last_ts >= (time.time() * 1000) - 86400000: break
+                if last_ts >= (time.time() * 1000) - 86400000 * 2: break
                 since = last_ts + 1
-                time.sleep(0.08)
-        except: pass
+                time.sleep(0.1)
+                if time.time() - start_time > max_total_time:
+                    break
+        except:
+            pass
         if not all_data: return pd.Series(dtype=float)
         df = pd.DataFrame(all_data, columns=['timestamp','open','high','low','close','volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         return df.drop_duplicates(subset=['timestamp']).set_index('timestamp')['close'].tz_localize(None)
 
-    # 2. Kraken Fetcher - 정상 페이징 방식 (개선)
+    # Kraken Fetcher - 안전 페이징 강화 (무한 루프 방지)
     def fetch_kraken(symbol, start_year=2015):
         all_data = []
         since = kraken.parse8601(f'{start_year}-01-01T00:00:00Z')
-        max_attempts = 8
-        attempt = 0
+        max_iterations = 12  # 최대 약 8~9년 데이터
+        iteration = 0
 
-        while attempt < max_attempts:
+        while iteration < max_iterations:
             try:
                 ohlcv = kraken.fetch_ohlcv(symbol, '1d', since=since, limit=720)
-                if not ohlcv: break
+                if not ohlcv or len(ohlcv) == 0:
+                    break
                 all_data.extend(ohlcv)
-                since = ohlcv[-1][0] + 86400000  # 다음 날부터
-                time.sleep(1.8)  # Kraken rate limit 엄격
+                
+                last_ts = ohlcv[-1][0]
+                if last_ts >= (time.time() * 1000) - (86400000 * 2):
+                    break
+                    
+                since = last_ts + 86400000
+                time.sleep(2.5)
+                
+                iteration += 1
+                
+                if time.time() - start_time > max_total_time:
+                    st.warning(f"{symbol} 데이터 일부만 로드 (시간 초과)")
+                    break
             except Exception as e:
-                attempt += 1
-                time.sleep(3 + attempt * 2)  # backoff
+                st.warning(f"Kraken {symbol} 오류 (시도 {iteration+1}): {str(e)}")
+                time.sleep(5)
+                iteration += 1
                 continue
 
-        if not all_data: return pd.Series(dtype=float)
+        if not all_data:
+            return pd.Series(dtype=float)
+        
         df = pd.DataFrame(all_data, columns=['timestamp','open','high','low','close','volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         return df.drop_duplicates('timestamp').set_index('timestamp').sort_index()['close'].tz_localize(None)
 
-    # 3. FRED Fetcher - 강화 (재시도 1회)
+    # FRED Fetcher
     def get_fred_secure(fid, retries=1):
         for _ in range(retries + 1):
             try:
@@ -136,6 +157,8 @@ def fetch_master_data():
 
     for key, val in fred_ids.items():
         d[key] = get_fred_secure(val)
+        if time.time() - start_time > max_total_time:
+            break
 
     # Nasdaq hybrid
     if not d['nasdaq_fred'].empty:
@@ -154,27 +177,20 @@ def fetch_master_data():
             d[asset['id']] = fetch_bithumb(asset['symbol'])
         elif asset['source'] == 'kraken':
             d[asset['id']] = fetch_kraken(asset['symbol'])
-
-    # Difficulty (필요시 유지, Mining Cost 제거로 사용 안 함)
-    try:
-        with open('difficulty (1).json', 'r', encoding='utf-8') as f:
-            js = json.load(f)['difficulty']
-        df_js = pd.DataFrame(js)
-        df_js['Date'] = pd.to_datetime(df_js['x'], unit='ms').dt.tz_localize(None)
-        d['diff'] = df_js.set_index('Date').sort_index()['y']
-    except:
-        d['diff'] = pd.Series(dtype=float)
+        
+        if time.time() - start_time > max_total_time:
+            st.warning("전체 로딩 시간 초과 - 일부 자산만 표시됩니다")
+            break
 
     return d
 
 raw = fetch_master_data()
 
 # -----------------------------------------------------------
-# 데이터 가공 & 차트
+# 나머지 로직 (유동성 계산, shift, 차트 등)은 이전 버전과 동일하게 유지
 # -----------------------------------------------------------
 if not raw.get('btc', pd.Series()).empty:
 
-    # 유동성 로직 (기존 유지)
     df_m = pd.DataFrame(index=raw['fed'].resample('W-WED').last().index)
     for k in ['fed', 'tga', 'rrp', 'ecb', 'boj', 'm2_us', 'm3_eu', 'm3_jp', 'eur_usd', 'usd_jpy']:
         if k in raw:
@@ -197,7 +213,6 @@ if not raw.get('btc', pd.Series()).empty:
     df_m['Global_M2_Tril'] = m2_us_t + m3_eu_usd_t + m3_jp_usd_t
     df_m['Global_M2_YoY'] = df_m['Global_M2_Tril'].pct_change(52) * 100
 
-    # Shift 적용
     def apply_shift(s, days):
         if s.empty: return pd.Series(dtype=float)
         new_s = s.copy()
@@ -208,13 +223,11 @@ if not raw.get('btc', pd.Series()).empty:
     for asset in ASSETS_CONFIG:
         processed_assets[asset['id']] = apply_shift(raw.get(asset['id'], pd.Series(dtype=float)), shift_days)
 
-    # 차트
     st.subheader(f"📊 Integrated Strategy Chart (Shift: {shift_days} days)")
 
     start_viz = pd.to_datetime('2019-01-01')
     def flt(s): return s[s.index >= start_viz] if not s.empty else s
 
-    # 유동성 선택
     if "Global M2" in liq_option:
         liq_v = flt(df_m['Global_M2_YoY'])
         liq_name = "🌍 Global M2 YoY"
@@ -235,7 +248,6 @@ if not raw.get('btc', pd.Series()).empty:
     else:
         l_rng = [-20, 20]
 
-    # 개선된 축 위치 계산
     active_assets = [a for a in ASSETS_CONFIG if selected_assets[a['id']]]
     num_active = len(active_assets)
     if num_active == 0:
@@ -262,7 +274,6 @@ if not raw.get('btc', pd.Series()).empty:
 
     fig = go.Figure(layout=layout)
 
-    # Liquidity Trace
     if not liq_v.empty:
         h = liq_color.lstrip('#')
         rgb = tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
@@ -273,7 +284,6 @@ if not raw.get('btc', pd.Series()).empty:
             yaxis='y', hoverinfo='none'
         ))
 
-    # Assets Loop
     current_pos = domain_end
     for i, asset in enumerate(active_assets):
         data = flt(processed_assets[asset['id']])
@@ -282,12 +292,10 @@ if not raw.get('btc', pd.Series()).empty:
         axis_name = f'yaxis{i+2}'
         axis_key = f'y{i+2}'
 
-        # 로그 스케일 안전 처리 (개선)
         is_log = (asset['id'] == 'doge')
         if is_log:
             valid_data = data[data > 0]
-            if valid_data.empty:
-                continue
+            if valid_data.empty: continue
             d_min = valid_data.min()
             d_max = valid_data.max()
             log_min = np.log10(d_min)
