@@ -8,14 +8,14 @@ import warnings
 import time
 import ccxt
 import numpy as np
-from datetime import date, timedelta, datetime
+from datetime import date, timedelta
 
 # 1. 환경 설정
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="GM Time Machine", layout="wide")
+st.set_page_config(page_title="GM Risk Radar Pro", layout="wide")
 
 st.title("🏛️ Grand Master: Analytics Engine")
-st.caption("Ver 19.3 | 시뮬레이션 기간 설정(Time Machine) 추가 | 구간별 정밀 검증 가능")
+st.caption("Ver 19.4 | Risk Radar 확장 (HY Spread + Liquidity Div) | 정밀해진 퀀트 연산 (112일 Lag)")
 
 # -----------------------------------------------------------
 # [사이드바 설정]
@@ -23,29 +23,21 @@ st.caption("Ver 19.3 | 시뮬레이션 기간 설정(Time Machine) 추가 | 구�
 st.sidebar.header("⚙️ Control Panel")
 is_mobile = st.sidebar.checkbox("📱 모바일 모드 (축 공간 최소화)", value=True)
 
-# [Stress Test 옵션 - 날짜 선택 추가]
+# [Stress Test 옵션]
 st.sidebar.markdown("---")
 st.sidebar.subheader("📉 Crash Simulation")
-
-# 1. 민감도 설정
 spike_threshold = st.sidebar.slider(
     "위험 감지 민감도 (Daily Delta bps)", 
-    min_value=5, max_value=50, value=15, step=1,
-    help="하루에 스프레드가 이 값(bps) 이상 튀어 오르면 '위기'로 간주합니다."
+    min_value=5, max_value=50, value=15, step=1
 )
 look_forward_days = st.sidebar.slider(
     "반응 관찰 기간 (Days)",
-    min_value=1, max_value=30, value=7,
-    help="신호 발생 후 며칠 뒤의 가격 등락을 확인할까요?"
+    min_value=1, max_value=30, value=7
 )
-
-# 2. [NEW] 날짜 구간 설정
-st.sidebar.markdown("**검증 기간 설정 (Date Range)**")
+st.sidebar.markdown("**검증 기간 설정**")
 col_d1, col_d2 = st.sidebar.columns(2)
-with col_d1:
-    sim_start_date = st.date_input("시작일", value=date(2019, 1, 1))
-with col_d2:
-    sim_end_date = st.date_input("종료일", value="today")
+with col_d1: sim_start_date = st.date_input("시작일", value=date(2019, 1, 1))
+with col_d2: sim_end_date = st.date_input("종료일", value="today")
 
 st.sidebar.markdown("---")
 liq_option = st.sidebar.radio(
@@ -61,7 +53,8 @@ liq_option = st.sidebar.radio(
 st.sidebar.markdown("---")
 st.sidebar.write("2. Time Shift (Days)")
 shift_days = st.sidebar.number_input(
-    "자산/지표 이동 (일)", min_value=-365, max_value=365, value=90, step=7
+    "자산/지표 이동 (일)", min_value=-365, max_value=365, value=112, step=7, # [업데이트] 기본값 112일로 변경
+    help="최근 분석된 Optimal Lag(112일)를 반영하여 기본값을 수정했습니다."
 )
 
 st.sidebar.markdown("---")
@@ -85,15 +78,13 @@ for asset in ASSETS_CONFIG:
     selected_assets[asset['id']] = st.sidebar.checkbox(f"{asset['name']}", value=asset['default'])
 
 # -----------------------------------------------------------
-# 데이터 수집 (Logic)
+# 데이터 수집 Logic
 # -----------------------------------------------------------
 def fetch_master_data_logic():
     d = {}
     meta_info = {}
     GLOBAL_START = time.time()
     MAX_EXECUTION_TIME = 30 
-    
-    # [설정] 2018년부터 데이터를 가져오되, 실제 분석은 사용자가 지정한 날짜로 자름
     START_YEAR = 2018 
     headers = {'User-Agent': 'Mozilla/5.0'}
 
@@ -191,98 +182,26 @@ def fetch_master_data_logic():
 raw, meta = fetch_master_data_logic()
 
 # -----------------------------------------------------------
-# [FUNC 1] Risk Radar (Real-Time BPS)
+# [FUNC 1] Risk Radar Logic
 # -----------------------------------------------------------
 def check_risk_radar(hy_series):
     if hy_series.empty: return None
-    
     last_val = hy_series.iloc[-1]
     prev_val = hy_series.iloc[-2]
     ma_20 = hy_series.rolling(20).mean().iloc[-1]
-    
     daily_chg_pct = (last_val - prev_val) / prev_val * 100
     daily_chg_bps = (last_val - prev_val) * 100
-    
     trend_break = last_val > ma_20
     is_danger_zone = last_val > 4.0
-    
     status, color, msg = "Normal", "green", "안정 (Risk-On)"
-    
     if daily_chg_pct > 5.0 or (trend_break and daily_chg_pct > 2.0):
         status, color, msg = "Warning", "orange", "⚠️ 급등 감지 (Warning)"
     if is_danger_zone:
         status, color, msg = "Danger", "red", "🚨 위험 지역 (Risk-Off)"
-        
-    return {
-        "val": last_val, 
-        "daily_chg_bps": daily_chg_bps, 
-        "status": status, 
-        "color": color, 
-        "msg": msg
-    }
+    return {"val": last_val, "daily_chg_bps": daily_chg_bps, "status": status, "color": color, "msg": msg}
 
 # -----------------------------------------------------------
-# [FUNC 2] Stress Test (Date Range Added)
-# -----------------------------------------------------------
-def run_stress_test(hy_series, btc_series, threshold_bps, look_forward, start_d, end_d):
-    try:
-        hy = hy_series.copy()
-        btc = btc_series.copy()
-        hy.index = hy.index.normalize()
-        btc.index = btc.index.normalize()
-        
-        # [NEW] 사용자 지정 날짜 구간으로 필터링
-        s_date = pd.to_datetime(start_d).normalize()
-        e_date = pd.to_datetime(end_d).normalize()
-        
-        # 데이터를 병합하기 전에 먼저 자르는 게 아니라, 병합 후 자르는 게 안전
-        df = pd.concat([hy, btc], axis=1).dropna()
-        df.columns = ['Spread', 'Price']
-        
-        # 날짜 필터링 적용
-        df = df[(df.index >= s_date) & (df.index <= e_date)]
-        
-        if df.empty: return pd.DataFrame()
-        
-        df['Spread_Chg_Bps'] = df['Spread'].diff() * 100
-        events = df[df['Spread_Chg_Bps'] >= threshold_bps].index
-        
-        results = []
-        for date in events:
-            target_date = date + timedelta(days=look_forward)
-            # 미래 날짜가 현재 데이터 범위(필터링 된 범위가 아님, 전체 범위) 내에 있어야 함
-            # 따라서 미래 가격 조회용으로는 원본(필터 전) 데이터를 쓰는 게 좋을 수도 있으나,
-            # 여기서는 편의상 잘린 데이터 내에서 확인하거나, 원본 데이터를 참조해야 함.
-            # 정확도를 위해 원본 시리즈에서 미래 가격을 조회
-            
-            # 원본 시리즈에서 가격 조회
-            if target_date <= btc.index[-1]:
-                try:
-                    price_at_signal = df.loc[date]['Price']
-                    # 미래 가격은 btc 원본에서 조회 (필터링된 종료일 이후의 결과도 궁금할 수 있으므로)
-                    future_data = btc[btc.index >= target_date]
-                    
-                    if not future_data.empty:
-                        price_future = future_data.iloc[0]
-                        price_chg_pct = (price_future - price_at_signal) / price_at_signal * 100
-                        
-                        outcome = "🛡️ 방어 성공" if price_chg_pct < 0 else "🎣 휩쏘 (False)"
-                        
-                        results.append({
-                            "Date": date.strftime("%Y-%m-%d"),
-                            "Spike": f"+{df.loc[date]['Spread_Chg_Bps']:.1f} bps",
-                            "Raw_Return": price_chg_pct,
-                            "BTC Return": f"{price_chg_pct:+.2f}%",
-                            "Outcome": outcome
-                        })
-                except: continue
-        
-        return pd.DataFrame(results).sort_values("Date", ascending=False)
-    except Exception:
-        return pd.DataFrame()
-
-# -----------------------------------------------------------
-# [FUNC 3] Quant Analytics
+# [FUNC 2] Quant Engine (Pure Calc)
 # -----------------------------------------------------------
 def run_quant_analysis_pure(liq_series, asset_series_daily):
     try:
@@ -290,7 +209,6 @@ def run_quant_analysis_pure(liq_series, asset_series_daily):
         asset_yoy = asset_weekly.pct_change(52) * 100
         df = pd.concat([liq_series, asset_yoy], axis=1).dropna()
         df.columns = ['Liquidity_YoY', 'Price_YoY']
-        
         if len(df) < 52: return None
         
         df['L_Smooth'] = df['Liquidity_YoY'].rolling(4).mean()
@@ -328,61 +246,121 @@ def run_quant_analysis_pure(liq_series, asset_series_daily):
     except Exception: return None
 
 # -----------------------------------------------------------
+# [FUNC 3] Stress Test
+# -----------------------------------------------------------
+def run_stress_test(hy_series, btc_series, threshold_bps, look_forward, start_d, end_d):
+    try:
+        hy, btc = hy_series.copy(), btc_series.copy()
+        hy.index, btc.index = hy.index.normalize(), btc.index.normalize()
+        s_date, e_date = pd.to_datetime(start_d).normalize(), pd.to_datetime(end_d).normalize()
+        
+        df = pd.concat([hy, btc], axis=1).dropna()
+        df.columns = ['Spread', 'Price']
+        df = df[(df.index >= s_date) & (df.index <= e_date)]
+        if df.empty: return pd.DataFrame()
+        
+        df['Spread_Chg_Bps'] = df['Spread'].diff() * 100
+        events = df[df['Spread_Chg_Bps'] >= threshold_bps].index
+        
+        results = []
+        for date in events:
+            target_date = date + timedelta(days=look_forward)
+            if target_date <= btc.index[-1]:
+                try:
+                    price_at_signal = df.loc[date]['Price']
+                    future_data = btc[btc.index >= target_date]
+                    if not future_data.empty:
+                        price_future = future_data.iloc[0]
+                        price_chg_pct = (price_future - price_at_signal) / price_at_signal * 100
+                        outcome = "🛡️ 방어 성공" if price_chg_pct < 0 else "🎣 휩쏘 (False)"
+                        results.append({
+                            "Date": date.strftime("%Y-%m-%d"),
+                            "Spike": f"+{df.loc[date]['Spread_Chg_Bps']:.1f} bps",
+                            "Raw_Return": price_chg_pct,
+                            "BTC Return": f"{price_chg_pct:+.2f}%",
+                            "Outcome": outcome
+                        })
+                except: continue
+        return pd.DataFrame(results).sort_values("Date", ascending=False)
+    except Exception: return pd.DataFrame()
+
+# -----------------------------------------------------------
 # Main Logic
 # -----------------------------------------------------------
 try:
-    if 'hy_spread' in raw and not raw['hy_spread'].empty:
-        risk_res = check_risk_radar(raw['hy_spread'])
-        if risk_res:
-            st.markdown("### ⚡ Risk Radar (HY Spread)")
-            r_col1, r_col2, r_col3 = st.columns([1, 1, 2])
-            with r_col1: 
-                st.metric("HY Spread", f"{risk_res['val']:.2f}%", f"{risk_res['daily_chg_bps']:+.0f} bps (Daily)", delta_color="inverse")
-            with r_col2: st.metric("Signal", risk_res['msg'])
-            with r_col3:
-                if risk_res['status'] == "Normal": st.success("안정적 (Risk-On)")
-                elif risk_res['status'] == "Warning": st.warning("주의 필요 (Spike)")
-                else: st.error("위험 (Risk-Off)")
-            st.divider()
-
+    # 0. 매크로 데이터 선행 계산 (Risk Radar 표시를 위해)
     if not raw.get('fed', pd.Series()).empty:
         base_idx = raw['fed'].resample('W-WED').last().index
         df_m = pd.DataFrame(index=base_idx)
-        
         for k in raw:
             if k not in [a['id'] for a in ASSETS_CONFIG] and k != 'diff':
                 try: df_m[k] = raw[k].reindex(df_m.index, method='ffill')
                 except: continue
-        
         df_m = df_m.fillna(method='ffill')
 
-        # G3 Calc
+        # Global M2 & G3 & Fed Net Calculation (NaN Safe Ver 18.3)
+        s_m2_us, s_m3_eu, s_m3_jp = df_m.get('m2_us'), df_m.get('m3_eu'), df_m.get('m3_jp')
+        if s_m2_us is not None and s_m3_eu is not None and s_m3_jp is not None:
+            global_m2_sum = (s_m2_us/1000) + ((s_m3_eu * df_m.get('eur_usd', 1))/1e12) + ((s_m3_jp / df_m.get('usd_jpy', 1))/1e12)
+            df_m['Global_M2_Tril'] = global_m2_sum.interpolate(limit_direction='both')
+            df_m['Global_M2_YoY'] = df_m['Global_M2_Tril'].pct_change(52) * 100
+        else: df_m['Global_M2_YoY'] = pd.Series(dtype=float)
+
         s_fed, s_ecb, s_boj = df_m.get('fed'), df_m.get('ecb'), df_m.get('boj')
         if s_fed is not None and s_ecb is not None and s_boj is not None:
-            fed_t = s_fed / 1000000
-            ecb_t = (s_ecb * df_m.get('eur_usd', 1)) / 1000000
-            boj_t = (s_boj * 0.0001) / df_m.get('usd_jpy', 1)
-            g3_sum = fed_t.fillna(0) + ecb_t.fillna(0) + boj_t.fillna(0)
+            g3_sum = (s_fed/1e6) + ((s_ecb * df_m.get('eur_usd', 1))/1e6) + ((s_boj * 0.0001) / df_m.get('usd_jpy', 1))
             df_m['G3_Asset_Tril'] = g3_sum.replace(0, np.nan).interpolate()
             df_m['G3_Asset_YoY'] = df_m['G3_Asset_Tril'].pct_change(52) * 100
         else: df_m['G3_Asset_YoY'] = pd.Series(dtype=float)
 
-        # Global M2 Calc
-        s_m2_us, s_m3_eu, s_m3_jp = df_m.get('m2_us'), df_m.get('m3_eu'), df_m.get('m3_jp')
-        if s_m2_us is not None and s_m3_eu is not None and s_m3_jp is not None:
-            m2_us = s_m2_us / 1000
-            m3_eu = (s_m3_eu * df_m.get('eur_usd', 1)) / 1e12
-            m3_jp = (s_m3_jp / df_m.get('usd_jpy', 1)) / 1e12
-            global_m2_sum = m2_us + m3_eu + m3_jp
-            df_m['Global_M2_Tril'] = global_m2_sum.interpolate(limit_direction='both')
-            df_m['Global_M2_YoY'] = df_m['Global_M2_Tril'].pct_change(52) * 100
-        else:
-            df_m['Global_M2_YoY'] = pd.Series(dtype=float)
-
         df_m['Fed_Net_Tril'] = (df_m.get('fed',0)/1000 - df_m.get('tga',0)/1000 - df_m.get('rrp',0)/1000000)
         df_m['Fed_Net_YoY'] = df_m['Fed_Net_Tril'].pct_change(52) * 100
 
-        # Shift
+    # 1. 상단: Integrated Risk Radar (HY + Liquidity Divergence)
+    st.markdown("### ⚡ Integrated Risk Radar")
+    r_cols = st.columns(2) # 2개 컬럼
+
+    # [Radar 1] HY Spread
+    if 'hy_spread' in raw and not raw['hy_spread'].empty:
+        risk_res = check_risk_radar(raw['hy_spread'])
+        if risk_res:
+            with r_cols[0]:
+                st.markdown("#### 🛡️ HY Spread Monitor")
+                c1, c2 = st.columns([1.5, 2])
+                with c1: st.metric("Level", f"{risk_res['val']:.2f}%", f"{risk_res['daily_chg_bps']:+.0f} bps", delta_color="inverse")
+                with c2: 
+                    if risk_res['status'] == "Normal": st.success(f"{risk_res['msg']}")
+                    elif risk_res['status'] == "Warning": st.warning(f"{risk_res['msg']}")
+                    else: st.error(f"{risk_res['msg']}")
+
+    # [Radar 2] M2 Divergence (for BTC)
+    if 'btc' in raw and not raw['btc'].empty and not df_m['Global_M2_YoY'].empty:
+        m2_res = run_quant_analysis_pure(df_m['Global_M2_YoY'], raw['btc'])
+        if m2_res:
+            with r_cols[1]:
+                st.markdown("#### 🌊 Liquidity Divergence (BTC vs M2)")
+                c1, c2 = st.columns([1.5, 2])
+                with c1:
+                    # 현재 BTC 가격 모멘텀과 M2 모멘텀의 Z-Score 차이 표시
+                    gap_state = "High" if m2_res['gap_z'] > 1.0 else ("Low" if m2_res['gap_z'] < -1.0 else "Fair")
+                    st.metric("Z-Gap", f"{m2_res['gap_z']:+.2f} σ", gap_state, delta_color="inverse")
+                with c2:
+                    regime = m2_res['regime']
+                    recent_corr = m2_res['recent_corr']
+                    if "Sync" in regime: 
+                        st.success(f"🟢 동행 (Sync)\n(Corr: {recent_corr:.2f})")
+                    elif "Divergence" in regime: 
+                        st.warning(f"⚠️ 이탈 (Divergence)\n(Corr: {recent_corr:.2f})")
+                    elif "Inverse" in regime:
+                        st.error(f"📉 역상관 (Inverse)\n(Corr: {recent_corr:.2f})")
+                    else:
+                        st.info(f"⚪ 약세 (Weak)\n(Corr: {recent_corr:.2f})")
+    
+    st.caption("※ 자세한 분석 내용은 하단 **Matrix Quant Analytics** 섹션에서 확인하세요.")
+    st.divider()
+
+    # 2. Shift Logic & Processing
+    if not raw.get('fed', pd.Series()).empty:
         def apply_shift(s, days):
             if s.empty: return pd.Series(dtype=float)
             new_s = s.copy()
@@ -396,9 +374,8 @@ try:
                 processed[asset['id']] = apply_shift(s, shift_days)
             else: processed[asset['id']] = pd.Series(dtype=float)
 
-        # Chart
+        # 3. Chart
         st.subheader(f"📊 Integrated Strategy Chart (Shift: {shift_days}d)")
-        
         start_viz = pd.to_datetime('2021-06-01') 
         def flt(s): return s[s.index >= start_viz] if not s.empty else s
 
@@ -451,7 +428,6 @@ try:
             axis_key = f'y{i+2}'
             d_min, d_max = data.min(), data.max()
             if pd.isna(d_min) or pd.isna(d_max) or d_min <= 0: d_min = 0.0001
-            
             t_type = "linear"
             if asset['id'] == 'hy_spread': rng = [d_min - 0.5, d_max + 0.5]
             elif asset['id'] == 'doge': 
@@ -462,7 +438,6 @@ try:
             else:
                 span = d_max - d_min
                 rng = [d_min - span*0.2, d_max + span*0.1]
-
             fig.update_layout({
                 axis_name: dict(
                     title=dict(text=asset['name'], font=dict(color=asset['color'], size=font_size)),
@@ -479,31 +454,25 @@ try:
         # 4. Stress Test
         st.markdown("---")
         st.subheader("📉 Crash Simulation (Stress Test)")
-        # [NEW] 날짜 표시 추가
         st.caption(f"기간: **{sim_start_date} ~ {sim_end_date}** | 감지 조건: Spread Spike **≥ {spike_threshold} bps**")
 
         if 'hy_spread' in raw and 'btc' in raw:
             res_df = run_stress_test(raw['hy_spread'], raw['btc'], spike_threshold, look_forward_days, sim_start_date, sim_end_date)
-            
             if not res_df.empty:
                 success_cases = res_df[res_df['Raw_Return'] < 0]
                 fail_cases = res_df[res_df['Raw_Return'] >= 0]
-                
                 total_sigs = len(res_df)
                 success_rate = (len(success_cases) / total_sigs) * 100
-                
                 avg_saved = success_cases['Raw_Return'].mean() if not success_cases.empty else 0
                 avg_missed = fail_cases['Raw_Return'].mean() if not fail_cases.empty else 0
-                
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("위험 감지 횟수", f"{total_sigs} 회")
                 c2.metric("방어 확률 (Win Rate)", f"{success_rate:.1f}%")
-                c3.metric("평균 방어 수익률", f"{avg_saved:.2f}%", help="성공 시 회피한 하락폭 평균")
-                c4.metric("평균 기회비용", f"{avg_missed:.2f}%", help="실패 시 놓친 상승폭 평균")
-                
+                c3.metric("평균 방어 수익률", f"{avg_saved:.2f}%")
+                c4.metric("평균 기회비용", f"{avg_missed:.2f}%")
                 st.dataframe(res_df[['Date', 'Spike', 'BTC Return', 'Outcome']].style.map(lambda x: 'color: #00FF7F' if '성공' in str(x) else ('color: #FF4500' if '휩쏘' in str(x) else ''), subset=['Outcome']), use_container_width=True)
             else:
-                st.info(f"선택하신 기간({sim_start_date} ~ {sim_end_date}) 동안 설정된 민감도({spike_threshold} bps)로 감지된 위험 신호가 없습니다.")
+                st.info(f"선택하신 기간 동안 감지된 위험 신호가 없습니다.")
 
         # 5. Quant Analytics
         st.markdown("---")
@@ -525,11 +494,9 @@ try:
                 with tab:
                     status_box.caption(f"Analyzing {asset['name']}...")
                     raw_asset_series = raw.get(asset['id'], pd.Series(dtype=float))
-                    
                     if raw_asset_series.empty:
                         st.warning("데이터 부족")
                         continue
-                    
                     results = []
                     for liq_label, liq_data in liquidity_sources:
                         if liq_data.empty: continue
@@ -537,29 +504,22 @@ try:
                         if res:
                             res['label'] = liq_label
                             results.append(res)
-                    
                     if not results:
                         st.info("분석 데이터 부족")
                         continue
-
                     cols = st.columns(len(results))
                     best_res = max(results, key=lambda x: x['global_corr'])
-                    
                     for i, res in enumerate(results):
                         with cols[i]:
                             if res == best_res: st.markdown(f"#### ⭐ {res['label']}")
                             else: st.markdown(f"#### {res['label']}")
-
                             st.metric("Optimal Lag", f"{res['optimal_lag']} days")
                             st.metric("Hist. Corr (4y)", f"{res['global_corr']:.2f}")
                             st.metric("Recent Corr (30d)", f"{res['recent_corr']:.2f}", delta=f"{res['recent_corr'] - res['global_corr']:.2f}")
-                            
                             regime_icon = "🟢" if "Sync" in res['regime'] else ("⚠️" if "Divergence" in res['regime'] else ("📉" if "Inverse" in res['regime'] else "⚪"))
                             st.metric("Regime", f"{regime_icon} {res['regime']}")
-                            
                             gap_state = "High" if res['gap_z'] > 1.0 else ("Low" if res['gap_z'] < -1.0 else "Fair")
                             st.metric("Z-Gap", f"{res['gap_z']:+.2f} σ", gap_state, delta_color="inverse")
-                    
                     if best_res['global_corr'] < 0:
                         insight = f"**{asset['name']}**는 유동성과 **역상관(Inverse)** 관계입니다."
                     else:
