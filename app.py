@@ -12,10 +12,10 @@ from datetime import date, timedelta
 
 # 1. 환경 설정
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="GM Momentum Core", layout="wide")
+st.set_page_config(page_title="GM Ratio Core", layout="wide")
 
 st.title("🏛️ Grand Master: Analytics Engine")
-st.caption("Ver 20.3 | Momentum Correlation | 변곡점(Turning Point) 기반 정밀 시차 산출 | 노이즈 제거")
+st.caption("Ver 20.4 | Ratio-Based Z-Gap | 가격 대 유동성 비율(P/L Ratio) 분석 | 역사적 고점/저점 완벽 매칭")
 
 # -----------------------------------------------------------
 # [사이드바 설정]
@@ -189,7 +189,7 @@ def check_risk_radar(hy_series):
     return {"val": last_val, "daily_chg_bps": daily_chg_bps, "status": status, "color": color, "msg": msg}
 
 # -----------------------------------------------------------
-# [FUNC 2] Quant Engine (The Momentum Fix)
+# [FUNC 2] Quant Engine (The Ratio Fix)
 # -----------------------------------------------------------
 def run_quant_analysis_pure(liq_series_raw, asset_series_raw, manual_lag_days):
     try:
@@ -197,46 +197,30 @@ def run_quant_analysis_pure(liq_series_raw, asset_series_raw, manual_lag_days):
         liq_weekly = liq_series_raw.resample('W-WED').last().interpolate(limit_direction='both')
         asset_weekly = asset_series_raw.resample('W-WED').last().interpolate(limit_direction='both')
         
-        # 교집합 구간 확보
         df = pd.concat([liq_weekly, asset_weekly], axis=1).dropna()
         df.columns = ['L_Raw', 'P_Raw']
         if len(df) < 52: return None
 
         # -------------------------------------------------------
-        # Core: Prepare Z-Score Levels
+        # Core A: Lag Detection (using YoY Momentum)
         # -------------------------------------------------------
-        df['L_Log'] = np.log(df['L_Raw'])
-        df['P_Log'] = np.log(df['P_Raw'])
+        df['L_YoY'] = df['L_Raw'].pct_change(52).replace([np.inf, -np.inf], np.nan)
+        df['P_YoY'] = df['P_Raw'].pct_change(52).replace([np.inf, -np.inf], np.nan)
         
-        # Log Level Smoothing
-        df['L_Smooth'] = df['L_Log'].rolling(4).mean()
-        df['P_Smooth'] = df['P_Log'].rolling(4).mean()
-        df = df.dropna()
+        L_YoY_Smooth = df['L_YoY'].rolling(4).mean()
+        P_YoY_Smooth = df['P_YoY'].rolling(4).mean()
         
-        # Z-Score (Levels) - "위치 에너지"
-        df['L_Z'] = (df['L_Smooth'] - df['L_Smooth'].mean()) / (df['L_Smooth'].std() + 1e-9)
-        df['P_Z'] = (df['P_Smooth'] - df['P_Smooth'].mean()) / (df['P_Smooth'].std() + 1e-9)
-
-        # -------------------------------------------------------
-        # [NEW] Momentum Extraction for Lag Detection
-        # "Z-Score의 변화량(미분)"을 사용하여 상관분석
-        # -------------------------------------------------------
-        # 1차 차분 (Velocity) + 4주 스무딩 = "추세적 모멘텀"
-        # 이렇게 하면 '단순 상승 추세'가 제거되고 '변곡점'이 드러남
-        df['L_Mom'] = df['L_Z'].diff().rolling(4).mean()
-        df['P_Mom'] = df['P_Z'].diff().rolling(4).mean()
-        
-        df_corr = df[['L_Mom', 'P_Mom']].dropna()
+        df_corr = pd.concat([L_YoY_Smooth, P_YoY_Smooth], axis=1).dropna()
+        df_corr.columns = ['L', 'P']
         
         best_lag_weeks, best_corr = 0, -1.0
-        
-        # 최소 1주 이상 탐색
-        for lag in range(1, 53): 
-            corr = df_corr['P_Mom'].corr(df_corr['L_Mom'].shift(lag))
+        # Macro Filter: 4주 이상부터 탐색
+        for lag in range(4, 53): 
+            corr = df_corr['P'].corr(df_corr['L'].shift(lag))
             if corr > best_corr: best_corr, best_lag_weeks = corr, lag
 
         # -------------------------------------------------------
-        # Final Calculation
+        # Core B: Ratio-Based Z-Gap (The FIX)
         # -------------------------------------------------------
         if manual_lag_days != 0:
             calc_lag_weeks = int(manual_lag_days / 7)
@@ -244,21 +228,39 @@ def run_quant_analysis_pure(liq_series_raw, asset_series_raw, manual_lag_days):
         else:
             calc_lag_weeks = best_lag_weeks
             used_mode = "Auto"
+            
+        # 1. 먼저 유동성 데이터를 Lag 만큼 Shift (미래로 밀기)
+        # 주의: Shift를 먼저 해야 "그 당시 유동성 vs 현재 가격"이 매칭됨
+        df['L_Raw_Shifted'] = df['L_Raw'].shift(calc_lag_weeks)
+        df_calc = df.dropna()
         
-        # Lag 적용 (Levels에 적용)
-        df['L_Z_Shifted'] = df['L_Z'].shift(calc_lag_weeks)
+        # 2. Ratio (Log Difference) 계산
+        # Log(Price) - Log(Liquidity) = Log(Price / Liquidity)
+        # 이 값은 "유동성 대비 가격 비율"의 로그값입니다.
+        df_calc['Valuation_Ratio'] = np.log(df_calc['P_Raw']) - np.log(df_calc['L_Raw_Shifted'])
         
-        last_val = df.iloc[-1]
-        gap_z = last_val['P_Z'] - last_val['L_Z_Shifted']
+        # 3. Ratio의 Z-Score (Normalization)
+        # 전체 기간 동안 이 비율의 평균 대비 현재 비율이 얼마나 높은가?
+        ratio_mean = df_calc['Valuation_Ratio'].mean()
+        ratio_std = df_calc['Valuation_Ratio'].std()
         
-        # 최근 상관관계 (레벨 기준)
-        df_recent = df.iloc[-8:]
-        recent_corr = df_recent['P_Z'].corr(df_recent['L_Z_Shifted'])
+        df_calc['Z_Gap'] = (df_calc['Valuation_Ratio'] - ratio_mean) / (ratio_std + 1e-9)
         
+        # 결과 추출
+        last_val = df_calc.iloc[-1]
+        gap_z = last_val['Z_Gap']
+        
+        # Regime 판단 (Ratio 기반)
         if best_corr < 0: regime = "Inverse"
         elif gap_z > 1.5: regime = "Overheat"
         elif gap_z < -1.5: regime = "Undervalued"
         else: regime = "Fair"
+        
+        # 최근 상관관계 (확인용)
+        # Z-Score of Log Levels끼리의 상관관계로 대체
+        df_calc['P_Z'] = (np.log(df_calc['P_Raw']) - np.log(df_calc['P_Raw']).mean()) / np.log(df_calc['P_Raw']).std()
+        df_calc['L_Z_S'] = (np.log(df_calc['L_Raw_Shifted']) - np.log(df_calc['L_Raw_Shifted']).mean()) / np.log(df_calc['L_Raw_Shifted']).std()
+        recent_corr = df_calc['P_Z'].iloc[-8:].corr(df_calc['L_Z_S'].iloc[-8:])
 
         return {
             "optimal_lag": best_lag_weeks * 7, 
@@ -353,10 +355,11 @@ try:
                     else: st.error(f"{risk_res['msg']}")
 
     if 'btc' in raw and not raw['btc'].empty and not df_m['Global_M2_Tril'].empty:
+        # [수정] Raw Level Data 전달 (Ratio 계산용)
         m2_res = run_quant_analysis_pure(df_m['Global_M2_Tril'], raw['btc'], shift_days)
         if m2_res:
             with r_cols[1]:
-                st.markdown("#### 🌊 Liquidity Z-Gap (Level)")
+                st.markdown("#### 🌊 Liquidity Z-Gap (Ratio)")
                 c1, c2 = st.columns([1.5, 2])
                 with c1:
                     gap_state = "High" if m2_res['gap_z'] > 1.0 else ("Low" if m2_res['gap_z'] < -1.0 else "Fair")
@@ -369,6 +372,7 @@ try:
                     elif "Fair" in regime: st.info(f"⚪ 적정\n({lag_msg})")
                     else: st.warning(f"⚠️ {regime}\n({lag_msg})")
     
+    # [NEW] Z-Gap Trend Chart (Ratio Method)
     st.markdown("#### 🌊 Z-Gap Trend Monitor (All Selected Assets)")
     target_z_assets = [a['id'] for a in ASSETS_CONFIG if selected_assets[a['id']] and a['id'] != 'hy_spread']
     z_chart_data = {}
@@ -378,20 +382,30 @@ try:
             asset_series = raw[t_asset]
             res = run_quant_analysis_pure(df_m['Global_M2_Tril'], asset_series, shift_days)
             if res:
+                # 1. Prepare
                 l_weekly = df_m['Global_M2_Tril'].resample('W-WED').last().interpolate()
                 p_weekly = asset_series.resample('W-WED').last().interpolate()
                 df_z = pd.concat([l_weekly, p_weekly], axis=1).dropna()
                 df_z.columns = ['L', 'P']
-                df_z['L_Log'] = np.log(df_z['L'])
-                df_z['P_Log'] = np.log(df_z['P'])
-                df_z['L_Smooth'] = df_z['L_Log'].rolling(4).mean()
-                df_z['P_Smooth'] = df_z['P_Log'].rolling(4).mean()
-                df_z['L_Z'] = (df_z['L_Smooth'] - df_z['L_Smooth'].mean()) / (df_z['L_Smooth'].std() + 1e-9)
-                df_z['P_Z'] = (df_z['P_Smooth'] - df_z['P_Smooth'].mean()) / (df_z['P_Smooth'].std() + 1e-9)
+                
+                # 2. Shift Liquidity FIRST
                 lag_weeks = int(res['calc_lag'] / 7)
-                df_z['L_Z_Shifted'] = df_z['L_Z'].shift(lag_weeks)
-                df_z['Gap_Z'] = df_z['P_Z'] - df_z['L_Z_Shifted']
-                z_chart_data[t_asset] = df_z['Gap_Z'].dropna()
+                df_z['L_Shifted'] = df_z['L'].shift(lag_weeks)
+                df_calc = df_z.dropna()
+                
+                # 3. Calculate Ratio Log Difference
+                # Ratio = Price / Liquidity
+                # Log(Ratio) = Log(Price) - Log(Liquidity)
+                df_calc['Valuation_Ratio'] = np.log(df_calc['P']) - np.log(df_calc['L_Shifted'])
+                
+                # 4. Z-Score of Ratio
+                # Smoothing Ratio first
+                df_calc['Ratio_Smooth'] = df_calc['Valuation_Ratio'].rolling(4).mean()
+                
+                mean_val = df_calc['Ratio_Smooth'].mean()
+                std_val = df_calc['Ratio_Smooth'].std()
+                
+                z_chart_data[t_asset] = ((df_calc['Ratio_Smooth'] - mean_val) / (std_val + 1e-9)).dropna()
 
     if z_chart_data:
         fig_z = go.Figure()
@@ -414,11 +428,11 @@ try:
         st.markdown("""
         | 구간 (Sigma) | 상태 | 의미 (Meaning) | 행동 요령 (Action) |
         | :--- | :--- | :--- | :--- |
-        | **+1.5 이상** | 🔴 **High (과열)** | 유동성 대비 가격이 너무 높음. | **매도/관망** |
+        | **+1.5 이상** | 🔴 **High (과열)** | 유동성 대비 가격 비율이 역사적 고점. | **매도/관망** |
         | **+1.0 ~ +1.5** | 🟠 **Warn (주의)** | 가격이 유동성을 앞서가기 시작함. | 추격 매수 자제 |
-        | **-1.0 ~ +1.0** | ⚪ **Fair (적정)** | 가격과 유동성이 **비슷한 속도**로 동행 중. | **추세 추종 (Hold)** |
-        | **-1.5 ~ -1.0** | 🔵 **Low (기회)** | 돈은 풀렸는데 가격이 아직 덜 오름. | **분할 매수 (Buy)** |
-        | **-2.0 이하** | 🟢 **Deep Value** | 극심한 공포/투매 구간. 절호의 기회. | **강력 매수 (Strong Buy)** |
+        | **-1.0 ~ +1.0** | ⚪ **Fair (적정)** | 가격과 유동성이 **적정 비율** 유지 중. | **추세 추종 (Hold)** |
+        | **-1.5 ~ -1.0** | 🔵 **Low (기회)** | 돈은 풀렸는데 가격이 저평가됨. | **분할 매수 (Buy)** |
+        | **-2.0 이하** | 🟢 **Deep Value** | 유동성 대비 가격이 역사적 저점. | **강력 매수 (Strong Buy)** |
         """)
 
     st.divider()
@@ -498,7 +512,7 @@ try:
 
         st.markdown("---")
         st.subheader("🛰️ Matrix Quant Analytics")
-        st.caption("비교 기준: Log Levels (Abs Value) ↔ Recent (Last 30d)")
+        st.caption("비교 기준: Ratio-Based Z-Gap (P/L Valuation)")
         
         if active_assets:
             asset_tabs = st.tabs([f"{a['name']}" for a in active_assets])
