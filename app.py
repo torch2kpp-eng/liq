@@ -12,10 +12,10 @@ from datetime import date, timedelta
 
 # 1. 환경 설정
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="GM Watchdog", layout="wide")
+st.set_page_config(page_title="GM Stability", layout="wide")
 
-st.title("🏛️ Grand Master: Watchdog Terminal")
-st.caption("Ver 16.1 | 강제 종료 타이머(Watchdog) 탑재 | 무한 로딩 원천 차단 | 진행률 표시")
+st.title("🏛️ Grand Master: Stability & Visual Fix")
+st.caption("Ver 16.2 | TypeError 원천 차단 | 초기 로딩 최적화(BTC Only) | Lag Box 강화")
 
 # -----------------------------------------------------------
 # [사이드바 설정]
@@ -36,18 +36,19 @@ st.sidebar.markdown("---")
 st.sidebar.write("2. Time Shift (Days)")
 shift_days = st.sidebar.number_input(
     "자산 가격 이동 (일)", min_value=-365, max_value=365, value=90, step=7,
-    help="양수(+) 입력 시 자산 차트를 과거로 이동시킵니다. (오른쪽에 생기는 박스는 유동성이 선행하는 구간입니다)"
+    help="양수(+) 입력 시 자산 차트를 과거로 이동시킵니다. (오른쪽 회색 박스는 유동성이 선행하는 구간입니다)"
 )
 
 st.sidebar.markdown("---")
 st.sidebar.write("3. 표시할 자산 (Right Axes)")
 
+# [수정 2] 초기 로딩 속도를 위해 BTC만 True, 나머지는 False
 ASSETS_CONFIG = [
-    {'id': 'nasdaq', 'name': 'Nasdaq', 'symbol': 'IXIC', 'source': 'hybrid', 'color': '#D62780', 'type': 'index', 'default': True},
-    {'id': 'gold',   'name': 'Gold',   'symbol': 'GC=F', 'source': 'hybrid_metal', 'color': '#FFD700', 'type': 'metal', 'default': True},
-    {'id': 'silver', 'name': 'Silver', 'symbol': 'SI=F', 'source': 'hybrid_metal', 'color': '#C0C0C0', 'type': 'metal', 'default': True},
+    {'id': 'nasdaq', 'name': 'Nasdaq', 'symbol': 'IXIC', 'source': 'hybrid', 'color': '#D62780', 'type': 'index', 'default': False},
+    {'id': 'gold',   'name': 'Gold',   'symbol': 'GC=F', 'source': 'hybrid_metal', 'color': '#FFD700', 'type': 'metal', 'default': False},
+    {'id': 'silver', 'name': 'Silver', 'symbol': 'SI=F', 'source': 'hybrid_metal', 'color': '#C0C0C0', 'type': 'metal', 'default': False},
     {'id': 'btc',    'name': 'BTC',    'symbol': 'BTC/KRW', 'source': 'bithumb', 'color': '#00FFEE', 'type': 'crypto', 'default': True},
-    {'id': 'doge',   'name': 'DOGE',   'symbol': 'DOGE/KRW', 'source': 'bithumb', 'color': '#FFA500', 'type': 'crypto', 'default': True},
+    {'id': 'doge',   'name': 'DOGE',   'symbol': 'DOGE/KRW', 'source': 'bithumb', 'color': '#FFA500', 'type': 'crypto', 'default': False},
     {'id': 'eth',    'name': 'ETH',    'symbol': 'ETH/KRW', 'source': 'bithumb', 'color': '#627EEA', 'type': 'crypto', 'default': False},
     {'id': 'link',   'name': 'LINK',   'symbol': 'LINK/KRW', 'source': 'bithumb', 'color': '#2A5ADA', 'type': 'crypto', 'default': False},
     {'id': 'ada',    'name': 'ADA',    'symbol': 'ADA/KRW', 'source': 'bithumb', 'color': '#0033AD', 'type': 'crypto', 'default': False},
@@ -59,80 +60,69 @@ for asset in ASSETS_CONFIG:
     selected_assets[asset['id']] = st.sidebar.checkbox(f"{asset['name']}", value=asset['default'])
 
 # -----------------------------------------------------------
-# 데이터 수집 (Watchdog 적용)
+# 데이터 수집 (Watchdog & Error Defense)
 # -----------------------------------------------------------
 def fetch_master_data_logic():
     d = {}
     meta_info = {}
     
-    # [핵심] 글로벌 와치독 타이머 시작
+    # Watchdog Setup
     GLOBAL_START = time.time()
-    MAX_EXECUTION_TIME = 25 # 25초 넘어가면 무조건 리턴
+    MAX_EXECUTION_TIME = 25 
     
-    # 진행바 생성
     progress_bar = st.progress(0)
     status_text = st.empty()
 
     START_YEAR = 2021
     headers = {'User-Agent': 'Mozilla/5.0'}
 
-    # Helper: 시간 체크
     def check_timeout():
-        if time.time() - GLOBAL_START > MAX_EXECUTION_TIME:
-            return True
+        if time.time() - GLOBAL_START > MAX_EXECUTION_TIME: return True
         return False
 
-    # 1. FRED Fetcher
+    # Fetchers (Error Handling Enhanced)
     def get_fred(id):
         if check_timeout(): return pd.Series(dtype=float)
         try:
             url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={id}"
-            r = requests.get(url, headers=headers, timeout=3) # 짧은 타임아웃
+            r = requests.get(url, headers=headers, timeout=3)
             df = pd.read_csv(io.StringIO(r.text), index_col=0, parse_dates=True)
             return df.squeeze().resample('D').interpolate(method='time').tz_localize(None)
         except: return pd.Series(dtype=float)
 
-    # 2. Yahoo Fetcher
     def get_yahoo(ticker):
         if check_timeout(): return pd.Series(dtype=float)
         try:
             import yfinance as yf
             df = yf.download(ticker, start=f"{START_YEAR}-01-01", progress=False, auto_adjust=True)
             if not df.empty:
-                # 컬럼 처리 단순화
                 s = df['Close'] if 'Close' in df.columns else df.iloc[:,0]
-                if isinstance(s, pd.DataFrame): s = s.squeeze() # 다중컬럼 방지
-                
-                # MultiIndex 처리 (최신 yfinance 이슈 대응)
-                if isinstance(s, pd.DataFrame): 
-                    s = s.iloc[:, 0]
-                
-                return s.tz_localize(None).resample('D').interpolate(method='time')
+                if isinstance(s, pd.DataFrame): s = s.iloc[:, 0]
+                s = s.squeeze().tz_localize(None)
+                # 인덱스가 날짜인지 확인
+                if isinstance(s.index, pd.DatetimeIndex):
+                    return s.resample('D').interpolate(method='time')
             return pd.Series(dtype=float)
         except: return pd.Series(dtype=float)
 
-    # 3. Hybrid Metal
     def get_metal_hybrid(symbol):
         if check_timeout(): return pd.Series(dtype=float), "Timeout"
-        # 1차 Futures
         data = get_yahoo(symbol)
-        if not data.empty: return data, "Futures"
-        # 2차 ETF
+        if not data.empty and len(data) > 10: return data, "Futures"
+        
         backup = "GLD" if "GC" in symbol else "SLV"
         data_b = get_yahoo(backup)
         if not data_b.empty: return data_b, "ETF(Backup)"
         return pd.Series(dtype=float), "Fail"
 
-    # 4. Bithumb
     bithumb = ccxt.bithumb({'enableRateLimit': True, 'timeout': 3000})
     def fetch_bithumb(symbol_code):
         if check_timeout(): return pd.Series(dtype=float)
         all_data = []
         try:
             since = bithumb.parse8601(f'{START_YEAR}-01-01T00:00:00Z')
-            for _ in range(8): # 루프 횟수 8회로 제한
-                if check_timeout(): break # 와치독 체크
-                
+            for _ in range(8): 
+                if check_timeout(): break
                 ohlcv = bithumb.fetch_ohlcv(symbol_code, '1d', since=since, limit=1000)
                 if not ohlcv: break
                 all_data.extend(ohlcv)
@@ -147,8 +137,10 @@ def fetch_master_data_logic():
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         return df.drop_duplicates('timestamp').set_index('timestamp')['close'].tz_localize(None)
 
-    # === [STEP 1] Macro Data (FRED) ===
-    status_text.text("📡 Fetching Macro Data (FRED)...")
+    # === Logic ===
+    status_text.text("📡 Initializing...")
+    
+    # FRED Macro
     fred_ids = {
         'fed': 'WALCL', 'tga': 'WTREGEN', 'rrp': 'RRPONTSYD',
         'ecb': 'ECBASSETSW', 'boj': 'JPNASSETS',
@@ -164,15 +156,23 @@ def fetch_master_data_logic():
         if check_timeout(): break
         d[k] = get_fred(v)
         current_step += 1
-        progress_bar.progress(int((current_step / total_steps) * 100))
+        progress_bar.progress(int((current_step / total_steps) * 90))
 
     if not d.get('nasdaq_fred', pd.Series()).empty: d['nasdaq'] = d['nasdaq_fred']
     else: d['nasdaq'] = get_yahoo("^IXIC")
 
-    # === [STEP 2] Assets Data ===
-    status_text.text("💰 Fetching Assets (Yahoo/Bithumb)...")
+    # Assets
+    status_text.text("💰 Fetching Active Assets...")
+    
+    # [최적화] 사용자가 선택한 자산만 가져오기 (초기 로딩 속도 향상 핵심)
+    active_ids = [a['id'] for a in ASSETS_CONFIG if selected_assets[a['id']]]
     
     for asset in ASSETS_CONFIG:
+        # 선택 안된 자산은 건너뛰어 시간 절약
+        if asset['id'] not in active_ids:
+            d[asset['id']] = pd.Series(dtype=float)
+            continue
+
         if check_timeout(): 
             d[asset['id']] = pd.Series(dtype=float)
             continue
@@ -189,19 +189,13 @@ def fetch_master_data_logic():
             d[asset['id']] = fetch_bithumb(asset['symbol'])
         
         current_step += 1
-        # 안전한 프로그레스 바 업데이트
-        prog = int((current_step / total_steps) * 100)
-        progress_bar.progress(min(prog, 100))
+        progress_bar.progress(min(int((current_step / total_steps) * 100), 100))
 
-    # === [STEP 3] Finalize ===
-    if check_timeout():
-        st.warning("⚠️ 데이터 수집 시간이 초과되어 일부 데이터만 로드되었습니다. (Safety Break)")
-    
-    status_text.text("✅ Data Processing Complete!")
-    progress_bar.empty() # 바 제거
-    status_text.empty()  # 텍스트 제거
+    status_text.text("✅ Data Ready")
+    progress_bar.empty()
+    status_text.empty()
 
-    # Difficulty (Local)
+    # Difficulty
     try:
         with open('difficulty (1).json', 'r') as f:
             js = json.load(f)['difficulty']
@@ -212,18 +206,6 @@ def fetch_master_data_logic():
 
     return d, meta_info
 
-# Streamlit Cache에 직접 UI를 넣으면 에러가 날 수 있으므로, 
-# 로직을 분리하고 캐시 함수는 데이터만 반환하게 하거나, 
-# 이번 버전에서는 '캐시를 끄고' 즉시 실행하여 디버깅을 돕습니다.
-# 안정화되면 다시 캐시를 켜겠습니다. (현재는 st.cache_data 주석 처리 권장)
-# 하지만 속도를 위해 캐시를 씁니다. 대신 UI 업데이트(progress)는 캐시 함수 밖이나 
-# 'experimental_allow_widgets' 옵션을 써야하지만 복잡하므로,
-# 심플하게: 캐시 함수 내에서는 print만 하고 UI는 제거, 혹은 캐시 없이 실행.
-
-# --> 선생님의 쾌적한 경험을 위해, 이번에는 @st.cache_data를 잠시 제거하고
-#     실시간으로 로딩되는 것을 눈으로 확인시켜 드립니다. (무한로딩 공포 해소)
-#     데이터가 가벼워져서 캐시 없어도 5초 내외로 뜹니다.
-
 raw, meta = fetch_master_data_logic()
 
 # -----------------------------------------------------------
@@ -231,15 +213,24 @@ raw, meta = fetch_master_data_logic()
 # -----------------------------------------------------------
 if not raw.get('btc', pd.Series()).empty:
 
-    # Macro
+    # 1. Macro Logic
     base_idx = raw['fed'].resample('W-WED').last().index
     df_m = pd.DataFrame(index=base_idx)
+    
+    # [수정 3] TypeError 방지용 엄격한 검사 루프
     for k in raw:
         if k not in [a['id'] for a in ASSETS_CONFIG] and k != 'diff':
-            df_m[k] = raw[k].reindex(df_m.index, method='ffill')
+            series = raw[k]
+            # 비어있지 않고, 인덱스가 날짜 형식인 경우만 병합
+            if not series.empty and isinstance(series.index, pd.DatetimeIndex):
+                try:
+                    df_m[k] = series.reindex(df_m.index, method='ffill')
+                except Exception:
+                    continue # reindex 실패시 건너뜀 (앱 죽음 방지)
+    
     df_m = df_m.fillna(method='ffill')
 
-    # Liquidity
+    # Liquidity Formulas
     df_m['Fed_Net_Tril'] = (df_m.get('fed',0)/1000 - df_m.get('tga',0)/1000 - df_m.get('rrp',0)/1000000)
     df_m['Fed_Net_YoY'] = df_m['Fed_Net_Tril'].pct_change(52) * 100
 
@@ -262,7 +253,12 @@ if not raw.get('btc', pd.Series()).empty:
 
     processed = {}
     for asset in ASSETS_CONFIG:
-        processed[asset['id']] = apply_shift(raw.get(asset['id'], pd.Series(dtype=float)), shift_days)
+        # 안전장치: 인덱스 확인
+        s = raw.get(asset['id'], pd.Series(dtype=float))
+        if isinstance(s.index, pd.DatetimeIndex):
+            processed[asset['id']] = apply_shift(s, shift_days)
+        else:
+            processed[asset['id']] = pd.Series(dtype=float)
 
     # Chart
     st.subheader(f"📊 Integrated Strategy Chart (Shift: {shift_days}d)")
@@ -309,29 +305,45 @@ if not raw.get('btc', pd.Series()).empty:
 
     fig = go.Figure(layout=layout)
 
-    # 1. Liquidity Trace
+    # 1. Liquidity Trace & [수정 1] Visual Lag Box
     if not liq_v.empty:
         h = liq_color.lstrip('#')
         rgb = tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+        
+        # Lag Box 먼저 그리기 (Layer Below)
+        if shift_days != 0:
+            last_date = liq_v.index.max()
+            # abs()를 사용하여 양수든 음수든 쉬프트 크기만큼 박스 생성
+            # shift_days > 0 (과거로 이동): 오른쪽 끝이 '유동성 선행 구간'
+            start_date = last_date - pd.Timedelta(days=abs(shift_days))
+            
+            fig.add_shape(
+                type="rect",
+                x0=start_date,
+                x1=last_date,
+                y0=l_rng[0], # Y축 전체 커버
+                y1=l_rng[1],
+                fillcolor="rgba(200, 200, 200, 0.15)", # 회색 반투명 (Opacity 0.15로 상향)
+                line=dict(width=0),
+                layer="below"
+            )
+            # 텍스트는 add_annotation 사용 (더 명확함)
+            fig.add_annotation(
+                x=last_date,
+                y=l_rng[1],
+                text=f"Lag: {abs(shift_days)}d",
+                showarrow=False,
+                yshift=10,
+                xshift=-40,
+                font=dict(color="rgba(255,255,255,0.7)")
+            )
+
         fig.add_trace(go.Scatter(
             x=liq_v.index, y=liq_v, name=liq_name,
             line=dict(color=liq_color, width=3),
             fill='tozeroy', fillcolor=f"rgba({rgb[0]},{rgb[1]},{rgb[2]},0.15)",
             yaxis='y', hoverinfo='none'
         ))
-        
-        # Visual Lag Box
-        if shift_days != 0:
-            last_date = liq_v.index.max()
-            start_date = last_date - pd.Timedelta(days=abs(shift_days))
-            fig.add_vrect(
-                x0=start_date, x1=last_date,
-                fillcolor="rgba(255, 255, 255, 0.08)",
-                layer="below", line_width=0,
-                annotation_text=f"Lag: {abs(shift_days)}d",
-                annotation_position="top left",
-                annotation_font_color="rgba(255,255,255,0.5)"
-            )
 
     # 2. Assets Trace
     current_pos = domain_end
@@ -377,12 +389,13 @@ if not raw.get('btc', pd.Series()).empty:
 
     with st.expander("🔍 데이터 연결 리포트"):
         for asset in ASSETS_CONFIG:
-            s = processed[asset['id']]
-            if s.empty:
-                st.error(f"❌ {asset['name']}: 로드 실패")
-            else:
-                extra = f" ({meta.get(asset['id'], 'OK')})" if asset['id'] in meta else ""
-                st.success(f"✅ {asset['name']}: 로드 성공{extra}")
+            if asset['id'] in active_ids: # 활성 자산만 리포트
+                s = processed[asset['id']]
+                if s.empty:
+                    st.error(f"❌ {asset['name']}: 로드 실패")
+                else:
+                    extra = f" ({meta.get(asset['id'], 'OK')})" if asset['id'] in meta else ""
+                    st.success(f"✅ {asset['name']}: 로드 성공{extra}")
 
 else:
-    st.error("데이터 로드 실패")
+    st.error("❌ 비트코인 로드 실패 (Bithumb 접속 상태를 확인하세요)")
