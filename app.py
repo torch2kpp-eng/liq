@@ -12,10 +12,10 @@ from datetime import date, timedelta
 
 # 1. 환경 설정
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="GM Final Fix", layout="wide")
+st.set_page_config(page_title="GM Final Polish", layout="wide")
 
-st.title("🏛️ Grand Master: Final Stability")
-st.caption("Ver 16.4 | 변수 스코프 에러(NameError) 수정 | 모바일 최적화 & 시각화 완료")
+st.title("🏛️ Grand Master: Final Polish")
+st.caption("Ver 16.5 | 구문 오류(Syntax Error) 수정 | 모바일 최적화 & 시각화 완성")
 
 # -----------------------------------------------------------
 # [사이드바 설정]
@@ -38,7 +38,8 @@ liq_option = st.sidebar.radio(
 st.sidebar.markdown("---")
 st.sidebar.write("2. Time Shift (Days)")
 shift_days = st.sidebar.number_input(
-    "자산 가격 이동 (일)", min_value=-365, max_value=365, value=90, step=7
+    "자산 가격 이동 (일)", min_value=-365, max_value=365, value=90, step=7,
+    help="양수(+) 입력 시 자산 차트를 과거로 이동시킵니다. (오른쪽 회색 박스는 유동성이 선행하는 구간입니다)"
 )
 
 st.sidebar.markdown("---")
@@ -241,4 +242,8 @@ if not raw.get('btc', pd.Series()).empty:
         else:
             processed[asset['id']] = pd.Series(dtype=float)
 
-    st.subheader(f"📊
+    # [수정] f-string 안전하게 처리
+    st.subheader(f"📊 Integrated Strategy Chart (Shift: {shift_days}d)")
+    
+    start_viz = pd.to_datetime('2021-06-01') 
+    def flt(s): return s[s.index >= start_viz] if not s.empty else s
