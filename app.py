@@ -12,10 +12,10 @@ from datetime import date
 
 # 1. 환경 설정
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="GM Full Dynamic", layout="wide")
+st.set_page_config(page_title="GM Clean View", layout="wide")
 
-st.title("🏛️ Grand Master: Full Dynamic Terminal")
-st.caption("Ver 13.1 | 유동성 축(Left) 동적 범위 적용 | 모든 지표 자동 최적화")
+st.title("🏛️ Grand Master: Clean View Terminal")
+st.caption("Ver 13.2 | 툴팁 박스 제거 | 마우스 추적 세로선(Spike Line) 적용")
 
 # -----------------------------------------------------------
 # [사이드바 설정]
@@ -43,11 +43,11 @@ show_nasdaq = st.sidebar.checkbox("Nasdaq (IXIC)", value=True)
 # -----------------------------------------------------------
 # 2. 데이터 수집
 # -----------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner="데이터 동기화 및 동적 스케일링 계산 중...")
+@st.cache_data(ttl=3600, show_spinner="데이터 동기화 중...")
 def fetch_master_data():
     d = {}
     
-    # [A] Crypto (Bithumb KRW via ccxt)
+    # [A] Crypto
     exchange = ccxt.bithumb({'enableRateLimit': True})
     
     def fetch_ohlcv(symbol, since_year=2017):
@@ -117,6 +117,7 @@ if not raw.get('btc', pd.Series()).empty:
     df_m['usd_jpy'] = raw['usd_jpy'].resample('W-WED').mean().reindex(df_m.index, method='ffill')
     df_m = df_m.fillna(method='ffill')
 
+    # Liquidity logics
     # 1. Fed Net
     df_m['Fed_Net_Tril'] = (df_m['fed'] / 1000 - df_m.get('tga', 0) / 1000 - df_m.get('rrp', 0) / 1_000_000)
     df_m['Fed_Net_YoY'] = df_m['Fed_Net_Tril'].pct_change(52) * 100
@@ -135,7 +136,7 @@ if not raw.get('btc', pd.Series()).empty:
     df_m['Global_M2_Tril'] = m2_us_t + m3_eu_usd_t + m3_jp_usd_t
     df_m['Global_M2_YoY'] = df_m['Global_M2_Tril'].pct_change(52) * 100
 
-    # --- Mining Cost ---
+    # Mining Cost
     df_c = pd.DataFrame(index=raw['btc'].index)
     if not raw['diff'].empty:
         df_c['diff'] = raw['diff'].reindex(df_c.index).interpolate()
@@ -147,7 +148,7 @@ if not raw.get('btc', pd.Series()).empty:
         k = (target.iloc[:,0] / target.iloc[:,1]).min() if not target.empty else 0.0000001
         df_c['floor'] = df_c['cost'] * k
 
-    # --- Shift -90d ---
+    # Shift -90d
     def shift_90(s):
         if s.empty: return pd.Series(dtype=float)
         new = s.copy()
@@ -164,7 +165,6 @@ if not raw.get('btc', pd.Series()).empty:
     start_viz = pd.to_datetime('2018-01-01')
     def flt(s): return s[s.index >= start_viz] if not s.empty else s
 
-    # 유동성 데이터 선택
     if "Global M2" in liq_option:
         liq_v = flt(df_m['Global_M2_YoY'])
         liq_name = "🌍 Global M2 YoY"
@@ -183,26 +183,19 @@ if not raw.get('btc', pd.Series()).empty:
     nd_v = flt(nasdaq_s)
     dg_v = flt(doge_s)
 
-    # -----------------------------------------------------------
-    # [핵심 수정] 유동성 축(Left Axis) 동적 범위 계산
-    # -----------------------------------------------------------
+    # Ranges
     if not liq_v.empty:
         l_min, l_max = liq_v.min(), liq_v.max()
-        # 데이터의 진폭(Span) 계산
         l_span = l_max - l_min
-        # 위아래로 10% 정도의 여유 공간(Buffer)을 둠
         if l_span == 0: l_span = 1
         l_rng = [l_min - (l_span * 0.1), l_max + (l_span * 0.1)]
-    else:
-        l_rng = [-20, 20] # 기본값
+    else: l_rng = [-20, 20]
 
-    # BTC Dynamic Range
     if not btc_v.empty:
         b_min, b_max = btc_v.min(), btc_v.max()
         b_rng = [max(b_min * 0.6, 1_000_000), b_max * 1.4]
     else: b_rng = [0, 1]
 
-    # DOGE Dynamic Range (Log)
     if not dg_v.empty:
         d_min, d_max = dg_v.min(), dg_v.max()
         if d_min <= 0: d_min = 0.0001
@@ -211,7 +204,7 @@ if not raw.get('btc', pd.Series()).empty:
         d_rng = [log_min - (span * 0.1), log_max + (span * 0.2)]
     else: d_rng = [-1, 1]
 
-    # 활성 축 계산
+    # Axes
     active_axes = []
     if show_btc: active_axes.append('btc')
     if show_nasdaq: active_axes.append('nasdaq')
@@ -225,69 +218,41 @@ if not raw.get('btc', pd.Series()).empty:
     # Layout
     layout = go.Layout(
         template="plotly_dark", height=700,
-        xaxis=dict(domain=[0.0, domain_end], showgrid=True, gridcolor='rgba(128,128,128,0.2)'),
-        
-        # [수정됨] 유동성 축에 계산된 동적 범위(l_rng) 적용
+        # [핵심] Spikes 설정 (가로/세로선)
+        xaxis=dict(
+            domain=[0.0, domain_end], 
+            showgrid=True, 
+            gridcolor='rgba(128,128,128,0.2)',
+            showspikes=True,       # Spike Line 활성화
+            spikemode='across',    # 차트 전체를 가로지르는 선
+            spikesnap='cursor',    # 마우스 커서에 스냅
+            spikethickness=1,      # 선 두께
+            spikecolor='white',    # 선 색상
+            spikedash='solid'      # 실선
+        ),
         yaxis=dict(
             title=dict(text=liq_name, font=dict(color=liq_color)),
             tickfont=dict(color=liq_color),
-            range=l_rng, # 여기가 핵심 변경 사항입니다
-            showgrid=False
+            range=l_rng, showgrid=False
         ),
         legend=dict(orientation="h", y=1.12, x=0, bgcolor="rgba(0,0,0,0)"),
-        hovermode="x unified",
+        hovermode="x", # Unified 박스 제거 (기본 x 모드)
         margin=dict(l=50, r=20, t=80, b=50)
     )
     
     fig = go.Figure(layout=layout)
 
-    # Liquidity Trace
+    # [핵심] Trace 추가 시 hoverinfo='none' 설정
     if not liq_v.empty:
-        fig.add_trace(go.Scatter(x=liq_v.index, y=liq_v, name=liq_name, line=dict(color=liq_color, width=3), fill='tozeroy', fillcolor=f"rgba{tuple(int(liq_color.lstrip('#')[i:i+2], 16) for i in (0, 2, 4)) + (0.15,)}", yaxis='y'))
+        fig.add_trace(go.Scatter(
+            x=liq_v.index, y=liq_v, name=liq_name, 
+            line=dict(color=liq_color, width=3), 
+            fill='tozeroy', fillcolor=f"rgba{tuple(int(liq_color.lstrip('#')[i:i+2], 16) for i in (0, 2, 4)) + (0.15,)}", 
+            yaxis='y',
+            hoverinfo='none' # 툴팁 끄기
+        ))
 
     current_pos = domain_end 
 
-    # BTC Trace
     if show_btc and not btc_v.empty:
         fig.update_layout(yaxis2=dict(
-            title=dict(text="BTC", font=dict(color="#00FFEE")),
-            tickfont=dict(color="#00FFEE"),
-            overlaying="y", side="right", 
-            anchor="free", position=current_pos,
-            range=b_rng, showgrid=False, tickformat=","
-        ))
-        fig.add_trace(go.Scatter(x=btc_v.index, y=btc_v, name="BTC", line=dict(color='#00FFEE', width=3), yaxis='y2'))
-        if not fl_v.empty:
-            fig.add_trace(go.Scatter(x=fl_v.index, y=fl_v, name="Cost", line=dict(color='red', width=1, dash='dot'), yaxis='y2'))
-        current_pos += right_margin_per_axis
-
-    # Nasdaq Trace
-    if show_nasdaq and not nd_v.empty:
-        fig.update_layout(yaxis3=dict(
-            title=dict(text="NDX", font=dict(color="#D62780")),
-            tickfont=dict(color="#D62780"),
-            overlaying="y", side="right", 
-            anchor="free", position=current_pos,
-            showgrid=False, tickformat=","
-        ))
-        fig.add_trace(go.Scatter(x=nd_v.index, y=nd_v, name="NDX", line=dict(color='#D62780', width=2), yaxis='y3'))
-        current_pos += right_margin_per_axis
-
-    # DOGE Trace
-    if show_doge and not dg_v.empty:
-        fig.update_layout(yaxis4=dict(
-            title=dict(text="DOGE", font=dict(color="orange")),
-            tickfont=dict(color="orange"),
-            overlaying="y", side="right", 
-            anchor="free", position=current_pos,
-            type="log", range=d_rng,
-            showgrid=False
-        ))
-        fig.add_trace(go.Scatter(x=dg_v.index, y=dg_v, name="DOGE", line=dict(color='orange', width=2), yaxis='y4'))
-        current_pos += right_margin_per_axis
-
-    st.plotly_chart(fig, use_container_width=True)
-    st.success("✅ 유동성 지표 동적 스케일링(Dynamic Scale) 적용 완료")
-
-else:
-    st.error("데이터 로드 실패")
