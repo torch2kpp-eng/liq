@@ -10,11 +10,12 @@ import ccxt
 import numpy as np
 from datetime import date
 
+# 1. 환경 설정
 warnings.filterwarnings("ignore")
+st.set_page_config(page_title="GM Speed Terminal", layout="wide")
 
-st.set_page_config(page_title="GM Anti-Block", layout="wide")
-st.title("🏛️ Grand Master: Anti-Block Terminal")
-st.caption("Ver 15.2 | Mining Cost 제거 | Kraken 안전 페이징 강화 | 축 위치 동적")
+st.title("🏛️ Grand Master: Speed Optimized Terminal")
+st.caption("Ver 15.3 | 초기 로딩 속도 최적화 (2021~) | Timeout 설정 강화 | 무한 로딩 해결")
 
 # -----------------------------------------------------------
 # [사이드바 설정]
@@ -34,8 +35,7 @@ liq_option = st.sidebar.radio(
 st.sidebar.markdown("---")
 st.sidebar.write("2. Time Shift (Days)")
 shift_days = st.sidebar.number_input(
-    "자산 가격 이동 (일)", min_value=-365, max_value=365, value=90, step=7,
-    help="양수(+) 과거 매칭, 음수(-) 미래 시뮬레이션"
+    "자산 가격 이동 (일)", min_value=-365, max_value=365, value=90, step=7
 )
 
 st.sidebar.markdown("---")
@@ -58,222 +58,230 @@ for asset in ASSETS_CONFIG:
     selected_assets[asset['id']] = st.sidebar.checkbox(f"{asset['name']}", value=asset['default'])
 
 # -----------------------------------------------------------
-# 데이터 수집
+# 데이터 수집 (최적화 버전)
 # -----------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner="데이터 보안 접속 중...")
+@st.cache_data(ttl=3600, show_spinner="데이터 고속 동기화 중 (Max 30s)...")
 def fetch_master_data():
     d = {}
-    start_time = time.time()
-    max_total_time = 120  # 2분 초과 시 부분 성공이라도 반환
-
+    
+    # [설정] 데이터 시작 시점 (너무 오래된 데이터는 과감히 포기하여 속도 확보)
+    START_YEAR = 2021 
+    start_ts_ms = pd.Timestamp(f'{START_YEAR}-01-01').value // 10**6
+    
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36'
     }
 
-    bithumb = ccxt.bithumb({'enableRateLimit': True})
-    kraken = ccxt.kraken({'enableRateLimit': True})
+    # [핵심] 타임아웃 설정 추가 (3초 안에 응답 없으면 끊음)
+    bithumb = ccxt.bithumb({'enableRateLimit': True, 'timeout': 3000})
+    kraken = ccxt.kraken({'enableRateLimit': True, 'timeout': 3000})
 
-    # Bithumb Fetcher
+    # 1. Bithumb Fetcher
     def fetch_bithumb(symbol_code):
         all_data = []
         try:
-            since = bithumb.parse8601('2017-01-01T00:00:00Z')
-            while True:
+            since = bithumb.parse8601(f'{START_YEAR}-01-01T00:00:00Z')
+            # 최대 5번 루프 (약 5000일 데이터 커버 가능하므로 충분)
+            for _ in range(10): 
                 ohlcv = bithumb.fetch_ohlcv(symbol_code, '1d', since=since, limit=1000)
                 if not ohlcv: break
                 all_data.extend(ohlcv)
+                
                 last_ts = ohlcv[-1][0]
-                if last_ts >= (time.time() * 1000) - 86400000 * 2: break
+                # 현재 시간 근처면 종료
+                if last_ts >= (time.time() * 1000) - 86400000: break
+                
                 since = last_ts + 1
-                time.sleep(0.1)
-                if time.time() - start_time > max_total_time:
-                    break
-        except:
-            pass
+                time.sleep(0.1) # 짧은 대기
+        except: pass
+        
         if not all_data: return pd.Series(dtype=float)
         df = pd.DataFrame(all_data, columns=['timestamp','open','high','low','close','volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        return df.drop_duplicates(subset=['timestamp']).set_index('timestamp')['close'].tz_localize(None)
+        return df.drop_duplicates('timestamp').set_index('timestamp')['close'].tz_localize(None)
 
-    # Kraken Fetcher - 안전 페이징 강화 (무한 루프 방지)
-    def fetch_kraken(symbol, start_year=2015):
+    # 2. Kraken Fetcher (안전 모드)
+    def fetch_kraken(symbol):
         all_data = []
-        since = kraken.parse8601(f'{start_year}-01-01T00:00:00Z')
-        max_iterations = 12  # 최대 약 8~9년 데이터
-        iteration = 0
-
-        while iteration < max_iterations:
-            try:
+        try:
+            since = kraken.parse8601(f'{START_YEAR}-01-01T00:00:00Z')
+            # [핵심] 루프 횟수 5회 제한 (속도 최우선)
+            for _ in range(5): 
                 ohlcv = kraken.fetch_ohlcv(symbol, '1d', since=since, limit=720)
-                if not ohlcv or len(ohlcv) == 0:
-                    break
+                if not ohlcv: break
                 all_data.extend(ohlcv)
                 
                 last_ts = ohlcv[-1][0]
-                if last_ts >= (time.time() * 1000) - (86400000 * 2):
-                    break
-                    
-                since = last_ts + 86400000
-                time.sleep(2.5)
+                if last_ts >= (time.time() * 1000) - 86400000: break
                 
-                iteration += 1
-                
-                if time.time() - start_time > max_total_time:
-                    st.warning(f"{symbol} 데이터 일부만 로드 (시간 초과)")
-                    break
-            except Exception as e:
-                st.warning(f"Kraken {symbol} 오류 (시도 {iteration+1}): {str(e)}")
-                time.sleep(5)
-                iteration += 1
-                continue
+                since = last_ts + 1
+                # Kraken은 rate limit이 엄격하므로 약간 대기
+                time.sleep(1.0) 
+        except: pass
 
-        if not all_data:
-            return pd.Series(dtype=float)
-        
+        if not all_data: return pd.Series(dtype=float)
         df = pd.DataFrame(all_data, columns=['timestamp','open','high','low','close','volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        return df.drop_duplicates('timestamp').set_index('timestamp').sort_index()['close'].tz_localize(None)
+        return df.drop_duplicates('timestamp').set_index('timestamp')['close'].tz_localize(None)
 
-    # FRED Fetcher
-    def get_fred_secure(fid, retries=1):
-        for _ in range(retries + 1):
-            try:
-                url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={fid}"
-                r = requests.get(url, headers=headers, timeout=15)
-                r.raise_for_status()
-                df = pd.read_csv(io.StringIO(r.text), index_col=0, parse_dates=True)
-                return df.squeeze().resample('D').interpolate(method='time').tz_localize(None)
-            except:
-                time.sleep(2)
-        return pd.Series(dtype=float)
+    # 3. FRED Fetcher
+    def get_fred(id):
+        try:
+            url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={id}"
+            r = requests.get(url, headers=headers, timeout=5)
+            r.raise_for_status()
+            df = pd.read_csv(io.StringIO(r.text), index_col=0, parse_dates=True)
+            return df.squeeze().resample('D').interpolate(method='time').tz_localize(None)
+        except: return pd.Series(dtype=float)
 
-    fred_ids = {
+    # 4. Yahoo Backup
+    def get_yahoo(ticker):
+        try:
+            import yfinance as yf
+            df = yf.download(ticker, start=f"{START_YEAR}-01-01", progress=False, auto_adjust=True)
+            if not df.empty:
+                if 'Close' in df.columns: return df['Close'].tz_localize(None)
+                return df.iloc[:,0].tz_localize(None)
+        except: return pd.Series(dtype=float)
+
+    # === 실행 (병렬처리 흉내 - 순차 실행이지만 빠르게) ===
+    
+    # FRED Data
+    fred_map = {
         'fed': 'WALCL', 'tga': 'WTREGEN', 'rrp': 'RRPONTSYD',
         'ecb': 'ECBASSETSW', 'boj': 'JPNASSETS',
         'm2_us': 'M2SL', 'm3_eu': 'MABMM301EZM189S', 'm3_jp': 'MABMM301JPM189S',
         'eur_usd': 'DEXUSEU', 'usd_jpy': 'DEXJPUS',
         'nasdaq_fred': 'NASDAQCOM'
     }
+    for k, v in fred_map.items():
+        d[k] = get_fred(v)
 
-    for key, val in fred_ids.items():
-        d[key] = get_fred_secure(val)
-        if time.time() - start_time > max_total_time:
-            break
+    # Nasdaq Setting
+    d['nasdaq'] = d['nasdaq_fred'] if not d['nasdaq_fred'].empty else get_yahoo("^IXIC")
 
-    # Nasdaq hybrid
-    if not d['nasdaq_fred'].empty:
-        d['nasdaq'] = d['nasdaq_fred']
-    else:
-        try:
-            import yfinance as yf
-            df = yf.download("^IXIC", period="max", progress=False)
-            d['nasdaq'] = df['Close'].tz_localize(None) if 'Close' in df else pd.Series(dtype=float)
-        except:
-            d['nasdaq'] = pd.Series(dtype=float)
-
-    # Crypto & Commodities
+    # Assets Fetching
     for asset in ASSETS_CONFIG:
         if asset['source'] == 'bithumb':
             d[asset['id']] = fetch_bithumb(asset['symbol'])
         elif asset['source'] == 'kraken':
             d[asset['id']] = fetch_kraken(asset['symbol'])
-        
-        if time.time() - start_time > max_total_time:
-            st.warning("전체 로딩 시간 초과 - 일부 자산만 표시됩니다")
-            break
+
+    # Difficulty (Local)
+    try:
+        with open('difficulty (1).json', 'r') as f:
+            js = json.load(f)['difficulty']
+        df_js = pd.DataFrame(js)
+        df_js['Date'] = pd.to_datetime(df_js['x'], unit='ms').dt.tz_localize(None)
+        d['diff'] = df_js.set_index('Date').sort_index()['y']
+    except: d['diff'] = pd.Series(dtype=float)
 
     return d
 
 raw = fetch_master_data()
 
 # -----------------------------------------------------------
-# 나머지 로직 (유동성 계산, shift, 차트 등)은 이전 버전과 동일하게 유지
+# 데이터 가공 및 차트 생성
 # -----------------------------------------------------------
 if not raw.get('btc', pd.Series()).empty:
 
-    df_m = pd.DataFrame(index=raw['fed'].resample('W-WED').last().index)
-    for k in ['fed', 'tga', 'rrp', 'ecb', 'boj', 'm2_us', 'm3_eu', 'm3_jp', 'eur_usd', 'usd_jpy']:
-        if k in raw:
+    # 1. Macro Data Processing
+    # 기준 인덱스 생성 (주간)
+    base_idx = raw['fed'].resample('W-WED').last().index
+    df_m = pd.DataFrame(index=base_idx)
+    
+    # 데이터 병합 및 보간
+    for k in raw:
+        if k not in [a['id'] for a in ASSETS_CONFIG] and k != 'diff':
+            # FRED 데이터는 2021년 이전 것도 있을 수 있으므로 reindex로 맞춤
             df_m[k] = raw[k].reindex(df_m.index, method='ffill')
-
+    
     df_m = df_m.fillna(method='ffill')
 
-    df_m['Fed_Net_Tril'] = (df_m['fed'] / 1000 - df_m.get('tga', 0) / 1000 - df_m.get('rrp', 0) / 1_000_000)
+    # Liquidity Formulas
+    # Fed Net
+    df_m['Fed_Net_Tril'] = (df_m.get('fed',0)/1000 - df_m.get('tga',0)/1000 - df_m.get('rrp',0)/1000000)
     df_m['Fed_Net_YoY'] = df_m['Fed_Net_Tril'].pct_change(52) * 100
 
-    fed_t = df_m['fed'] / 1_000_000
-    ecb_t = (df_m['ecb'] * df_m['eur_usd']) / 1_000_000
-    boj_t = (df_m['boj'] * 0.0001) / df_m['usd_jpy']
-    df_m['G3_Asset_Tril'] = fed_t + ecb_t + boj_t
-    df_m['G3_Asset_YoY'] = df_m['G3_Asset_Tril'].pct_change(52) * 100
+    # G3
+    fed_t = df_m.get('fed',0)/1000
+    ecb_t = (df_m.get('ecb',0) * df_m.get('eur_usd',1)) / 1000000
+    boj_t = (df_m.get('boj',0) * 0.0001) / df_m.get('usd_jpy',1)
+    df_m['G3_Asset_YoY'] = (fed_t + ecb_t + boj_t).pct_change(52) * 100
 
-    m2_us_t = df_m['m2_us'] / 1000
-    m3_eu_usd_t = (df_m['m3_eu'] * df_m['eur_usd']) / 1_000_000_000_000
-    m3_jp_usd_t = (df_m['m3_jp'] / df_m['usd_jpy']) / 1_000_000_000_000
-    df_m['Global_M2_Tril'] = m2_us_t + m3_eu_usd_t + m3_jp_usd_t
-    df_m['Global_M2_YoY'] = df_m['Global_M2_Tril'].pct_change(52) * 100
+    # Global M2
+    m2_us = df_m.get('m2_us',0) / 1000
+    m3_eu = (df_m.get('m3_eu',0) * df_m.get('eur_usd',1)) / 1e12
+    m3_jp = (df_m.get('m3_jp',0) / df_m.get('usd_jpy',1)) / 1e12
+    df_m['Global_M2_YoY'] = (m2_us + m3_eu + m3_jp).pct_change(52) * 100
 
+    # 2. Shift Logic
     def apply_shift(s, days):
         if s.empty: return pd.Series(dtype=float)
         new_s = s.copy()
         new_s.index = new_s.index - pd.Timedelta(days=days)
         return new_s
 
-    processed_assets = {}
+    processed = {}
     for asset in ASSETS_CONFIG:
-        processed_assets[asset['id']] = apply_shift(raw.get(asset['id'], pd.Series(dtype=float)), shift_days)
+        processed[asset['id']] = apply_shift(raw.get(asset['id'], pd.Series(dtype=float)), shift_days)
 
-    st.subheader(f"📊 Integrated Strategy Chart (Shift: {shift_days} days)")
-
-    start_viz = pd.to_datetime('2019-01-01')
+    # 3. Chart Generation
+    st.subheader(f"📊 Integrated Strategy Chart (Shift: {shift_days}d)")
+    
+    # 시각화 시작점: 2021년 데이터부터 로드했으므로 2021-06 이후부터 보여주는게 안정적 (YoY 계산 고려)
+    start_viz = pd.to_datetime('2021-06-01') 
     def flt(s): return s[s.index >= start_viz] if not s.empty else s
 
+    # Select Liquidity
     if "Global M2" in liq_option:
         liq_v = flt(df_m['Global_M2_YoY'])
-        liq_name = "🌍 Global M2 YoY"
-        liq_color = "#FF4500"
+        liq_name, liq_color = "🌍 Global M2 YoY", "#FF4500"
     elif "G3" in liq_option:
         liq_v = flt(df_m['G3_Asset_YoY'])
-        liq_name = "🏛️ G3 Assets YoY"
-        liq_color = "#FFD700"
+        liq_name, liq_color = "🏛️ G3 Assets YoY", "#FFD700"
     else:
         liq_v = flt(df_m['Fed_Net_YoY'])
-        liq_name = "🇺🇸 Fed Net Liq YoY"
-        liq_color = "#00FF7F"
+        liq_name, liq_color = "🇺🇸 Fed Net Liq YoY", "#00FF7F"
 
+    # Liquidity Scale
     if not liq_v.empty:
         l_min, l_max = liq_v.min(), liq_v.max()
-        l_span = l_max - l_min if l_max != l_min else 20
-        l_rng = [l_min - l_span * 0.1, l_max + l_span * 0.1]
+        l_span = max(l_max - l_min, 10)
+        l_rng = [l_min - l_span*0.1, l_max + l_span*0.1]
     else:
         l_rng = [-20, 20]
 
+    # Dynamic Layout Calculation
     active_assets = [a for a in ASSETS_CONFIG if selected_assets[a['id']]]
     num_active = len(active_assets)
-    if num_active == 0:
-        domain_end = 0.88
+    
+    # 축 간격 자동 계산 (화면 꽉 채우기)
+    if num_active == 0: domain_end = 0.95
     else:
-        spacing = max(0.04, min(0.10, 0.92 / max(1, num_active)))
-        domain_end = 1.0 - (num_active * spacing) + spacing / 2
-        domain_end = max(0.55, min(0.92, domain_end))
+        # 축 하나당 5~8% 공간 할당
+        margin = 0.05 if num_active > 5 else 0.08
+        domain_end = 1.0 - (num_active * margin)
+        domain_end = max(0.5, domain_end) # 차트 최소 너비 보장
 
-    common_spike = dict(
+    # Spike Style
+    spike_settings = dict(
         showspikes=True, spikemode='across', spikesnap='cursor',
         spikethickness=1, spikecolor='red', spikedash='dash'
     )
 
     layout = go.Layout(
         template="plotly_dark", height=800,
-        xaxis=dict(domain=[0.0, domain_end], showgrid=True, gridcolor='rgba(128,128,128,0.2)', **common_spike),
-        yaxis=dict(title=liq_name, title_font_color=liq_color, tickfont_color=liq_color,
-                   range=l_rng, showgrid=False, **common_spike),
+        xaxis=dict(domain=[0.0, domain_end], showgrid=True, gridcolor='rgba(128,128,128,0.2)', **spike_settings),
+        yaxis=dict(title=liq_name, title_font_color=liq_color, tickfont_color=liq_color, range=l_rng, showgrid=False, **spike_settings),
         legend=dict(orientation="h", y=1.12, x=0, bgcolor="rgba(0,0,0,0)"),
-        hovermode="x unified",
+        hovermode="x", # Clean View (No Box)
         margin=dict(l=50, r=20, t=80, b=50)
     )
 
     fig = go.Figure(layout=layout)
 
+    # 1. Liquidity Trace
     if not liq_v.empty:
         h = liq_color.lstrip('#')
         rgb = tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
@@ -284,60 +292,61 @@ if not raw.get('btc', pd.Series()).empty:
             yaxis='y', hoverinfo='none'
         ))
 
+    # 2. Assets Traces
     current_pos = domain_end
     for i, asset in enumerate(active_assets):
-        data = flt(processed_assets[asset['id']])
+        data = flt(processed[asset['id']])
         if data.empty: continue
 
         axis_name = f'yaxis{i+2}'
         axis_key = f'y{i+2}'
 
-        is_log = (asset['id'] == 'doge')
+        # Scale Calculation
+        d_min, d_max = data.min(), data.max()
+        if d_min <= 0: d_min = 0.0001
+        
+        is_log = (asset['id'] == 'doge') # Doge Log
         if is_log:
-            valid_data = data[data > 0]
-            if valid_data.empty: continue
-            d_min = valid_data.min()
-            d_max = valid_data.max()
-            log_min = np.log10(d_min)
-            log_max = np.log10(d_max)
+            log_min, log_max = np.log10(d_min), np.log10(d_max)
             span = log_max - log_min
-            rng = [log_min - span * 0.15, log_max + span * 0.25]
-            type_val = "log"
+            rng = [log_min - span*0.1, log_max + span*0.1]
+            t_type = "log"
         else:
-            d_min, d_max = data.min(), data.max()
-            span = d_max - d_min if d_max != d_min else 1
-            rng = [max(d_min - span * 0.4, 0), d_max + span * 0.15]
-            type_val = "linear"
+            span = d_max - d_min
+            rng = [d_min - span*0.2, d_max + span*0.1] # Buffer
+            t_type = "linear"
 
+        # Update Axis
         fig.update_layout({
             axis_name: dict(
                 title=dict(text=asset['name'], font=dict(color=asset['color'])),
                 tickfont=dict(color=asset['color']),
                 overlaying="y", side="right", anchor="free", position=current_pos,
-                range=rng, type=type_val, showgrid=False, tickformat=",",
-                **common_spike
+                range=rng, type=t_type, showgrid=False, tickformat=",",
+                **spike_settings
             )
         })
 
+        # Add Trace
         fig.add_trace(go.Scatter(
-            x=data.index, y=data,
-            name=asset['name'],
+            x=data.index, y=data, name=asset['name'],
             line=dict(color=asset['color'], width=2),
-            yaxis=axis_key,
-            hoverinfo='none'
+            yaxis=axis_key, hoverinfo='none'
         ))
-
-        current_pos += spacing
+        
+        current_pos += margin
 
     st.plotly_chart(fig, use_container_width=True)
 
+    # Status Panel
     with st.expander("🔍 데이터 연결 상태"):
         for asset in ASSETS_CONFIG:
-            s = processed_assets[asset['id']]
+            s = processed[asset['id']]
             if s.empty:
                 st.error(f"❌ {asset['name']}: 로드 실패 (Source: {asset['source']})")
             else:
-                st.success(f"✅ {asset['name']}: 로드 성공 ({len(s)} rows)")
+                st.success(f"✅ {asset['name']}: {len(s)} rows loaded")
 
 else:
-    st.error("❌ 비트코인(Bithumb) 데이터 로드 실패. 잠시 후 새로고침하세요.")
+    st.error("데이터 로드에 실패했습니다. (Timeout)")
+    st.info("새로고침을 하거나 잠시 후 다시 시도해주세요.")
