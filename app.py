@@ -12,10 +12,10 @@ from datetime import date, timedelta
 
 # 1. 환경 설정
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="GM Stability", layout="wide")
+st.set_page_config(page_title="GM BPS Edition", layout="wide")
 
-st.title("🏛️ Grand Master: Final Stability Engine")
-st.caption("Ver 18.2 | 모바일 초기 로딩(M2) 버그 수정 | Zero-Fill 로직 제거 | 데이터 안정성 강화")
+st.title("🏛️ Grand Master: Analytics Engine")
+st.caption("Ver 18.4 | HY Spread BPS 표기 적용 | Global M2 로딩 최적화 | UI/UX 완성형")
 
 # -----------------------------------------------------------
 # [사이드바 설정]
@@ -197,27 +197,42 @@ def fetch_master_data_logic():
 raw, meta = fetch_master_data_logic()
 
 # -----------------------------------------------------------
-# [CORE] Risk Radar Logic
+# [CORE] Risk Radar Logic (BPS Updated)
 # -----------------------------------------------------------
 def check_risk_radar(hy_series):
     if hy_series.empty: return None
+    
     last_val = hy_series.iloc[-1]
     prev_val = hy_series.iloc[-2]
     ma_20 = hy_series.rolling(20).mean().iloc[-1]
-    daily_chg = (last_val - prev_val) / prev_val * 100
+    
+    # 1. 등락률 (내부 경보 로직용)
+    daily_chg_pct = (last_val - prev_val) / prev_val * 100
+    
+    # 2. [수정] BPS 변동 (표기용) -> 1%p = 100bps
+    daily_chg_bps = (last_val - prev_val) * 100
+    
     trend_break = last_val > ma_20
     is_danger_zone = last_val > 4.0
     
     status, color, msg = "Normal", "green", "안정 (Risk-On)"
-    if daily_chg > 5.0 or (trend_break and daily_chg > 2.0):
+    
+    # 경보는 여전히 '비율(%)' 기준으로 민감하게 작동 (5% 이상 급등 시)
+    if daily_chg_pct > 5.0 or (trend_break and daily_chg_pct > 2.0):
         status, color, msg = "Warning", "orange", "⚠️ 급등 감지 (Warning)"
     if is_danger_zone:
         status, color, msg = "Danger", "red", "🚨 위험 지역 (Risk-Off)"
         
-    return {"val": last_val, "daily_chg": daily_chg, "ma_20": ma_20, "status": status, "color": color, "msg": msg}
+    return {
+        "val": last_val, 
+        "daily_chg_bps": daily_chg_bps, # BPS 값 전달
+        "status": status, 
+        "color": color, 
+        "msg": msg
+    }
 
 # -----------------------------------------------------------
-# [CORE] Quant Analytics
+# [CORE] Quant Analytics (Pure Calc)
 # -----------------------------------------------------------
 def run_quant_analysis_pure(liq_series, asset_series_daily):
     try:
@@ -271,7 +286,16 @@ try:
         if risk_res:
             st.markdown("### ⚡ Risk Radar (HY Spread)")
             r_col1, r_col2, r_col3 = st.columns([1, 1, 2])
-            with r_col1: st.metric("HY Spread", f"{risk_res['val']:.2f}%", f"{risk_res['daily_chg']:.2f}% (Daily)", delta_color="inverse")
+            
+            # [수정] BPS 단위로 표기 변경 (+부호 표시, 소수점 없이 정수)
+            with r_col1: 
+                st.metric(
+                    "HY Spread", 
+                    f"{risk_res['val']:.2f}%", 
+                    f"{risk_res['daily_chg_bps']:+.0f} bps (Daily)", 
+                    delta_color="inverse"
+                )
+                
             with r_col2: st.metric("Signal", risk_res['msg'])
             with r_col3:
                 if risk_res['status'] == "Normal": st.success("현재 하이일드 스프레드는 안정적입니다. (20일 이평선 아래)")
@@ -290,34 +314,26 @@ try:
         
         df_m = df_m.fillna(method='ffill')
 
-        # [FIX] G3 Calculation (NaN Safe)
+        # G3 Calc (NaN Safe)
         s_fed, s_ecb, s_boj = df_m.get('fed'), df_m.get('ecb'), df_m.get('boj')
         if s_fed is not None and s_ecb is not None and s_boj is not None:
             fed_t = s_fed / 1000000
             ecb_t = (s_ecb * df_m.get('eur_usd', 1)) / 1000000
             boj_t = (s_boj * 0.0001) / df_m.get('usd_jpy', 1)
             g3_sum = fed_t.fillna(0) + ecb_t.fillna(0) + boj_t.fillna(0)
-            # [Fix] 0을 NaN으로 치환 후 Interpolate
             df_m['G3_Asset_Tril'] = g3_sum.replace(0, np.nan).interpolate()
             df_m['G3_Asset_YoY'] = df_m['G3_Asset_Tril'].pct_change(52) * 100
         else: df_m['G3_Asset_YoY'] = pd.Series(dtype=float)
 
-        # [FIX] Global M2 Calculation (Ver 18.3: Integrity Patch)
-        # 하나라도 데이터가 없으면(NaN) 합산을 보류하여, 그래프가 깨지는 것을 방지합니다.
-        s_m2_us = df_m.get('m2_us')
-        s_m3_eu = df_m.get('m3_eu')
-        s_m3_jp = df_m.get('m3_jp')
-        
+        # Global M2 Calc (NaN Safe - All or Nothing)
+        s_m2_us, s_m3_eu, s_m3_jp = df_m.get('m2_us'), df_m.get('m3_eu'), df_m.get('m3_jp')
         if s_m2_us is not None and s_m3_eu is not None and s_m3_jp is not None:
             m2_us = s_m2_us / 1000
             m3_eu = (s_m3_eu * df_m.get('eur_usd', 1)) / 1e12
             m3_jp = (s_m3_jp / df_m.get('usd_jpy', 1)) / 1e12
             
-            # [핵심 수정] fillna(0) 제거 -> 데이터가 하나라도 비면 결과도 NaN (차트 왜곡 방지)
-            # 3개국 데이터가 모두 존재하는 교집합 구간만 계산됩니다.
+            # [FIX] 하나라도 NaN이면 합산 안 함 (차트 깨짐 방지)
             global_m2_sum = m2_us + m3_eu + m3_jp
-            
-            # 중간에 빈 곳은 부드럽게 연결 (Interpolate)
             df_m['Global_M2_Tril'] = global_m2_sum.interpolate(limit_direction='both')
             df_m['Global_M2_YoY'] = df_m['Global_M2_Tril'].pct_change(52) * 100
         else:
@@ -341,7 +357,7 @@ try:
             else:
                 processed[asset['id']] = pd.Series(dtype=float)
 
-        # Chart Logic
+        # Chart Render
         st.subheader(f"📊 Integrated Strategy Chart (Shift: {shift_days}d)")
         
         start_viz = pd.to_datetime('2021-06-01') 
@@ -513,4 +529,3 @@ try:
 
 except Exception as e:
     st.error(f"⚠️ 시스템 오류: {str(e)}")
-
