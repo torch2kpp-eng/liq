@@ -1,9 +1,6 @@
-streamlit>=1.30.0
-pandas>=2.0
-plotly>=5.15
-requests
-yfinance>=0.2.40
-ccxt>=4.0.0
+streamlit
+pandas
 numpy
-lxml
-
+plotly
+yfinance
+pandas_datareader
