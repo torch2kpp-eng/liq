@@ -2,166 +2,199 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import requests
-import io
+import yfinance as yf
+from pandas_datareader import data as pdr
 from datetime import datetime
 
-# ============================================================
-# [APP CONFIG]
-# ============================================================
+# -----------------------------------------------------------
+# [ENV]
+# -----------------------------------------------------------
 st.set_page_config(page_title="GM Strategy v3.8", layout="wide")
 st.title("🏛️ Grand Master: Adaptive Alpha Engine")
-st.caption("v3.8 | ONLINE AUTO DATA | Adaptive Risk Budgeting | Valuation Tilt")
+st.caption("v3.8 | ONLINE DATA | Adaptive Risk Budgeting | Valuation Tilt")
 
-# ============================================================
+# -----------------------------------------------------------
 # [SIDEBAR]
-# ============================================================
+# -----------------------------------------------------------
 st.sidebar.header("⚙️ Engine Tuning")
 base_target_vol = st.sidebar.slider("🎯 Base Target Vol (%)", 30, 80, 50, 5)
 max_lev_cap = st.sidebar.slider("🔒 Max Leverage Limit", 1.0, 3.0, 2.0, 0.1)
 
-# ============================================================
-# [DATA FETCH]
-# ============================================================
+# -----------------------------------------------------------
+# [DATA LOADER - ONLINE ONLY]
+# -----------------------------------------------------------
 @st.cache_data(ttl=3600)
-def fetch_data():
-    headers = {"User-Agent": "Mozilla/5.0"}
+def load_online_data():
     data = {}
 
-    # --- BTC (Yahoo Finance) ---
+    start = "2013-01-01"
+    end = datetime.today().strftime("%Y-%m-%d")
+
+    # BTC (Yahoo)
+    btc = yf.download("BTC-USD", start=start, end=end, progress=False)
+    if btc.empty:
+        return None
+    data["btc"] = btc["Adj Close"]
+
+    # M2 (FRED)
     try:
-        btc_url = (
-            "https://query1.finance.yahoo.com/v7/finance/download/BTC-USD"
-            "?period1=1279315200&period2=9999999999&interval=1d&events=history"
-        )
-        btc = pd.read_csv(btc_url)
-        btc['Date'] = pd.to_datetime(btc['Date'])
-        btc.set_index('Date', inplace=True)
-        data['btc'] = btc['Close'].astype(float)
+        m2 = pdr.DataReader("M2SL", "fred", start, end)
+        data["m2"] = m2["M2SL"]
     except:
-        data['btc'] = pd.Series(dtype=float)
+        data["m2"] = pd.Series(dtype=float)
 
-    # --- FRED Helper ---
-    def get_fred(series_id):
-        try:
-            url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
-            r = requests.get(url, headers=headers, timeout=10)
-            df = pd.read_csv(io.StringIO(r.text))
-            df['DATE'] = pd.to_datetime(df['DATE'])
-            df.set_index('DATE', inplace=True)
-            s = pd.to_numeric(df.iloc[:, 0], errors='coerce')
-            return s
-        except:
-            return pd.Series(dtype=float)
-
-    data['m2'] = get_fred("M2SL")
-    data['spread'] = get_fred("BAMLH0A0HYM2")
+    # Credit Spread (optional)
+    try:
+        spread = pdr.DataReader("BAMLH0A0HYM2", "fred", start, end)
+        data["spread"] = spread["BAMLH0A0HYM2"]
+    except:
+        data["spread"] = pd.Series(dtype=float)
 
     return data
 
-with st.spinner("📡 Fetching live macro & market data..."):
-    raw = fetch_data()
+raw = load_online_data()
 
-if raw['btc'].empty or raw['m2'].empty:
-    st.error("❌ Online BTC or M2 data fetch failed.")
+if raw is None or raw["btc"].empty or raw["m2"].empty:
+    st.error("❌ BTC 또는 M2 온라인 데이터를 불러오지 못했습니다.")
     st.stop()
 
-# ============================================================
-# [ENGINE]
-# ============================================================
-def run_engine(raw, base_vol, max_lev):
-    # --- Unified Index ---
-    start = max(raw['btc'].index.min(), raw['m2'].index.min())
-    end = raw['btc'].index.max()
-    idx = pd.date_range(start, end, freq='D')
+# -----------------------------------------------------------
+# [CORE ENGINE]
+# -----------------------------------------------------------
+def run_strategy_engine(raw_data, base_vol, max_lev):
 
-    price = raw['btc'].reindex(idx).interpolate().ffill()
-    m2 = raw['m2'].reindex(idx).ffill().bfill()
-    spread = raw['spread'].reindex(idx).ffill().fillna(3.5)
+    # 1. ALIGNMENT
+    idx = pd.date_range(
+        start=max(raw_data["btc"].index.min(), raw_data["m2"].index.min()),
+        end=raw_data["btc"].index.max(),
+        freq="D"
+    )
 
-    # --- Spread Regime ---
-    spread_z = (spread - spread.rolling(365).mean()) / (spread.rolling(365).std() + 1e-9)
-    lag = np.where(spread_z.shift(1) < 0.5, 56, 168)
+    price = raw_data["btc"].reindex(idx).interpolate("time").ffill().bfill()
+    m2 = raw_data["m2"].reindex(idx).ffill().bfill()
 
-    # --- Kalman Valuation ---
-    N = len(idx)
+    if raw_data["spread"].empty:
+        spread = pd.Series(3.5, index=idx)
+    else:
+        spread = raw_data["spread"].reindex(idx).ffill().bfill()
+
+    # 2. REGIME LAG
+    z = (spread - spread.rolling(365).mean()) / (spread.rolling(365).std() + 1e-9)
+    lag = np.where(z.shift(1) < 0.5, 56, 168)
+
     shifted_m2 = []
     m2v = m2.values
-
-    for i in range(N):
-        j = i - lag[i]
+    for i in range(len(idx)):
+        j = int(i - lag[i])
         shifted_m2.append(m2v[j] if j >= 0 else m2v[0])
 
     x = np.log(np.array(shifted_m2))
     y = np.log(price.values)
 
+    # 3. RLS VALUATION MODEL
     lam = 0.9995
     theta = np.array([0.0, 1.0])
     P = np.eye(2) * 100
 
-    residuals, betas = [], []
+    res, beta = [], []
+    X = np.column_stack([np.ones(len(x)), x])
 
-    for i in range(N):
-        X = np.array([1, x[i]])
-        y_hat = X @ theta
-        err = y[i] - y_hat
+    for i in range(len(x)):
+        xi = X[i].reshape(-1, 1)
+        yi = y[i]
+        pred = float(xi.T @ theta)
+        err = yi - pred
 
-        residuals.append(err)
-        betas.append(theta[1])
+        res.append(err)
+        beta.append(theta[1])
 
-        K = (P @ X) / (lam + X.T @ P @ X)
-        theta = theta + K * err
-        P = (P - np.outer(K, X.T @ P)) / lam
+        K = (P @ xi) / (lam + xi.T @ P @ xi)
+        theta = theta + (K.flatten() * err)
+        P = (P - K @ xi.T @ P) / lam
 
     df = pd.DataFrame(index=idx)
-    df['Price'] = price
-    df['Residual'] = residuals
-    df['Z_Gap'] = (df['Residual'] - df['Residual'].rolling(730, min_periods=90).mean()) / df['Residual'].rolling(730, min_periods=90).std()
-    df['Beta'] = betas
-    df['Beta_MA'] = df['Beta'].rolling(60).mean()
-    df['Beta_Up'] = df['Beta'] > df['Beta_MA']
-    df['Vol_30'] = price.pct_change().rolling(30).std() * np.sqrt(365) * 100
-    df['MA200'] = price.rolling(200).mean()
+    df["Price"] = price
+    df["Residual"] = res
+    df["Z_Gap"] = (
+        (df["Residual"] - df["Residual"].rolling(730, min_periods=90).mean())
+        / df["Residual"].rolling(730, min_periods=90).std()
+    )
 
+    df["Beta"] = beta
+    df["Beta_MA"] = df["Beta"].rolling(60).mean()
+    df["Beta_Up"] = df["Beta"] > df["Beta_MA"]
+
+    ret = price.pct_change()
+    df["Vol_30"] = ret.rolling(30).std() * np.sqrt(365) * 100
+
+    df["MA200"] = df["Price"].rolling(200).mean()
+
+    # 4. FINAL DECISION
     last = df.iloc[-1]
+    curr_vol = last["Vol_30"] if not np.isnan(last["Vol_30"]) else 50
+    z_val = last["Z_Gap"] if not np.isnan(last["Z_Gap"]) else 0
+    trend = last["Price"] > last["MA200"]
 
-    if last['Price'] < last['MA200']:
-        return df, 0.0, "❄️ HIBERNATION", 0, 0, 0
-
-    target_vol = base_vol + (10 if last['Beta_Up'] else -10)
-    scalar = min(target_vol / max(last['Vol_30'], 1.0), max_lev)
-
+    status = ""
+    adaptive = base_vol
     val_mod = 1.0
-    if last['Z_Gap'] > 2:
-        val_mod = 0.7
-    elif last['Z_Gap'] < -2:
-        val_mod = 1.3
+    exposure = 0.0
 
-    exposure = min(scalar * val_mod, max_lev)
+    if not trend:
+        status = "HIBERNATION (Cash)"
+        exposure = 0.0
+    else:
+        if last["Beta_Up"]:
+            adaptive += 10
+            status = "HIGH BETA"
+        else:
+            adaptive -= 10
+            status = "LOW BETA"
 
-    return df, exposure, "ACTIVE", target_vol, last['Vol_30'], last['Z_Gap']
+        scalar = min(adaptive / curr_vol, max_lev)
 
-# ============================================================
+        if z_val > 2:
+            val_mod = 0.7
+            status += " + TRIM"
+        elif z_val < -2:
+            val_mod = 1.3
+            status += " + BOOST"
+
+        exposure = min(scalar * val_mod, max_lev)
+
+    return exposure, status, df, curr_vol, adaptive, z_val, val_mod, last["Beta_Up"]
+
+# -----------------------------------------------------------
 # [RUN]
-# ============================================================
-df, exp, status, tgt_vol, curr_vol, z = run_engine(raw, base_target_vol, max_lev_cap)
+# -----------------------------------------------------------
+exp, status, df, vol, tgt, z, vm, bu = run_strategy_engine(
+    raw, base_target_vol, max_lev_cap
+)
 
-# ============================================================
+# -----------------------------------------------------------
 # [DASHBOARD]
-# ============================================================
+# -----------------------------------------------------------
 st.markdown("### 🧭 Institutional Command Center")
 
-c1, c2, c3 = st.columns(3)
+c1, c2, c3, c4 = st.columns(4)
 c1.metric("Final Exposure", f"{exp*100:.0f}%", status)
-c2.metric("Target Vol", f"{tgt_vol:.0f}%", f"Current {curr_vol:.1f}%")
-c3.metric("Valuation Z", f"{z:.2f} σ")
+c2.metric("Risk Budget", f"{tgt:.0f}%", f"Current {vol:.1f}%")
+c3.metric("Valuation Tilt", f"x{vm}", f"Z {z:.2f}")
+c4.metric("Liquidity Regime", "🚀" if bu else "🐌")
 
 st.divider()
 
-df_viz = df[df.index >= "2020-01-01"]
+dfv = df[df.index >= "2020-01-01"]
 
-fig = go.Figure()
-fig.add_trace(go.Scatter(x=df_viz.index, y=df_viz['Price'], name="BTC Price"))
-fig.add_trace(go.Scatter(x=df_viz.index, y=df_viz['MA200'], name="MA200"))
-fig.update_layout(template="plotly_dark", height=450)
-st.plotly_chart(fig, use_container_width=True)
+fig1 = go.Figure()
+fig1.add_trace(go.Scatter(x=dfv.index, y=dfv["Vol_30"], name="Volatility"))
+fig1.add_hline(y=tgt, line_dash="dash", line_color="red")
+fig1.update_layout(title="Volatility Control", height=400)
+st.plotly_chart(fig1, use_container_width=True)
+
+fig2 = go.Figure()
+fig2.add_bar(x=dfv.index, y=dfv["Z_Gap"])
+fig2.add_hline(y=2, line_dash="dash", line_color="red")
+fig2.add_hline(y=-2, line_dash="dash", line_color="green")
+fig2.update_layout(title="Valuation Z-Gap", height=400)
+st.plotly_chart(fig2, use_container_width=True)
