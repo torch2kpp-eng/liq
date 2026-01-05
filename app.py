@@ -1,22 +1,16 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-import requests
-import io
-import warnings
-import time
-import ccxt
 import numpy as np
-from datetime import datetime, timedelta
+import os
+from datetime import datetime
 
 # -----------------------------------------------------------
 # [환경 설정]
 # -----------------------------------------------------------
-warnings.filterwarnings("ignore")
 st.set_page_config(page_title="GM Strategy v3.7", layout="wide")
-
 st.title("🏛️ Grand Master: Adaptive Alpha Engine")
-st.caption("v3.7 | Adaptive Risk Budgeting | Valuation Tilt | Institutional Grade")
+st.caption("v3.7 (Local Data Optimized) | Risk Parity | Valuation Tilt")
 
 # -----------------------------------------------------------
 # [사이드바] Strategy Tuning
@@ -26,69 +20,101 @@ base_target_vol = st.sidebar.slider("🎯 Base Target Vol (%)", 30, 80, 50, 5)
 max_lev_cap = st.sidebar.slider("🔒 Max Leverage Limit", 1.0, 3.0, 2.0, 0.1)
 
 # -----------------------------------------------------------
-# [CORE] 데이터 파이프라인
+# [CORE] 데이터 로더 (로컬 파일 우선)
 # -----------------------------------------------------------
 @st.cache_data(ttl=3600)
-def fetch_data():
-    d = {}
-    headers = {'User-Agent': 'Mozilla/5.0'}
+def load_data():
+    data = {}
+    
+    # 1. 파일 로드 함수 (공통)
+    def read_csv_data(filenames):
+        for f in filenames:
+            if os.path.exists(f):
+                try:
+                    df = pd.read_csv(f, parse_dates=['observation_date'], index_col='observation_date')
+                    # 숫자로 변환 (에러 방지)
+                    s = df.iloc[:, 0].apply(pd.to_numeric, errors='coerce')
+                    return s.sort_index()
+                except: continue
+        return pd.Series(dtype=float)
 
-    def get_fred(id):
-        try:
-            url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={id}"
-            r = requests.get(url, headers=headers, timeout=5)
-            df = pd.read_csv(io.StringIO(r.text), index_col=0, parse_dates=True)
-            s = df.squeeze().apply(pd.to_numeric, errors='coerce')
-            ext_idx = pd.date_range(start=s.index.min(), end=datetime.now(), freq='D')
-            s_ext = s.reindex(ext_idx)
-            return s_ext.fillna(method='ffill').fillna(method='bfill')
-        except: return pd.Series(dtype=float)
+    # 2. BTC 데이터 로드
+    # 업로드해주신 파일명 후보들
+    data['btc'] = read_csv_data(['CBBTCUSD 2.csv', 'CBBTCUSD.csv', 'btc.csv'])
+    
+    # 3. M2 데이터 로드
+    data['m2'] = read_csv_data(['M2SL 2.csv', 'M2SL.csv', 'm2.csv'])
+    
+    # 4. Spread 데이터 로드 (없으면 3.5 고정)
+    # Spread 파일이 없으므로, 기본값 생성 혹은 파일이 있다면 로드
+    s_spread = read_csv_data(['BAMLH0A0HYM2.csv', 'spread.csv'])
+    if s_spread.empty:
+        # 데이터가 없으면 BTC 기간에 맞춰 3.5(중립)로 채움
+        if not data['btc'].empty:
+            idx = data['btc'].index
+            data['spread'] = pd.Series(3.5, index=idx)
+        else:
+            data['spread'] = pd.Series(dtype=float)
+    else:
+        data['spread'] = s_spread
 
-    def fetch_btc():
-        try:
-            # Production: Use real exchange data
-            bithumb = ccxt.bithumb({'enableRateLimit': True, 'timeout': 3000})
-            ohlcv = bithumb.fetch_ohlcv('BTC/KRW', '1d', limit=1000)
-            if not ohlcv: return pd.Series(dtype=float)
-            df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            return df.set_index('timestamp')['close'].tz_localize(None)
-        except: return pd.Series(dtype=float)
+    return data
 
-    d['m2'] = get_fred('M2SL')
-    d['spread'] = get_fred('BAMLH0A0HYM2')
-    d['btc'] = fetch_btc()
-    return d
+# 데이터 로딩 실행
+raw = load_data()
 
-with st.spinner("📡 월가 적응형 엔진(Adaptive Engine) 가동 중..."):
-    raw = fetch_data()
+# 데이터 상태 점검 메시지
+if raw['btc'].empty:
+    st.error("❌ 'CBBTCUSD 2.csv' 파일을 찾을 수 없습니다.")
+    st.stop()
+if raw['m2'].empty:
+    st.error("❌ 'M2SL 2.csv' 파일을 찾을 수 없습니다.")
+    st.stop()
 
 # -----------------------------------------------------------
-# [ENGINE] GM v3.7 Logic
+# [ENGINE] GM v3.7 Logic (Robust)
 # -----------------------------------------------------------
-def run_strategy_v3_7(price, m2, spread, base_vol, max_lev):
+def run_strategy_engine(raw_data, base_vol, max_lev):
     try:
-        # 1. Alignment
-        idx = price.index
-        m2_d = m2.reindex(idx).fillna(method='ffill')
-        spread_d = spread.reindex(idx).fillna(method='ffill').fillna(3.5)
+        # 1. Alignment (전체 기간 통합)
+        # BTC와 M2 중 더 긴 기간을 커버하도록 인덱스 생성
+        start_dt = max(raw_data['btc'].index.min(), raw_data['m2'].index.min())
+        end_dt = raw_data['btc'].index.max() # BTC 마지막 날짜 기준
         
-        # 2. Regime Lag (Bias Free)
-        spread_z = (spread_d - spread_d.rolling(365).mean()) / (spread_d.rolling(365).std() + 1e-9)
-        regime_sig = spread_z.shift(1)
+        idx = pd.date_range(start=start_dt, end=end_dt, freq='D')
+        
+        # Reindex & Fill
+        # BTC: 주말/휴일은 보간(Time Interpolation)
+        price = raw_data['btc'].reindex(idx).interpolate(method='time').fillna(method='ffill').fillna(method='bfill')
+        # M2: 월간 데이터이므로 ffill (직전 값 유지)
+        m2_d = raw_data['m2'].reindex(idx).fillna(method='ffill').fillna(method='bfill')
+        # Spread
+        spread_d = raw_data['spread'].reindex(idx).fillna(method='ffill').fillna(3.5)
+
+        # 2. Indicators Calculation
+        
+        # A. Regime Lag (Bias Free)
+        # Spread Z-Score
+        roll_mean = spread_d.rolling(365).mean()
+        roll_std = spread_d.rolling(365).std()
+        spread_z = (spread_d - roll_mean) / (roll_std + 1e-9)
+        regime_sig = spread_z.shift(1) # 하루 전 신호 사용
         lag_vals = np.where(regime_sig < 0.5, 56, 168)
         
-        # 3. Valuation (Kalman Filter)
+        # B. Valuation (Kalman Filter)
         m2_vals = m2_d.values
         shifted_m2 = []
         N = len(idx)
         for i in range(N):
             l_idx = int(i - lag_vals[i])
-            shifted_m2.append(m2_vals[l_idx] if l_idx >=0 else m2_vals[0])
+            # 인덱스 범위를 벗어나면 첫 번째 값 사용
+            val = m2_vals[l_idx] if l_idx >= 0 else m2_vals[0]
+            shifted_m2.append(val)
             
         x_liq = np.log(np.array(shifted_m2))
         y_price = np.log(price.values)
         
+        # RLS Algorithm
         lam = 0.9995
         theta = np.zeros(2); theta[1] = 1.0
         P = np.eye(2) * 100
@@ -108,68 +134,68 @@ def run_strategy_v3_7(price, m2, spread, base_vol, max_lev):
                 K = num / den
                 theta = theta + (K * err).flatten()
                 P = (P - np.dot(K, np.dot(xi.T, P))) / lam
-        
-        # 4. Signal Construction
+
+        # DataFrame 구성
         df = pd.DataFrame(index=idx)
         df['Price'] = price
-        df['Z_Gap'] = (pd.Series(residuals, index=idx) - pd.Series(residuals, index=idx).rolling(730).mean()) / pd.Series(residuals, index=idx).rolling(730).std()
-        
-        # Beta Trend (For Adaptive Vol)
+        df['Residual'] = residuals
+        df['Z_Gap'] = (df['Residual'] - df['Residual'].rolling(730, min_periods=90).mean()) / df['Residual'].rolling(730, min_periods=90).std()
         df['Beta'] = betas
+        
+        # C. Beta Trend
         df['Beta_MA'] = df['Beta'].rolling(60).mean()
         df['Beta_Up'] = df['Beta'] > df['Beta_MA']
         
-        # Volatility
+        # D. Volatility
         daily_ret = price.pct_change()
-        vol_30 = daily_ret.rolling(30).std() * np.sqrt(365) * 100
+        df['Vol_30'] = daily_ret.rolling(30).std() * np.sqrt(365) * 100
         
-        # Trend
-        ma200 = price.rolling(200).mean()
-        is_trend = price.iloc[-1] > ma200.iloc[-1]
+        # E. Trend Filter
+        df['MA200'] = df['Price'].rolling(200).mean()
         
-        # 5. Final Decision Logic (Last Day)
-        curr_vol = vol_30.iloc[-1]
-        if pd.isna(curr_vol) or curr_vol < 1.0: curr_vol = 50.0
+        # 3. Final Decision (마지막 날짜 기준)
+        last = df.iloc[-1]
         
-        z_val = df['Z_Gap'].iloc[-1]
-        is_beta_up = df['Beta_Up'].iloc[-1]
+        # 안전장치: 데이터가 NaN이면 기본값 처리
+        curr_vol = last['Vol_30'] if not pd.isna(last['Vol_30']) else 50.0
+        z_val = last['Z_Gap'] if not pd.isna(last['Z_Gap']) else 0.0
+        is_trend = last['Price'] > last['MA200']
         
+        # 로직 시작
         status_msg = ""
         status_color = "normal"
-        base_dir = 1.0
+        adaptive_target = base_vol
+        val_mod = 1.0
+        final_exp = 0.0
         
         if not is_trend:
             final_exp = 0.0
             status_msg = "❄️ HIBERNATION (Cash)"
             status_color = "off"
-            adaptive_target = 0.0
-            val_mod = 1.0
         else:
-            # A. Adaptive Risk Budgeting
-            if is_beta_up:
-                adaptive_target = base_vol + 10.0 # Aggressive
+            # Beta Driven Target Vol
+            if last['Beta_Up']:
+                adaptive_target = base_vol + 10.0
                 status_msg = "🔥 HIGH BETA (Aggressive)"
                 status_color = "inverse"
             else:
-                adaptive_target = base_vol - 10.0 # Defensive
+                adaptive_target = base_vol - 10.0
                 status_msg = "🛡️ LOW BETA (Defensive)"
-                status_color = "normal"
             
-            # B. Risk Scalar
-            risk_scalar = adaptive_target / curr_vol
-            risk_scalar = min(risk_scalar, max_lev)
+            # Risk Scalar
+            if curr_vol < 1.0: curr_vol = 50.0 # 0 나누기 방지
+            scalar = adaptive_target / curr_vol
+            scalar = min(scalar, max_lev)
             
-            # C. Valuation Modifier (Tilt)
-            val_mod = 1.0
+            # Valuation Modifier
             if z_val > 2.0: 
-                val_mod = 0.7 # Trim
-                status_msg += " + TRIM (Overheat)"
+                val_mod = 0.7
+                status_msg += " + TRIM"
             elif z_val < -2.0: 
-                val_mod = 1.3 # Boost
-                status_msg += " + BOOST (Value)"
+                val_mod = 1.3
+                status_msg += " + BOOST"
                 
-            # Final Calculation
-            final_exp = base_dir * risk_scalar * val_mod
+            final_exp = scalar * val_mod
             final_exp = min(final_exp, max_lev)
             
         return {
@@ -177,61 +203,67 @@ def run_strategy_v3_7(price, m2, spread, base_vol, max_lev):
             "status": status_msg,
             "color": status_color,
             "z_gap": z_val,
-            "beta_up": is_beta_up,
             "curr_vol": curr_vol,
             "target_vol": adaptive_target,
             "val_mod": val_mod,
-            "df": pd.DataFrame({'Price': price, 'MA200': ma200, 'Z_Gap': df['Z_Gap'], 'Beta': df['Beta']})
+            "beta_up": bool(last['Beta_Up']),
+            "df": df
         }
         
-    except Exception as e: return None
+    except Exception as e:
+        st.error(f"엔진 오류 발생: {e}")
+        return None
 
 # -----------------------------------------------------------
 # [DASHBOARD]
 # -----------------------------------------------------------
-if 'btc' in raw and not raw['m2'].empty:
-    res = run_strategy_v3_7(raw['btc'], raw['m2'], raw['spread'], base_target_vol, max_lev_cap)
-    
-    if res:
-        st.markdown("### 🧭 Institutional Command Center")
-        
-        # Top Metrics
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            st.metric("Final Exposure", f"{res['exposure']*100:.0f}%", res['status'], delta_color=res['color'])
-        with c2:
-            st.metric("Adaptive Target Vol", f"{res['target_vol']}%", f"Current Vol: {res['curr_vol']:.1f}%")
-        with c3:
-            st.metric("Valuation Tilt", f"x{res['val_mod']}", f"Z-Gap: {res['z_gap']:.2f} σ")
-        with c4:
-            icon = "🚀" if res['beta_up'] else "🐌"
-            st.metric("Transmission (Beta)", icon, "Liquidity Efficiency")
-            
-        st.divider()
-        
-        # Charts
-        tab1, tab2 = st.tabs(["🛡️ Exposure Logic", "📊 Valuation Signal"])
-        
-        df_viz = res['df'][res['df'].index >= '2020-01-01']
-        
-        with tab1:
-            # Beta Trend Visual
-            st.caption("Beta Trend (Transmission Efficiency): If Rising, we target higher volatility.")
-            st.line_chart(df_viz['Beta'])
-            
-        with tab2:
-            fig = go.Figure()
-            cols = []
-            for i in range(len(df_viz)):
-                z = df_viz['Z_Gap'].iloc[i]
-                if z > 2.0: cols.append('red')
-                elif z < -2.0: cols.append('lime')
-                else: cols.append('gray')
-            fig.add_trace(go.Bar(x=df_viz.index, y=df_viz['Z_Gap'], marker_color=cols))
-            fig.add_hline(y=2.0, line_dash="dash", line_color="red")
-            fig.add_hline(y=-2.0, line_dash="dash", line_color="lime")
-            fig.update_layout(title="Z-Gap History", template="plotly_dark", height=450)
-            st.plotly_chart(fig, use_container_width=True)
+res = run_strategy_engine(raw, base_target_vol, max_lev_cap)
 
-    else: st.error("엔진 오류")
-else: st.info("데이터 로딩 중...")
+if res:
+    st.markdown("### 🧭 Institutional Command Center")
+    
+    # Metrics
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Final Exposure", f"{res['exposure']*100:.0f}%", res['status'], delta_color=res['color'])
+    with c2:
+        st.metric("Risk Budget", f"{res['target_vol']}% Vol", f"Current: {res['curr_vol']:.1f}%")
+    with c3:
+        st.metric("Valuation Tilt", f"x{res['val_mod']}", f"Z-Gap: {res['z_gap']:.2f} σ")
+    with c4:
+        icon = "🚀" if res['beta_up'] else "🐌"
+        st.metric("Liquidity Efficiency", icon, "Beta Trend")
+        
+    st.divider()
+    
+    # Charts
+    tab1, tab2 = st.tabs(["🛡️ Strategy Logic", "📊 Valuation Signal"])
+    
+    df_viz = res['df'][res['df'].index >= '2020-01-01']
+    
+    with tab1:
+        # Volatility & Beta
+        fig_v = go.Figure()
+        fig_v.add_trace(go.Scatter(x=df_viz.index, y=df_viz['Vol_30'], name='Market Vol', line=dict(color='yellow')))
+        fig_v.add_hline(y=res['target_vol'], line_dash="dash", line_color="magenta", annotation_text="Target Vol")
+        fig_v.update_layout(title="Volatility vs Target (Risk Control)", template="plotly_dark", height=400)
+        st.plotly_chart(fig_v, use_container_width=True)
+        
+    with tab2:
+        # Z-Gap
+        fig_z = go.Figure()
+        cols = []
+        for i in range(len(df_viz)):
+            z = df_viz['Z_Gap'].iloc[i]
+            if z > 2.0: cols.append('red')
+            elif z < -2.0: cols.append('lime')
+            else: cols.append('gray')
+        
+        fig_z.add_trace(go.Bar(x=df_viz.index, y=df_viz['Z_Gap'], marker_color=cols, name='Z-Gap'))
+        fig_z.add_hline(y=2.0, line_dash="dash", line_color="red")
+        fig_z.add_hline(y=-2.0, line_dash="dash", line_color="lime")
+        fig_z.update_layout(title="Z-Gap Signal History", template="plotly_dark", height=400)
+        st.plotly_chart(fig_z, use_container_width=True)
+
+else:
+    st.warning("데이터 계산 중 문제가 발생했습니다. 데이터 파일 기간을 확인해주세요.")
