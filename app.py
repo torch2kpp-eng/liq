@@ -1,36 +1,49 @@
 import streamlit as st
 import os
-from PIL import Image, ImageChops
+from PIL import Image, ImageChops, ImageDraw
 
 # 페이지 설정
-st.set_page_config(page_title="달콤한 디저트 공방", page_icon="🍰")
+st.set_page_config(page_title="무지개 디저트 공방", page_icon="🌈")
 
-def apply_color_to_image(image_path, color_hex):
-    """이미지의 밝은 부분에 사용자가 선택한 색상을 입히는 함수"""
+def apply_gradient_to_image(image_path, color1_hex, color2_hex):
+    """이미지에 상단->하단 그라데이션을 입히는 함수"""
     try:
         # 이미지 불러오기 및 RGBA 변환
         img = Image.open(image_path).convert("RGBA")
+        width, height = img.size
         
         # Hex 색상을 RGB로 변환
-        color_rgb = tuple(int(color_hex.lstrip('#')[i:i+2], 16) for i in (0, 2, 4))
+        c1 = tuple(int(color1_hex.lstrip('#')[i:i+2], 16) for i in (0, 2, 4))
+        c2 = tuple(int(color2_hex.lstrip('#')[i:i+2], 16) for i in (0, 2, 4))
         
-        # 선택한 색상의 단색 레이어 생성
-        color_layer = Image.new("RGBA", img.size, color_rgb + (255,))
+        # 1. 그라데이션 레이어 생성
+        gradient = Image.new('RGBA', (width, height))
+        draw = ImageDraw.Draw(gradient)
         
-        # Multiply(승산) 합성을 통해 색상 적용 (이미지의 질감 유지)
-        colored_img = ImageChops.multiply(img, color_layer)
+        for y in range(height):
+            # 상단(c1)에서 하단(c2)으로 색상 보간 계산
+            r = int(c1[0] + (c2[0] - c1[0]) * (y / height))
+            g = int(c1[1] + (c2[1] - c1[1]) * (y / height))
+            b = int(c1[2] + (c2[2] - c1[2]) * (y / height))
+            draw.line([(0, y), (width, y)], fill=(r, g, b, 255))
         
-        # 원본의 알파 채널(투명도) 유지
-        img.paste(colored_img, (0, 0), img)
-        return img
+        # 2. Multiply(승산) 합성을 통해 디저트 질감 위에 색상 적용
+        colored_part = ImageChops.multiply(img, gradient)
+        
+        # 3. 원본 이미지의 알파 채널(투명도)을 유지하며 합성
+        output = Image.new("RGBA", img.size)
+        output.paste(colored_part, (0, 0), mask=img)
+        return output
     except Exception as e:
+        st.error(f"이미지 처리 중 오류가 발생했습니다: {e}")
         return None
 
-# 메인 타이틀
-st.title("🎨 디저트 색깔 입히기 공방")
+# --- UI 구성 ---
+st.title("🌈 나만의 그라데이션 디저트")
+st.write("두 가지 색깔을 골라 세상에 하나뿐인 무지개 디저트를 만들어봐요!")
 
-# 사이드바 설정
-st.sidebar.header("🛠️ 꾸미기 도구함")
+# 사이드바: 설정 도구
+st.sidebar.header("🎨 디자인 센터")
 
 dessert_options = {
     "아이스크림": "icecream.png",
@@ -40,40 +53,58 @@ dessert_options = {
     "쿠키": "cookie.png"
 }
 
-selected_name = st.sidebar.selectbox("디저트 선택", list(dessert_options.keys()))
-chosen_color = st.sidebar.color_picker("디저트에 입힐 색상 선택", "#FFB6C1")
+selected_name = st.sidebar.selectbox("디저트를 골라보세요", list(dessert_options.keys()))
+color_top = st.sidebar.color_picker("윗부분 색상", "#FFB6C1")   # 기본 핑크
+color_bottom = st.sidebar.color_picker("아랫부분 색상", "#87CEEB") # 기본 하늘색
 
-# 메인 화면
 st.divider()
 
+# --- 메인 실행 로직 ---
 image_filename = dessert_options[selected_name]
 image_path = os.path.join("assets", image_filename)
 
 if os.path.exists(image_path):
-    # 색상 적용 로직 실행
-    final_dessert = apply_color_to_image(image_path, chosen_color)
+    # 그라데이션 합성 함수 호출
+    result_img = apply_gradient_to_image(image_path, color_top, color_bottom)
     
-    col1, col2 = st.columns([2, 1])
+    col1, col2 = st.columns([3, 2])
     
     with col1:
-        if final_dessert:
-            st.image(final_dessert, caption=f"내가 만든 {chosen_color}색 {selected_name}", use_container_width=True)
+        if result_img:
+            st.image(result_img, caption=f"멋진 {selected_name} 완성!", use_container_width=True)
     
     with col2:
-        st.write("### 📝 디자인 정보")
-        st.success(f"현재 선택: **{selected_name}**")
-        st.write(f"색상 코드: `{chosen_color}`")
+        st.subheader("📝 나의 레시피")
+        st.info(f"선택한 디저트: **{selected_name}**")
         
-        # 결과물 다운로드 버튼
+        # 선택한 그라데이션 미리보기 박스 (CSS 사용)
+        st.write("적용된 그라데이션:")
+        st.markdown(f"""
+            <div style="
+                width: 100%; 
+                height: 60px; 
+                border-radius: 15px; 
+                background: linear-gradient(to bottom, {color_top}, {color_bottom});
+                border: 2px solid #f0f0f0;
+                box-shadow: 2px 2px 5px rgba(0,0,0,0.1);
+            "></div>
+        """, unsafe_allow_html=True)
+        
+        # 이미지 다운로드 기능
         import io
         buf = io.BytesIO()
-        final_dessert.save(buf, format="PNG")
-        st.download_button("🖼️ 이미지 저장하기", buf.getvalue(), f"my_{selected_name}.png", "image/png")
+        result_img.save(buf, format="PNG")
+        st.download_button(
+            label="🖼️ 이미지 저장하기",
+            data=buf.getvalue(),
+            file_name=f"my_{selected_name}.png",
+            mime="image/png"
+        )
 
 else:
-    st.error(f"assets 폴더에 '{image_filename}' 파일이 없습니다.")
+    st.warning(f"assets 폴더에 '{image_filename}' 파일이 있는지 확인해주세요!")
 
-# 오류가 났던 부분 수정: st.confetti() 삭제 후 st.balloons() 사용
-if st.button("🎉 완성!"):
+# 완료 효과
+if st.button("🎉 작품 완성!"):
     st.balloons()
-    st.success("정말 예쁜 디저트네요!")
+    st.success("참 잘했어요! 정말 먹음직스러운 디저트네요.")
