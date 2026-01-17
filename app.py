@@ -1,37 +1,37 @@
 import streamlit as st
 import os
+from PIL import Image, ImageChops
 
-# 1. 페이지 설정 (웹 브라우저 탭에 표시될 정보)
-st.set_page_config(
-    page_title="달콤한 디저트 공방", 
-    page_icon="🍰", 
-    layout="centered"
-)
+# 페이지 설정
+st.set_page_config(page_title="달콤한 디저트 공방", page_icon="🍰")
 
-# 2. 디자인을 위한 커스텀 CSS (폰트 크기 및 스타일)
-st.markdown("""
-    <style>
-    .main-title {
-        font-size: 40px !important;
-        color: #FF69B4;
-        text-align: center;
-        font-weight: bold;
-    }
-    .dessert-box {
-        border: 5px solid #FFB6C1;
-        border-radius: 20px;
-        padding: 20px;
-        background-color: #FFF0F5;
-    }
-    </style>
-    """, unsafe_allow_html=True)
+def apply_color_to_image(image_path, color_hex):
+    """이미지의 밝은 부분에 사용자가 선택한 색상을 입히는 함수"""
+    try:
+        # 이미지 불러오기 및 RGBA 변환
+        img = Image.open(image_path).convert("RGBA")
+        
+        # Hex 색상을 RGB로 변환
+        color_rgb = tuple(int(color_hex.lstrip('#')[i:i+2], 16) for i in (0, 2, 4))
+        
+        # 선택한 색상의 단색 레이어 생성
+        color_layer = Image.new("RGBA", img.size, color_rgb + (255,))
+        
+        # Multiply(승산) 합성을 통해 색상 적용 (이미지의 질감 유지)
+        colored_img = ImageChops.multiply(img, color_layer)
+        
+        # 원본의 알파 채널(투명도) 유지
+        img.paste(colored_img, (0, 0), img)
+        return img
+    except Exception as e:
+        return None
 
-st.markdown('<p class="main-title">🎨 나만의 달콤한 디저트 만들기</p>', unsafe_allow_html=True)
+# 메인 타이틀
+st.title("🎨 디저트 색깔 입히기 공방")
 
-# 3. 사이드바: 디저트 및 색상 선택
+# 사이드바 설정
 st.sidebar.header("🛠️ 꾸미기 도구함")
 
-# 디저트 목록 (파일 이름과 정확히 일치해야 함)
 dessert_options = {
     "아이스크림": "icecream.png",
     "빙수": "shaved_ice.png",
@@ -40,50 +40,40 @@ dessert_options = {
     "쿠키": "cookie.png"
 }
 
-selected_name = st.sidebar.selectbox("어떤 디저트를 고를까요?", list(dessert_options.keys()))
-chosen_color = st.sidebar.color_picker("가장 좋아하는 색깔을 골라보세요!", "#FFB6C1")
+selected_name = st.sidebar.selectbox("디저트 선택", list(dessert_options.keys()))
+chosen_color = st.sidebar.color_picker("디저트에 입힐 색상 선택", "#FFB6C1")
 
-# 4. 메인 화면 로직
+# 메인 화면
 st.divider()
 
-# 선택된 이미지 경로 파악
 image_filename = dessert_options[selected_name]
 image_path = os.path.join("assets", image_filename)
 
-# 화면 레이아웃 구성
-col1, col2 = st.columns([3, 2])
-
-with col1:
-    st.subheader(f"✨ 완성된 {selected_name} ✨")
+if os.path.exists(image_path):
+    # 색상 적용 로직 실행
+    final_dessert = apply_color_to_image(image_path, chosen_color)
     
-    # 이미지 출력 시도
-    if os.path.exists(image_path):
-        # 이미지를 감싸는 예쁜 박스 효과
-        st.image(image_path, use_column_width=True)
-    else:
-        st.error(f"⚠️ '{image_filename}' 파일을 찾을 수 없어요!")
-        st.info(f"GitHub의 assets 폴더에 {image_filename} 파일이 있는지 다시 확인해주세요.")
-
-with col2:
-    st.write("### 📝 제작 노트")
-    st.info(f"오늘의 테마: **{selected_name}**")
+    col1, col2 = st.columns([2, 1])
     
-    # 선택한 색상을 시각적으로 보여주는 원형 박스
-    st.write("지정된 마법 색상:")
-    st.markdown(f"""
-        <div style="
-            width: 80px; 
-            height: 80px; 
-            background-color: {chosen_color}; 
-            border-radius: 50%; 
-            border: 3px solid white;
-            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
-        "></div>
-    """, unsafe_allow_html=True)
-    st.write(f"색상 코드: `{chosen_color}`")
+    with col1:
+        if final_dessert:
+            st.image(final_dessert, caption=f"내가 만든 {chosen_color}색 {selected_name}", use_container_width=True)
+    
+    with col2:
+        st.write("### 📝 디자인 정보")
+        st.success(f"현재 선택: **{selected_name}**")
+        st.write(f"색상 코드: `{chosen_color}`")
+        
+        # 결과물 다운로드 버튼
+        import io
+        buf = io.BytesIO()
+        final_dessert.save(buf, format="PNG")
+        st.download_button("🖼️ 이미지 저장하기", buf.getvalue(), f"my_{selected_name}.png", "image/png")
 
-# 5. 인터랙션 버튼
-if st.button("🎉 디저트 가게에 진열하기"):
+else:
+    st.error(f"assets 폴더에 '{image_filename}' 파일이 없습니다.")
+
+# 오류가 났던 부분 수정: st.confetti() 삭제 후 st.balloons() 사용
+if st.button("🎉 완성!"):
     st.balloons()
-    st.confetti() # Streamlit의 즐거운 효과
-    st.success(f"정말 멋져요! 이 {selected_name}은 세상에서 가장 달콤할 것 같아요.")
+    st.success("정말 예쁜 디저트네요!")
