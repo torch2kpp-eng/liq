@@ -4,3 +4,6 @@ numpy
 plotly
 yfinance
 pandas_datareader
+streamlit
+Pillow
+numpy
