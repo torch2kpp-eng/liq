@@ -1,770 +1,349 @@
-import streamlit as st
-import os
 import io
 import math
-import random
-import zipfile
-from datetime import datetime
-from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
+import requests
+import numpy as np
+import pandas as pd
+import streamlit as st
 
-# ---------------------------
-# Page Config
-# ---------------------------
-st.set_page_config(
-    page_title="무지개 디저트 공방",
-    page_icon="🍰",
-    layout="wide",
-    initial_sidebar_state="expanded",
+# =========================
+# liq repo - Global M2 Validator
+# =========================
+
+st.set_page_config(page_title="liq | Global M2 Validator", layout="wide")
+
+# -------------------------
+# Config
+# -------------------------
+WEEK_RULE = "W-FRI"
+
+# Core-12 (예시 세트) - 필요하면 이름만 바꿔서 고정하면 됨
+CORE12 = [
+    "US", "EA", "JP",
+    "CN", "GB", "CA", "CH",
+    "AU", "IN", "KR",
+    "BR", "MX",
+]
+
+# 각국 통화 코드(USD 환산용)
+CCY = {
+    "US": "USD",
+    "EA": "EUR",
+    "JP": "JPY",
+    "CN": "CNY",
+    "GB": "GBP",
+    "CA": "CAD",
+    "CH": "CHF",
+    "AU": "AUD",
+    "IN": "INR",
+    "KR": "KRW",
+    "BR": "BRL",
+    "MX": "MXN",
+}
+
+# -------------------------
+# Helpers: robust download
+# -------------------------
+def http_get(url: str, timeout=30) -> str:
+    r = requests.get(url, timeout=timeout, headers={"User-Agent": "liq-validator/1.0"})
+    r.raise_for_status()
+    return r.text
+
+def parse_two_col_csv(text: str, date_col="DATE", value_col=None) -> pd.Series:
+    """
+    FRED/ECB csvdata는 컬럼명이 다를 수 있어서 유연 파서.
+    반환: DatetimeIndex / float Series
+    """
+    df = pd.read_csv(io.StringIO(text))
+    # date column 추정
+    if date_col not in df.columns:
+        # ECB csvdata는 TIME_PERIOD가 일반적
+        if "TIME_PERIOD" in df.columns:
+            date_col = "TIME_PERIOD"
+        elif "date" in [c.lower() for c in df.columns]:
+            date_col = [c for c in df.columns if c.lower() == "date"][0]
+        else:
+            raise ValueError(f"Cannot find date column in CSV. columns={list(df.columns)}")
+
+    if value_col is None:
+        # FRED: VALUE, ECB: OBS_VALUE
+        if "VALUE" in df.columns:
+            value_col = "VALUE"
+        elif "OBS_VALUE" in df.columns:
+            value_col = "OBS_VALUE"
+        else:
+            # fallback: 마지막 컬럼
+            value_col = df.columns[-1]
+
+    out = df[[date_col, value_col]].copy()
+    out[date_col] = pd.to_datetime(out[date_col], errors="coerce")
+    out[value_col] = pd.to_numeric(out[value_col], errors="coerce")
+    out = out.dropna(subset=[date_col]).set_index(date_col).sort_index()
+    s = out[value_col].astype(float)
+    return s
+
+# -------------------------
+# Data sources (Auto)
+# -------------------------
+def fetch_us_m2_fred() -> pd.Series:
+    """
+    FRED M2SL (Monthly, SA). API key 없이도 table-data CSV 경로로 실무적으로 수급 가능.
+    (FRED series metadata: M2SL)  [oai_citation:3‡FRED](https://fred.stlouisfed.org/data/M2SL?utm_source=chatgpt.com)
+    """
+    url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=M2SL"
+    txt = http_get(url)
+    s = parse_two_col_csv(txt, date_col="DATE", value_col="M2SL")
+    s.name = "US_M2_USD_BIL"
+    # 단위: Billions of Dollars (USD)
+    return s
+
+def fetch_ea_m2_ecb() -> pd.Series:
+    """
+    ECB Data Portal BSI:
+    Monetary aggregate M2, stocks, Euro area, SA
+    Series key: BSI.M.U2.Y.V.M20.X.1.U2.2300.Z01.E  [oai_citation:4‡data.ecb.europa.eu](https://data.ecb.europa.eu/data/datasets/BSI/BSI.M.U2.Y.V.M20.X.1.U2.2300.Z01.E?utm_source=chatgpt.com)
+    API format=csvdata  [oai_citation:5‡data.ecb.europa.eu](https://data.ecb.europa.eu/help/api/data?utm_source=chatgpt.com)
+    """
+    series_key = "BSI.M.U2.Y.V.M20.X.1.U2.2300.Z01.E"
+    url = f"https://data-api.ecb.europa.eu/service/data/BSI/{series_key}?format=csvdata"
+    txt = http_get(url)
+    s = parse_two_col_csv(txt, date_col="TIME_PERIOD", value_col="OBS_VALUE")
+    s.name = "EA_M2_EUR_MIL"
+    # 단위: Millions of Euro
+    return s
+
+def fetch_ecb_exr_monthly(base: str, quote: str = "EUR") -> pd.Series:
+    """
+    ECB EXR 예시에서:
+    https://data-api.ecb.europa.eu/service/data/EXR/M.USD.EUR.SP00.A  [oai_citation:6‡data.ecb.europa.eu](https://data.ecb.europa.eu/help/data-examples?utm_source=chatgpt.com)
+    를 그대로 확장:
+    M.{base}.{quote}.SP00.A (Monthly, spot)
+    반환은 'quote 1단위당 base'로 이해하면 됨.
+    예: base=USD, quote=EUR -> 1 EUR = x USD (EURUSD)
+    """
+    key = f"M.{base}.{quote}.SP00.A"
+    url = f"https://data-api.ecb.europa.eu/service/data/EXR/{key}?format=csvdata"
+    txt = http_get(url)
+    s = parse_two_col_csv(txt, date_col="TIME_PERIOD", value_col="OBS_VALUE")
+    s.name = f"EXR_{base}{quote}"
+    return s
+
+def build_fx_to_usd(ccy: str) -> pd.Series:
+    """
+    ECB EXR을 이용해 (현지통화 -> USD) 월간 환율을 만든다.
+    ECB는 EUR 기준 교차환산이 안정적:
+    - EURUSD = USD per EUR (base=USD, quote=EUR)
+    - EURCCY = CCY per EUR (base=CCY, quote=EUR)
+    그러면 1 CCY = (USD per EUR)/(CCY per EUR) USD
+    """
+    if ccy == "USD":
+        # USD->USD = 1
+        idx = pd.date_range("1990-01-01", pd.Timestamp.today(), freq="MS")
+        return pd.Series(1.0, index=idx, name="FX_USDUSD")
+
+    eurusd = fetch_ecb_exr_monthly("USD", "EUR")  # 1 EUR = x USD
+    eurccy = fetch_ecb_exr_monthly(ccy, "EUR")   # 1 EUR = x CCY
+
+    # align
+    df = pd.concat([eurusd, eurccy], axis=1).dropna()
+    fx = df.iloc[:, 0] / df.iloc[:, 1]
+    fx.name = f"FX_{ccy}USD"
+    return fx
+
+# -------------------------
+# Manual CSV loader (for non-auto countries)
+# -------------------------
+def load_manual_m2(country: str, uploaded_file) -> pd.Series:
+    """
+    업로드 CSV 포맷(권장):
+    date,value  (컬럼명 대소문자 무관)
+    예: 2024-01-31, 4496.02
+    """
+    df = pd.read_csv(uploaded_file)
+    cols = {c.lower(): c for c in df.columns}
+    if "date" not in cols or "value" not in cols:
+        raise ValueError(f"[{country}] CSV must have columns: date,value (case-insensitive). got={list(df.columns)}")
+    dcol, vcol = cols["date"], cols["value"]
+    df[dcol] = pd.to_datetime(df[dcol], errors="coerce")
+    df[vcol] = pd.to_numeric(df[vcol], errors="coerce")
+    df = df.dropna(subset=[dcol]).set_index(dcol).sort_index()
+    s = df[vcol].astype(float)
+    s.name = f"{country}_M2_LOCAL"
+    return s
+
+# -------------------------
+# Standardization + Validation
+# -------------------------
+def to_weekly_last(s: pd.Series) -> pd.Series:
+    # 월간/주간 무엇이든 "주간(W-FRI) last"로 표준화
+    return s.resample(WEEK_RULE).last().ffill()
+
+def validate_series(name: str, s: pd.Series) -> dict:
+    info = {
+        "name": name,
+        "start": None if s.empty else s.index.min().date(),
+        "end": None if s.empty else s.index.max().date(),
+        "n": int(s.shape[0]),
+        "missing_ratio": float(s.isna().mean()) if len(s) else math.nan,
+        "nonpositive_ratio": float((s <= 0).mean()) if len(s) else math.nan,
+        "has_gaps_gt_45d": False,
+    }
+    if len(s) >= 2:
+        gaps = s.index.to_series().diff().dt.days.dropna()
+        info["has_gaps_gt_45d"] = bool((gaps > 45).any())
+    return info
+
+# =========================
+# UI
+# =========================
+st.title("liq | Global M2 (USD) Validator — Core12")
+
+with st.sidebar:
+    st.header("1) Core12 구성")
+    st.caption("Auto 수급: US(FRED), EA(ECB-BSI), FX(ECB-EXR). 나머지는 CSV 업로드로 주입 후 동일 파이프라인에서 검증.")
+    selected = st.multiselect("대상 국가", CORE12, default=CORE12)
+
+    st.header("2) 수동 데이터 업로드(필요 국가만)")
+    uploads = {}
+    for c in selected:
+        # US/EA는 자동 수급이므로 업로드 불필요 (원하면 비교 검증용으로 받게 확장 가능)
+        if c in ("US", "EA"):
+            continue
+        uploads[c] = st.file_uploader(f"{c} M2 CSV (date,value)", type=["csv"], key=f"up_{c}")
+
+    st.header("3) 옵션")
+    use_sa_ea = st.checkbox("EA: Seasonally adjusted(Y) 사용", value=True)
+    st.caption("EA 시리즈는 SA(Y)로 고정 구현. 필요하면 N(비SA)로 바꿔 비교 가능.")
+
+# -------------------------
+# Build dataset
+# -------------------------
+@st.cache_data(show_spinner=False, ttl=6 * 60 * 60)
+def build_all(selected_countries):
+    # M2 raw
+    m2 = {}
+
+    # Auto
+    if "US" in selected_countries:
+        m2["US"] = fetch_us_m2_fred()  # USD billions
+    if "EA" in selected_countries:
+        m2["EA"] = fetch_ea_m2_ecb()   # EUR millions
+
+    # Manual
+    # (파일 업로드는 cache 밖에서 합류시키는 게 안전하지만, 여기선 구조 단순화를 우선)
+    return m2
+
+m2_auto = build_all(tuple(selected))
+
+# Load manual outside cache (because UploadedFile is not hash-stable)
+m2_all = dict(m2_auto)
+manual_errors = []
+for c in selected:
+    if c in ("US", "EA"):
+        continue
+    if uploads.get(c) is None:
+        continue
+    try:
+        m2_all[c] = load_manual_m2(c, uploads[c])
+    except Exception as e:
+        manual_errors.append(str(e))
+
+if manual_errors:
+    st.error("수동 업로드 오류:\n- " + "\n- ".join(manual_errors))
+    st.stop()
+
+# FX build (ECB)
+fx_map = {}
+fx_errors = []
+for c in selected:
+    ccy = CCY[c]
+    try:
+        fx_map[c] = build_fx_to_usd(ccy)  # monthly
+    except Exception as e:
+        fx_errors.append(f"{c}({ccy}) FX build failed: {e}")
+
+if fx_errors:
+    st.error("FX 수급/생성 오류:\n- " + "\n- ".join(fx_errors))
+    st.stop()
+
+# Convert M2 -> USD level
+m2_usd = {}
+meta = []
+
+for c, s in m2_all.items():
+    ccy = CCY[c]
+    fx = fx_map[c]
+
+    # align monthly -> weekly (convert after aligning in time)
+    s_w = to_weekly_last(s)
+
+    if c == "US":
+        # US already USD billions
+        usd = s_w * 1e9
+        unit_note = "FRED M2SL: Billions USD"
+    elif c == "EA":
+        # ECB: Millions EUR -> EUR -> USD
+        # EUR millions * 1e6 * (EUR->USD)
+        fx_w = to_weekly_last(fx)
+        usd = (s_w * 1e6) * fx_w
+        unit_note = "ECB BSI: Millions EUR"
+    else:
+        # Manual: assume "local currency units" (you must ensure the CSV unit is consistent with official series)
+        fx_w = to_weekly_last(fx)
+        usd = s_w * fx_w
+        unit_note = "Manual CSV: local currency unit (as provided)"
+
+    usd.name = f"{c}_M2_USD"
+    m2_usd[c] = usd
+
+    meta.append({
+        "country": c,
+        "ccy": ccy,
+        "m2_unit": unit_note,
+        "m2_start": None if s_w.empty else s_w.index.min().date(),
+        "m2_end": None if s_w.empty else s_w.index.max().date(),
+        "fx_start": None if fx.empty else fx.index.min().date(),
+        "fx_end": None if fx.empty else fx.index.max().date(),
+    })
+
+# Global sum
+df_usd = pd.concat(m2_usd.values(), axis=1).sort_index()
+global_m2 = df_usd.sum(axis=1, min_count=1)
+global_m2.name = "GLOBAL_M2_USD"
+
+# Validations
+val_rows = []
+for c, s in m2_usd.items():
+    val = validate_series(s.name, s)
+    val["country"] = c
+    val_rows.append(val)
+
+val_df = pd.DataFrame(val_rows).set_index("country")
+
+# =========================
+# Display
+# =========================
+c1, c2 = st.columns([2, 1], gap="large")
+
+with c1:
+    st.subheader("A) Global M2 (USD) — Weekly (W-FRI)")
+    st.line_chart(global_m2)
+
+    st.subheader("B) Components (USD) — Weekly (W-FRI)")
+    st.line_chart(df_usd)
+
+with c2:
+    st.subheader("C) Data/FX coverage")
+    st.dataframe(pd.DataFrame(meta))
+
+    st.subheader("D) Sanity checks")
+    st.dataframe(val_df)
+
+st.subheader("E) Export (for integration)")
+export_df = pd.concat([global_m2, df_usd], axis=1)
+csv = export_df.dropna(how="all").to_csv(index=True).encode("utf-8-sig")
+st.download_button("Download weekly_global_m2_usd.csv", data=csv, file_name="weekly_global_m2_usd.csv", mime="text/csv")
+
+st.caption(
+    "주의: US/EA는 자동 수급이지만, 나머지 국가는 CSV 단위/정의(M2 구성, SA/NSA, 월말잔액/평잔 등)를 "
+    "공식 통계 기준으로 맞춰 넣어야 합니다. 이 앱은 파이프라인(환산/리샘플/합산/검증)을 고정해 재현성을 확보합니다."
 )
-
-# ---------------------------
-# Fancy CSS (Kid-friendly)
-# ---------------------------
-APP_CSS = """
-<style>
-/* 전체 배경 */
-[data-testid="stAppViewContainer"]{
-  background: radial-gradient(circle at 20% 10%, rgba(255,182,193,.35), transparent 45%),
-              radial-gradient(circle at 90% 20%, rgba(135,206,235,.35), transparent 45%),
-              radial-gradient(circle at 40% 90%, rgba(255,255,153,.30), transparent 45%),
-              linear-gradient(180deg, #fff7fb 0%, #f6fbff 45%, #fffdf6 100%);
-}
-
-/* 사이드바 */
-[data-testid="stSidebar"]{
-  background: linear-gradient(180deg, rgba(255,255,255,.85), rgba(255,255,255,.75));
-  border-right: 1px solid rgba(0,0,0,.06);
-  backdrop-filter: blur(8px);
-}
-
-/* 타이틀 */
-h1, h2, h3{
-  letter-spacing: -0.5px;
-}
-.kid-card{
-  background: rgba(255,255,255,.85);
-  border: 1px solid rgba(0,0,0,.06);
-  border-radius: 18px;
-  box-shadow: 0 10px 24px rgba(0,0,0,.06);
-  padding: 18px 18px;
-}
-.kid-badge{
-  display:inline-block;
-  padding: 6px 10px;
-  border-radius: 999px;
-  background: rgba(255,255,255,.9);
-  border: 1px solid rgba(0,0,0,.06);
-  font-size: 12px;
-}
-hr{
-  border: none;
-  height: 1px;
-  background: rgba(0,0,0,.08);
-  margin: 8px 0 16px 0;
-}
-.small-muted{
-  color: rgba(0,0,0,.55);
-  font-size: 13px;
-}
-
-/* 버튼 살짝 큼직하게 */
-.stButton button, .stDownloadButton button{
-  border-radius: 14px !important;
-  padding: 10px 14px !important;
-  border: 1px solid rgba(0,0,0,.10) !important;
-  box-shadow: 0 8px 18px rgba(0,0,0,.06) !important;
-}
-
-/* expander */
-.streamlit-expanderHeader{
-  font-weight: 650;
-}
-</style>
-"""
-st.markdown(APP_CSS, unsafe_allow_html=True)
-
-# ---------------------------
-# Helpers
-# ---------------------------
-def hex_to_rgb(hex_color: str):
-    hex_color = hex_color.strip().lstrip("#")
-    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
-
-def clamp(v, a=0, b=255):
-    return max(a, min(b, v))
-
-def load_font(font_size: int):
-    # 선택: assets/fonts/*.ttf 있으면 사용, 없으면 기본 폰트
-    candidates = [
-        os.path.join("assets", "fonts", "NanumGothic.ttf"),
-        os.path.join("assets", "fonts", "NanumGothicBold.ttf"),
-        os.path.join("assets", "fonts", "Pretendard-Regular.ttf"),
-    ]
-    for fp in candidates:
-        if os.path.exists(fp):
-            try:
-                return ImageFont.truetype(fp, font_size)
-            except Exception:
-                pass
-    return ImageFont.load_default()
-
-@st.cache_data(show_spinner=False)
-def load_base_image(image_path: str):
-    img = Image.open(image_path).convert("RGBA")
-    return img
-
-def make_linear_gradient(size, c1, c2, direction="top-bottom"):
-    w, h = size
-    grad = Image.new("RGBA", (w, h))
-    draw = ImageDraw.Draw(grad)
-
-    # direction에 따라 보간축 결정
-    # t: 0~1
-    if direction == "top-bottom":
-        for y in range(h):
-            t = y / max(1, (h - 1))
-            r = int(c1[0] + (c2[0] - c1[0]) * t)
-            g = int(c1[1] + (c2[1] - c1[1]) * t)
-            b = int(c1[2] + (c2[2] - c1[2]) * t)
-            draw.line([(0, y), (w, y)], fill=(r, g, b, 255))
-    elif direction == "left-right":
-        for x in range(w):
-            t = x / max(1, (w - 1))
-            r = int(c1[0] + (c2[0] - c1[0]) * t)
-            g = int(c1[1] + (c2[1] - c1[1]) * t)
-            b = int(c1[2] + (c2[2] - c1[2]) * t)
-            draw.line([(x, 0), (x, h)], fill=(r, g, b, 255))
-    elif direction == "diag":
-        # 대각선 보간: (x+y)/(w+h)
-        for y in range(h):
-            for x in range(w):
-                t = (x + y) / max(1, (w + h - 2))
-                r = int(c1[0] + (c2[0] - c1[0]) * t)
-                g = int(c1[1] + (c2[1] - c1[1]) * t)
-                b = int(c1[2] + (c2[2] - c1[2]) * t)
-                grad.putpixel((x, y), (r, g, b, 255))
-    else:
-        # default
-        return make_linear_gradient(size, c1, c2, "top-bottom")
-
-    return grad
-
-def make_radial_gradient(size, c1, c2, center=(0.5, 0.4)):
-    w, h = size
-    cx, cy = center
-    cx *= w
-    cy *= h
-    max_r = math.sqrt(max(cx, w-cx)**2 + max(cy, h-cy)**2)
-
-    grad = Image.new("RGBA", (w, h))
-    for y in range(h):
-        for x in range(w):
-            r = math.sqrt((x - cx)**2 + (y - cy)**2)
-            t = min(1.0, r / max_r)
-            rr = int(c1[0] + (c2[0] - c1[0]) * t)
-            gg = int(c1[1] + (c2[1] - c1[1]) * t)
-            bb = int(c1[2] + (c2[2] - c1[2]) * t)
-            grad.putpixel((x, y), (rr, gg, bb, 255))
-    return grad
-
-def apply_gradient(img_rgba: Image.Image, color1_hex: str, color2_hex: str, mode="multiply", direction="top-bottom", radial=False):
-    """디저트 질감을 살리면서 컬러를 입힘"""
-    c1 = hex_to_rgb(color1_hex)
-    c2 = hex_to_rgb(color2_hex)
-
-    w, h = img_rgba.size
-    if radial:
-        grad = make_radial_gradient((w, h), c1, c2)
-    else:
-        grad = make_linear_gradient((w, h), c1, c2, direction=direction)
-
-    if mode == "multiply":
-        colored = ImageChops.multiply(img_rgba, grad)
-    elif mode == "screen":
-        colored = ImageChops.screen(img_rgba, grad)
-    elif mode == "overlay":
-        # 간단 overlay 근사: (multiply + screen)/2
-        colored = Image.blend(ImageChops.multiply(img_rgba, grad), ImageChops.screen(img_rgba, grad), 0.5)
-    else:
-        colored = ImageChops.multiply(img_rgba, grad)
-
-    out = Image.new("RGBA", img_rgba.size)
-    out.paste(colored, (0, 0), mask=img_rgba.split()[-1])  # alpha 유지
-    return out
-
-def add_outline(img: Image.Image, outline_width=6, outline_color=(255, 255, 255, 255)):
-    alpha = img.split()[-1]
-    # 팽창(blur)로 외곽선 생성
-    expanded = alpha.filter(ImageFilter.MaxFilter(size=max(3, outline_width*2+1)))
-    outline = Image.new("RGBA", img.size, outline_color)
-    outline.putalpha(expanded)
-    # 원본 알파 영역 제외해서 테두리만
-    outline_only = ImageChops.subtract(outline, Image.new("RGBA", img.size, (0,0,0,0)).putalpha(alpha) if False else outline)
-    # 위 라인이 PIL에서 불편하므로 더 안전한 방식:
-    # outline_only = outline - (outline masked by original alpha)
-    mask_orig = Image.new("L", img.size, 0)
-    mask_orig.paste(alpha, (0, 0))
-    outline_mask = ImageChops.subtract(expanded, mask_orig)  # expanded - original
-    outline_only = Image.new("RGBA", img.size, outline_color)
-    outline_only.putalpha(outline_mask)
-    return Image.alpha_composite(outline_only, img)
-
-def add_drop_shadow(img: Image.Image, offset=(10, 14), blur=18, shadow_color=(0, 0, 0, 120)):
-    w, h = img.size
-    shadow = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    alpha = img.split()[-1]
-    shadow_layer = Image.new("RGBA", (w, h), shadow_color)
-    shadow_layer.putalpha(alpha)
-    shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(blur))
-
-    base = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    base.alpha_composite(shadow_layer, dest=offset)
-    base.alpha_composite(img, dest=(0, 0))
-    return base
-
-def sprinkle_layer(size, density=120, seed=42, palette=None, min_len=6, max_len=18, width=3, alpha=210):
-    """스프링클/별가루 레이어 생성"""
-    w, h = size
-    rnd = random.Random(seed)
-
-    if palette is None:
-        palette = [
-            (255, 182, 193), (135, 206, 235), (255, 255, 153),
-            (186, 255, 201), (221, 160, 221), (255, 215, 0)
-        ]
-
-    layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(layer)
-
-    for _ in range(density):
-        x = rnd.randint(0, w-1)
-        y = rnd.randint(0, h-1)
-        c = palette[rnd.randint(0, len(palette)-1)]
-        c = (c[0], c[1], c[2], alpha)
-
-        kind = rnd.choice(["line", "dot", "star"])
-        if kind == "dot":
-            r = rnd.randint(2, 5)
-            draw.ellipse((x-r, y-r, x+r, y+r), fill=c)
-        elif kind == "line":
-            L = rnd.randint(min_len, max_len)
-            ang = rnd.random() * math.pi
-            x2 = int(x + L * math.cos(ang))
-            y2 = int(y + L * math.sin(ang))
-            draw.line((x, y, x2, y2), fill=c, width=width)
-        else:  # star
-            r = rnd.randint(6, 12)
-            pts = []
-            for k in range(10):
-                rr = r if k % 2 == 0 else r * 0.45
-                a = (math.pi/5) * k
-                pts.append((x + rr*math.cos(a), y + rr*math.sin(a)))
-            draw.polygon(pts, fill=c)
-
-    return layer
-
-def make_sticker(kind="star", size=(220, 220), fill=(255, 255, 255, 230), stroke=(0,0,0,80), stroke_w=6):
-    """기본 도형 스티커 생성"""
-    w, h = size
-    img = Image.new("RGBA", (w, h), (0,0,0,0))
-    d = ImageDraw.Draw(img)
-
-    if kind == "star":
-        cx, cy = w//2, h//2
-        R = min(w, h)*0.40
-        r = R*0.45
-        pts = []
-        for k in range(10):
-            rr = R if k % 2 == 0 else r
-            a = -math.pi/2 + k*(math.pi/5)
-            pts.append((cx + rr*math.cos(a), cy + rr*math.sin(a)))
-        d.polygon(pts, fill=fill, outline=stroke)
-    elif kind == "heart":
-        # 간단 하트
-        cx, cy = w//2, h//2
-        s = min(w,h)*0.34
-        pts = []
-        for t in [i/200 for i in range(0, 201)]:
-            x = 16*math.sin(t*math.pi*2)**3
-            y = 13*math.cos(t*math.pi*2) - 5*math.cos(2*t*math.pi*2) - 2*math.cos(3*t*math.pi*2) - math.cos(4*t*math.pi*2)
-            pts.append((cx + x*s/18, cy - y*s/18))
-        d.polygon(pts, fill=fill, outline=stroke)
-    elif kind == "rainbow":
-        # 무지개 아치
-        pad = int(min(w,h)*0.10)
-        bbox = (pad, pad, w-pad, h-pad)
-        bands = [
-            (255, 99, 132, 220),
-            (255, 159, 64, 220),
-            (255, 205, 86, 220),
-            (75, 192, 192, 220),
-            (54, 162, 235, 220),
-            (153, 102, 255, 220),
-        ]
-        thick = int(min(w,h)*0.10)
-        for i, col in enumerate(bands):
-            bb = (bbox[0]+i*thick//3, bbox[1]+i*thick//3, bbox[2]-i*thick//3, bbox[3]-i*thick//3)
-            d.arc(bb, start=200, end=340, fill=col, width=thick)
-        # 구름
-        cloud = (255,255,255,240)
-        for dx in [-40, 40]:
-            x0 = w//2 + dx - 60
-            y0 = h//2 + 40
-            d.ellipse((x0, y0, x0+110, y0+70), fill=cloud)
-            d.ellipse((x0+25, y0-20, x0+95, y0+55), fill=cloud)
-    else:
-        d.rounded_rectangle((20, 20, w-20, h-20), radius=28, fill=fill, outline=stroke, width=stroke_w)
-
-    # 외곽선 두껍게 느낌
-    if stroke_w > 0:
-        img = img.filter(ImageFilter.GaussianBlur(0.2))
-    return img
-
-def paste_centered(base: Image.Image, overlay: Image.Image, center_xy, scale=1.0, rotation=0):
-    ov = overlay.copy()
-    if scale != 1.0:
-        nw = max(1, int(ov.size[0] * scale))
-        nh = max(1, int(ov.size[1] * scale))
-        ov = ov.resize((nw, nh), resample=Image.Resampling.LANCZOS)
-
-    if rotation != 0:
-        ov = ov.rotate(rotation, expand=True, resample=Image.Resampling.BICUBIC)
-
-    x = int(center_xy[0] - ov.size[0] / 2)
-    y = int(center_xy[1] - ov.size[1] / 2)
-    base.alpha_composite(ov, dest=(x, y))
-    return base
-
-def add_text_label(img: Image.Image, text: str, pos=("center", "bottom"), font_size=48,
-                   fill=(30,30,30,255), stroke_fill=(255,255,255,230), stroke_w=4,
-                   pad=16, bubble=True):
-    if not text.strip():
-        return img
-
-    w, h = img.size
-    font = load_font(font_size)
-    draw = ImageDraw.Draw(img)
-
-    # 텍스트 박스 크기
-    bbox = draw.textbbox((0,0), text, font=font, stroke_width=stroke_w)
-    tw = bbox[2] - bbox[0]
-    th = bbox[3] - bbox[1]
-
-    # 위치 계산
-    if pos[0] == "left":
-        x = int(0.08*w)
-    elif pos[0] == "right":
-        x = int(0.92*w - tw)
-    else:
-        x = int((w - tw) / 2)
-
-    if pos[1] == "top":
-        y = int(0.06*h)
-    elif pos[1] == "center":
-        y = int((h - th) / 2)
-    else:
-        y = int(0.90*h - th)
-
-    # 말풍선/라벨 배경
-    if bubble:
-        bx0 = x - pad
-        by0 = y - pad
-        bx1 = x + tw + pad
-        by1 = y + th + pad
-        bubble_bg = Image.new("RGBA", img.size, (0,0,0,0))
-        bd = ImageDraw.Draw(bubble_bg)
-        bd.rounded_rectangle((bx0, by0, bx1, by1), radius=18, fill=(255,255,255,210), outline=(0,0,0,50), width=2)
-        bubble_bg = bubble_bg.filter(ImageFilter.GaussianBlur(0.4))
-        img = Image.alpha_composite(img, bubble_bg)
-        draw = ImageDraw.Draw(img)
-
-    draw.text((x, y), text, font=font, fill=fill, stroke_fill=stroke_fill, stroke_width=stroke_w)
-    return img
-
-def export_png_bytes(img: Image.Image):
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
-
-def safe_filename(s: str):
-    return "".join(ch for ch in s if ch.isalnum() or ch in ("_", "-", "."))[:80]
-
-# ---------------------------
-# Assets
-# ---------------------------
-dessert_options = {
-    "아이스크림": "icecream.png",
-    "빙수": "shaved_ice.png",
-    "젤리빈": "jellybean.png",
-    "마카롱": "macaron.png",
-    "쿠키": "cookie.png",
-}
-
-# ---------------------------
-# Session State
-# ---------------------------
-if "gallery" not in st.session_state:
-    st.session_state.gallery = []  # list of dict: {name, meta, bytes, ts}
-
-if "seed" not in st.session_state:
-    st.session_state.seed = 42
-
-# ---------------------------
-# Header
-# ---------------------------
-left, right = st.columns([3, 2], vertical_alignment="center")
-with left:
-    st.markdown(
-        """
-        <div class="kid-card">
-          <div class="kid-badge">🍭 Rainbow Dessert Studio</div>
-          <h1 style="margin: 10px 0 4px 0;">무지개 디저트 공방</h1>
-          <div class="small-muted">색을 고르고, 토핑을 뿌리고, 스티커와 글자를 붙여서 나만의 디저트를 완성해보세요.</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-with right:
-    st.markdown(
-        """
-        <div class="kid-card">
-          <div class="kid-badge">팁</div>
-          <div class="small-muted" style="margin-top:8px;">
-            1) 그라데이션 모드는 Multiply가 질감이 가장 자연스럽습니다.<br/>
-            2) 스프링클 밀도를 올리면 더 화려해집니다.<br/>
-            3) 작품은 아래 갤러리에 저장할 수 있습니다.
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-st.write("")
-st.divider()
-
-# ---------------------------
-# Sidebar Controls
-# ---------------------------
-st.sidebar.header("🎨 디자인 센터")
-
-# Step selector
-step = st.sidebar.radio(
-    "꾸미기 단계",
-    ["1) 디저트 선택", "2) 색(그라데이션)", "3) 토핑(스프링클)", "4) 스티커 & 글자", "5) 저장 & 내보내기"],
-)
-
-st.sidebar.divider()
-
-# Common: Dessert selection
-selected_name = st.sidebar.selectbox("디저트를 골라보세요", list(dessert_options.keys()))
-image_filename = dessert_options[selected_name]
-image_path = os.path.join("assets", image_filename)
-
-# Random recipe button
-if st.sidebar.button("🎲 랜덤 레시피 뽑기"):
-    st.session_state.seed = random.randint(1, 999999)
-    st.sidebar.success("랜덤 레시피를 적용했습니다. 아래 옵션을 확인해보세요.")
-
-# Color presets
-preset_palettes = {
-    "핑크-하늘": ("#FFB6C1", "#87CEEB"),
-    "레몬-민트": ("#FFF59D", "#A7FFEB"),
-    "라벤더-피치": ("#C7B8FF", "#FFD1A6"),
-    "딸기-바나나": ("#FF8FA3", "#FFE082"),
-    "초코-크림": ("#A1887F", "#FFF3E0"),
-}
-
-st.sidebar.subheader("🌈 색상")
-preset = st.sidebar.selectbox("팔레트 프리셋", ["직접 선택"] + list(preset_palettes.keys()))
-if preset != "직접 선택":
-    default_top, default_bottom = preset_palettes[preset]
-else:
-    default_top, default_bottom = "#FFB6C1", "#87CEEB"
-
-color_top = st.sidebar.color_picker("윗부분 색상", default_top)
-color_bottom = st.sidebar.color_picker("아랫부분 색상", default_bottom)
-
-with st.sidebar.expander("고급 색 옵션", expanded=False):
-    gradient_mode = st.selectbox("합성 모드", ["multiply", "overlay", "screen"], index=0)
-    gradient_direction = st.selectbox("방향", ["top-bottom", "left-right", "diag"], index=0)
-    radial = st.checkbox("라디얼(원형) 그라데이션", value=False)
-
-st.sidebar.subheader("✨ 꾸미기")
-with st.sidebar.expander("외곽선/그림자/프레임", expanded=False):
-    use_shadow = st.checkbox("그림자", value=True)
-    shadow_blur = st.slider("그림자 블러", 0, 40, 18, 1)
-    shadow_dx = st.slider("그림자 X", -30, 30, 10, 1)
-    shadow_dy = st.slider("그림자 Y", -30, 30, 14, 1)
-
-    use_outline = st.checkbox("하이라이트 외곽선", value=True)
-    outline_w = st.slider("외곽선 두께", 0, 20, 6, 1)
-    outline_col = st.color_picker("외곽선 색", "#FFFFFF")
-
-    use_frame = st.checkbox("액자 프레임", value=False)
-    frame_thick = st.slider("프레임 두께", 10, 120, 50, 2)
-    frame_col = st.color_picker("프레임 색", "#FFFFFF")
-
-with st.sidebar.expander("토핑(스프링클)", expanded=False):
-    sprinkles_on = st.checkbox("스프링클 뿌리기", value=True)
-    sprinkles_density = st.slider("밀도", 0, 600, 180, 10)
-    sprinkles_alpha = st.slider("투명도", 50, 255, 210, 5)
-    sprinkles_size = st.slider("크기감(선 두께)", 1, 8, 3, 1)
-    sprinkles_seed = st.number_input("랜덤 시드", min_value=1, max_value=999999, value=int(st.session_state.seed), step=1)
-
-with st.sidebar.expander("스티커 & 글자", expanded=False):
-    sticker_kind = st.selectbox("기본 스티커", ["없음", "star", "heart", "rainbow"], index=1)
-    sticker_scale = st.slider("스티커 크기", 0.3, 2.2, 1.0, 0.05)
-    sticker_rot = st.slider("스티커 회전", -180, 180, 0, 5)
-    sticker_x = st.slider("스티커 위치 X", 0, 100, 75, 1)  # %
-    sticker_y = st.slider("스티커 위치 Y", 0, 100, 20, 1)  # %
-    uploaded_sticker = st.file_uploader("내 스티커 PNG 업로드(투명 배경)", type=["png"])
-
-    label_text = st.text_input("작품 이름/메시지", value=f"내 {selected_name}!")
-    label_pos_x = st.selectbox("글자 위치(좌우)", ["center", "left", "right"], index=0)
-    label_pos_y = st.selectbox("글자 위치(상하)", ["bottom", "top", "center"], index=0)
-    label_font = st.slider("글자 크기", 16, 96, 44, 2)
-    label_color = st.color_picker("글자 색", "#1E1E1E")
-    label_outline = st.checkbox("글자 테두리", value=True)
-    label_bubble = st.checkbox("말풍선 배경", value=True)
-
-st.sidebar.divider()
-
-with st.sidebar.expander("내보내기", expanded=False):
-    export_scale = st.slider("내보내기 해상도 배율", 1, 3, 2, 1)
-    include_recipe = st.checkbox("레시피 카드 포함(ZIP)", value=True)
-
-# ---------------------------
-# Build Image Pipeline
-# ---------------------------
-def render_dessert():
-    if not os.path.exists(image_path):
-        # 자산이 없을 때: 임시 플레이스홀더 생성
-        ph = Image.new("RGBA", (900, 700), (255, 255, 255, 0))
-        d = ImageDraw.Draw(ph)
-        d.rounded_rectangle((120, 120, 780, 580), radius=60, fill=(255,255,255,220), outline=(0,0,0,30), width=3)
-        d.text((160, 320), "assets 폴더에\n디저트 PNG가 필요해요.", fill=(0,0,0,180), font=load_font(36))
-        base = ph
-    else:
-        base = load_base_image(image_path)
-
-    # 1) Gradient
-    out = apply_gradient(
-        base,
-        color_top,
-        color_bottom,
-        mode=gradient_mode,
-        direction=gradient_direction,
-        radial=radial
-    )
-
-    # 2) Outline
-    if use_outline and outline_w > 0:
-        oc = hex_to_rgb(outline_col) + (255,)
-        out = add_outline(out, outline_width=outline_w, outline_color=oc)
-
-    # 3) Sprinkles (only on opaque regions)
-    if sprinkles_on and sprinkles_density > 0:
-        pal = [hex_to_rgb(color_top), hex_to_rgb(color_bottom), (255,255,153), (186,255,201), (221,160,221), (255,215,0)]
-        sp = sprinkle_layer(out.size, density=sprinkles_density, seed=int(sprinkles_seed),
-                            palette=pal, width=int(sprinkles_size), alpha=int(sprinkles_alpha))
-        # 알파 영역에만 스프링클 보이도록 마스킹
-        alpha = out.split()[-1]
-        sp.putalpha(ImageChops.multiply(sp.split()[-1], alpha))
-        out = Image.alpha_composite(out, sp)
-
-    # 4) Sticker
-    if uploaded_sticker is not None:
-        try:
-            st_img = Image.open(uploaded_sticker).convert("RGBA")
-        except Exception:
-            st_img = None
-    else:
-        st_img = None
-
-    if sticker_kind != "없음" or st_img is not None:
-        if st_img is None:
-            st_img = make_sticker(kind=sticker_kind, size=(240, 240), fill=(255,255,255,235), stroke=(0,0,0,70), stroke_w=6)
-
-        cx = int(out.size[0] * (sticker_x / 100))
-        cy = int(out.size[1] * (sticker_y / 100))
-        out = paste_centered(out, st_img, (cx, cy), scale=float(sticker_scale), rotation=int(sticker_rot))
-
-    # 5) Text label
-    fill = hex_to_rgb(label_color) + (255,)
-    stroke_fill = (255,255,255,230) if label_outline else None
-    out = add_text_label(
-        out,
-        text=label_text,
-        pos=(label_pos_x, label_pos_y),
-        font_size=int(label_font),
-        fill=fill,
-        stroke_fill=stroke_fill if stroke_fill else (0,0,0,0),
-        stroke_w=4 if label_outline else 0,
-        bubble=bool(label_bubble),
-    )
-
-    # 6) Shadow (마지막에)
-    if use_shadow:
-        out = add_drop_shadow(out, offset=(int(shadow_dx), int(shadow_dy)), blur=int(shadow_blur), shadow_color=(0,0,0,120))
-
-    # 7) Frame (마지막 장식)
-    if use_frame:
-        w, h = out.size
-        fr = Image.new("RGBA", (w + frame_thick*2, h + frame_thick*2), (0,0,0,0))
-        d = ImageDraw.Draw(fr)
-        fc = hex_to_rgb(frame_col) + (255,)
-        d.rounded_rectangle((0,0, fr.size[0]-1, fr.size[1]-1), radius=28, fill=fc, outline=(0,0,0,30), width=3)
-        fr.alpha_composite(out, dest=(frame_thick, frame_thick))
-        out = fr
-
-    return out
-
-result_img = render_dessert()
-
-# ---------------------------
-# Main Layout
-# ---------------------------
-colA, colB = st.columns([3.2, 1.8], gap="large")
-
-with colA:
-    st.markdown('<div class="kid-card">', unsafe_allow_html=True)
-    st.subheader("🍰 미리보기")
-    st.image(result_img, use_container_width=True)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-with colB:
-    st.markdown('<div class="kid-card">', unsafe_allow_html=True)
-    st.subheader("🧾 나의 레시피 카드")
-
-    st.write(f"- **디저트:** {selected_name}")
-    st.write(f"- **그라데이션:** {color_top} → {color_bottom} ({'라디얼' if radial else gradient_direction}, {gradient_mode})")
-    st.write(f"- **스프링클:** {'ON' if sprinkles_on else 'OFF'} / 밀도 {sprinkles_density} / 시드 {sprinkles_seed}")
-    st.write(f"- **스티커:** {'업로드' if uploaded_sticker else sticker_kind}")
-    st.write(f"- **텍스트:** {label_text}")
-
-    st.write("적용된 그라데이션 미리보기:")
-    st.markdown(
-        f"""
-        <div style="
-            width: 100%;
-            height: 68px;
-            border-radius: 16px;
-            background: linear-gradient(to bottom, {color_top}, {color_bottom});
-            border: 1px solid rgba(0,0,0,.08);
-            box-shadow: 0 8px 18px rgba(0,0,0,.06);
-        "></div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    st.divider()
-
-    # 다운로드(단일)
-    export_img = result_img
-    if export_scale != 1:
-        export_img = export_img.resize(
-            (export_img.size[0]*export_scale, export_img.size[1]*export_scale),
-            resample=Image.Resampling.LANCZOS
-        )
-
-    out_bytes = export_png_bytes(export_img)
-    st.download_button(
-        label="🖼️ PNG 저장하기",
-        data=out_bytes,
-        file_name=f"my_{safe_filename(selected_name)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-        mime="image/png",
-        use_container_width=True
-    )
-
-    # 저장(갤러리)
-    if st.button("⭐ 내 갤러리에 저장", use_container_width=True):
-        st.session_state.gallery.append({
-            "name": label_text.strip() if label_text.strip() else f"내 {selected_name}",
-            "dessert": selected_name,
-            "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "meta": {
-                "top": color_top,
-                "bottom": color_bottom,
-                "mode": gradient_mode,
-                "direction": gradient_direction,
-                "radial": radial,
-                "sprinkles": sprinkles_on,
-                "sprinkles_density": sprinkles_density,
-                "sprinkles_seed": int(sprinkles_seed),
-                "sticker": "uploaded" if uploaded_sticker else sticker_kind,
-            },
-            "png": export_png_bytes(result_img)  # 원본 크기 저장
-        })
-        st.balloons()
-        st.success("갤러리에 저장했습니다.")
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-st.write("")
-st.divider()
-
-# ---------------------------
-# Gallery Section
-# ---------------------------
-st.markdown('<div class="kid-card">', unsafe_allow_html=True)
-st.subheader("🖼️ 내 작품 갤러리")
-
-if len(st.session_state.gallery) == 0:
-    st.info("아직 저장된 작품이 없습니다. 위에서 ‘내 갤러리에 저장’을 눌러보세요.")
-else:
-    # ZIP 다운로드 준비
-    if include_recipe:
-        # 레시피 텍스트도 함께
-        pass
-
-    zip_buf = io.BytesIO()
-    with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for i, item in enumerate(st.session_state.gallery, start=1):
-            base_name = safe_filename(item["name"]) or f"dessert_{i}"
-            zf.writestr(f"{i:02d}_{base_name}.png", item["png"])
-
-            if include_recipe:
-                meta = item["meta"]
-                recipe_txt = (
-                    f"작품명: {item['name']}\n"
-                    f"디저트: {item['dessert']}\n"
-                    f"저장시간: {item['ts']}\n"
-                    f"그라데이션: {meta['top']} -> {meta['bottom']}\n"
-                    f"모드: {meta['mode']}\n"
-                    f"방향: {meta['direction']}\n"
-                    f"라디얼: {meta['radial']}\n"
-                    f"스프링클: {meta['sprinkles']} / 밀도 {meta['sprinkles_density']} / 시드 {meta['sprinkles_seed']}\n"
-                    f"스티커: {meta['sticker']}\n"
-                )
-                zf.writestr(f"{i:02d}_{base_name}_recipe.txt", recipe_txt)
-
-    st.download_button(
-        label="📦 갤러리 ZIP 다운로드",
-        data=zip_buf.getvalue(),
-        file_name=f"dessert_gallery_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
-        mime="application/zip",
-        use_container_width=False
-    )
-
-    # 썸네일 표시
-    cols = st.columns(4)
-    for idx, item in enumerate(reversed(st.session_state.gallery)):
-        c = cols[idx % 4]
-        with c:
-            img = Image.open(io.BytesIO(item["png"])).convert("RGBA")
-            st.image(img, use_container_width=True)
-            st.caption(f"{item['name']}  ({item['ts']})")
-            st.download_button(
-                label="PNG 받기",
-                data=item["png"],
-                file_name=f"{safe_filename(item['name'])}.png",
-                mime="image/png",
-                key=f"dl_{idx}"
-            )
-
-    st.write("")
-    if st.button("🧹 갤러리 비우기"):
-        st.session_state.gallery = []
-        st.success("갤러리를 비웠습니다.")
-
-st.markdown("</div>", unsafe_allow_html=True)
