@@ -1,5 +1,5 @@
 # streamlit_app.py
-# liq | Global Liquidity Validator (Core12) + One-click ZIP export
+# liq | US+EA Liquidity Validator (M2 unified) | 2010+ only | One-click ZIP export
 #
 # pip install streamlit pandas numpy requests
 # streamlit run streamlit_app.py
@@ -9,7 +9,6 @@ import json
 import zipfile
 from io import BytesIO
 from datetime import datetime, timezone
-from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -17,31 +16,16 @@ import requests
 import streamlit as st
 
 # =========================
-# App Config
+# Fixed policy (as requested)
 # =========================
-st.set_page_config(page_title="liq | Global Liquidity Validator", layout="wide")
-
 WEEK_RULE = "W-FRI"
+CLIP_START = pd.Timestamp("2010-01-01")
 
-CORE12 = ["US", "EA", "CA", "CH", "JP", "CN", "GB", "AU", "IN", "KR", "BR", "MX"]
+# EA: M2 series key (ECB BSI)
+EA_M2_KEY = "BSI.M.U2.Y.V.M20.X.1.U2.2300.Z01.E"  # M2
+# US: FRED M2SL (billions USD)
 
-CCY = {
-    "US": "USD",
-    "EA": "EUR",
-    "CA": "CAD",
-    "CH": "CHF",
-    "JP": "JPY",
-    "CN": "CNY",
-    "GB": "GBP",
-    "AU": "AUD",
-    "IN": "INR",
-    "KR": "KRW",
-    "BR": "BRL",
-    "MX": "MXN",
-}
-
-AUTO_COUNTRIES = {"US", "EA", "CA"}
-BOC_GROUP_DEFAULT = "ATABLE_MONETARY_AGGREGATES"
+st.set_page_config(page_title="liq | US+EA (M2) 2010+", layout="wide")
 
 
 # =========================
@@ -70,173 +54,23 @@ def parse_two_col_csv(text: str, date_candidates=("DATE", "TIME_PERIOD"), value_
     return out[value_col].astype(float)
 
 
+def clip_2010(s: pd.Series) -> pd.Series:
+    if s is None or s.empty:
+        return pd.Series(dtype=float)
+    return s.loc[s.index >= CLIP_START].copy()
+
+
 def to_weekly_last_ffill(s: pd.Series) -> pd.Series:
     if s is None or s.empty:
         return pd.Series(dtype=float)
     return s.sort_index().resample(WEEK_RULE).last().ffill()
 
 
-# =========================
-# FX via ECB (cross through EUR)
-# =========================
-@st.cache_data(show_spinner=False, ttl=6 * 60 * 60)
-def fetch_ecb_exr_monthly(base: str, quote: str = "EUR") -> pd.Series:
-    """
-    ECB EXR key:
-      M.{base}.{quote}.SP00.A
-    Example:
-      M.USD.EUR.SP00.A = USD per EUR (EURUSD)
-      M.CAD.EUR.SP00.A = CAD per EUR (EURCAD)
-    """
-    key = f"M.{base}.{quote}.SP00.A"
-    url = f"https://data-api.ecb.europa.eu/service/data/EXR/{key}"
-    txt = http_get(url, params={"format": "csvdata"}).text
-    s = parse_two_col_csv(txt, date_candidates=("TIME_PERIOD",), value_candidates=("OBS_VALUE",))
-    s.name = f"EXR_{base}{quote}"
-    return s
+def multiply_with_fx_aligned(local_weekly: pd.Series, fx_weekly: pd.Series) -> pd.Series:
+    fx_aligned = fx_weekly.reindex(local_weekly.index).ffill()
+    return local_weekly * fx_aligned
 
 
-@st.cache_data(show_spinner=False, ttl=6 * 60 * 60)
-def fx_to_usd_monthly(ccy: str) -> pd.Series:
-    """
-    Return FX_{ccy}USD = USD per 1 CCY.
-
-    - USD: 1.0
-    - EUR: use EURUSD directly (USD per EUR) => EXR M.USD.EUR...
-    - Others: cross via EUR => (EURUSD)/(EURLCY) = (USD per EUR)/(CCY per EUR) = USD per CCY
-    """
-    if ccy == "USD":
-        idx = pd.date_range("1990-01-01", pd.Timestamp.today().normalize(), freq="MS")
-        return pd.Series(1.0, index=idx, name="FX_USDUSD")
-
-    if ccy == "EUR":
-        eurusd = fetch_ecb_exr_monthly("USD", "EUR")  # USD per EUR
-        eurusd.name = "FX_EURUSD"
-        return eurusd
-
-    eurusd = fetch_ecb_exr_monthly("USD", "EUR")  # USD per EUR
-    eurccy = fetch_ecb_exr_monthly(ccy, "EUR")    # CCY per EUR
-    df = pd.concat([eurusd, eurccy], axis=1).dropna()
-    fx = df.iloc[:, 0] / df.iloc[:, 1]            # USD per CCY
-    fx.name = f"FX_{ccy}USD"
-    return fx
-
-
-# =========================
-# Auto: US M2 (FRED)
-# =========================
-@st.cache_data(show_spinner=False, ttl=6 * 60 * 60)
-def fetch_us_m2_fred_usd() -> pd.Series:
-    """
-    FRED M2SL is in Billions of USD. Convert to USD by *1e9.
-    """
-    url = "https://fred.stlouisfed.org/graph/fredgraph.csv"
-    txt = http_get(url, params={"id": "M2SL"}).text
-    df = pd.read_csv(io.StringIO(txt)).rename(columns={"DATE": "DATE", "M2SL": "VALUE"})
-    s = parse_two_col_csv(df.to_csv(index=False), date_candidates=("DATE",), value_candidates=("VALUE",))
-    s = s * 1e9
-    s.name = "US_M2_USD"
-    return s
-
-
-# =========================
-# Auto: EA Broad Money (ECB BSI)
-#   Fix: strip "BSI." prefix from key (flow is in URL)
-# =========================
-@st.cache_data(show_spinner=False, ttl=6 * 60 * 60)
-def fetch_ea_bsi_monthly(series_key: str) -> pd.Series:
-    key = series_key
-    if key.startswith("BSI."):
-        key = key.replace("BSI.", "", 1)
-
-    url = f"https://data-api.ecb.europa.eu/service/data/BSI/{key}"
-    txt = http_get(url, params={"format": "csvdata"}).text
-    s = parse_two_col_csv(txt, date_candidates=("TIME_PERIOD",), value_candidates=("OBS_VALUE",))
-    s.name = f"EA_BSI_{series_key}"
-    return s
-
-
-# =========================
-# Canada: BoC Valet group + series mapping
-# =========================
-@st.cache_data(show_spinner=False, ttl=6 * 60 * 60)
-def fetch_boc_group_json(group: str, start_date: str = "2000-01-01") -> dict:
-    url = f"https://www.bankofcanada.ca/valet/observations/group/{group}/json"
-    return http_get(url, params={"start_date": start_date}).json()
-
-
-def best_match_series_code(series_detail: Dict[str, dict], include: Tuple[str, ...], exclude: Tuple[str, ...]) -> Optional[str]:
-    """
-    Simple scoring: count include tokens in label, ignore those with any exclude tokens.
-    """
-    inc = [t.lower() for t in include]
-    exc = [t.lower() for t in exclude]
-    best_code, best_score = None, -1
-    for code, meta in series_detail.items():
-        label = str(meta.get("label", "")).lower()
-        if any(t in label for t in exc):
-            continue
-        score = sum(1 for t in inc if t in label)
-        if score > best_score:
-            best_score, best_code = score, code
-    return best_code if best_score > 0 else None
-
-
-def boc_extract_two_series(j: dict, code_a: str, code_b: str) -> Tuple[pd.Series, pd.Series]:
-    obs = j.get("observations", [])
-    rows = []
-    for o in obs:
-        rows.append(
-            {
-                "date": o.get("d"),
-                "A": o.get(code_a, {}).get("v"),
-                "B": o.get(code_b, {}).get("v"),
-            }
-        )
-    df = pd.DataFrame(rows)
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df["A"] = pd.to_numeric(df["A"], errors="coerce")
-    df["B"] = pd.to_numeric(df["B"], errors="coerce")
-    df = df.dropna(subset=["date"]).set_index("date").sort_index()
-    return df["A"].astype(float), df["B"].astype(float)
-
-
-def suggest_multiplier_from_units(units: str) -> float:
-    """
-    Heuristic: infer scale from units text.
-    """
-    u = (units or "").lower()
-    if "trillion" in u:
-        return 1e12
-    if "billion" in u:
-        return 1e9
-    if "million" in u:
-        return 1e6
-    if "thousand" in u:
-        return 1e3
-    return 1.0
-
-
-# =========================
-# Manual CSV loader
-# =========================
-def load_manual_m2(country: str, uploaded_file) -> pd.Series:
-    df = pd.read_csv(uploaded_file)
-    cols = {c.lower(): c for c in df.columns}
-    if "date" not in cols or "value" not in cols:
-        raise ValueError(f"[{country}] CSV must have columns: date,value (case-insensitive). got={list(df.columns)}")
-    dcol, vcol = cols["date"], cols["value"]
-    df[dcol] = pd.to_datetime(df[dcol], errors="coerce")
-    df[vcol] = pd.to_numeric(df[vcol], errors="coerce")
-    df = df.dropna(subset=[dcol]).set_index(dcol).sort_index()
-    s = df[vcol].astype(float)
-    s.name = f"{country}_M2_LOCAL"
-    return s
-
-
-# =========================
-# Validation helpers
-# =========================
 def validate_series_basic(s: pd.Series) -> dict:
     if s is None or s.empty:
         return {
@@ -258,280 +92,160 @@ def validate_series_basic(s: pd.Series) -> dict:
     }
 
 
-def multiply_with_fx_aligned(local_weekly: pd.Series, fx_weekly: pd.Series) -> pd.Series:
+# =========================
+# FX via ECB
+# =========================
+@st.cache_data(show_spinner=False, ttl=6 * 60 * 60)
+def fetch_ecb_exr_monthly(base: str, quote: str = "EUR") -> pd.Series:
     """
-    Critical fix:
-      Align FX to the M2 index before multiplying to avoid trailing NaNs.
+    ECB EXR key:
+      M.{base}.{quote}.SP00.A
+    Example:
+      M.USD.EUR.SP00.A = USD per EUR (EURUSD)
     """
-    fx_aligned = fx_weekly.reindex(local_weekly.index).ffill()
-    out = local_weekly * fx_aligned
-    return out
+    key = f"M.{base}.{quote}.SP00.A"
+    url = f"https://data-api.ecb.europa.eu/service/data/EXR/{key}"
+    txt = http_get(url, params={"format": "csvdata"}).text
+    s = parse_two_col_csv(txt, date_candidates=("TIME_PERIOD",), value_candidates=("OBS_VALUE",))
+    s.name = f"EXR_{base}{quote}"
+    return s
+
+
+@st.cache_data(show_spinner=False, ttl=6 * 60 * 60)
+def fx_eur_to_usd_monthly() -> pd.Series:
+    # EURUSD: USD per EUR
+    eurusd = fetch_ecb_exr_monthly("USD", "EUR")
+    eurusd.name = "FX_EURUSD"
+    return eurusd
+
+
+# =========================
+# US M2 (FRED)
+# =========================
+@st.cache_data(show_spinner=False, ttl=6 * 60 * 60)
+def fetch_us_m2_usd() -> pd.Series:
+    """
+    FRED M2SL: Billions USD -> convert to USD by *1e9
+    """
+    url = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+    txt = http_get(url, params={"id": "M2SL"}).text
+    df = pd.read_csv(io.StringIO(txt)).rename(columns={"DATE": "DATE", "M2SL": "VALUE"})
+    s = parse_two_col_csv(df.to_csv(index=False), date_candidates=("DATE",), value_candidates=("VALUE",))
+    s = s * 1e9
+    s.name = "US_M2_USD"
+    return s
+
+
+# =========================
+# EA M2 (ECB BSI)
+# =========================
+@st.cache_data(show_spinner=False, ttl=6 * 60 * 60)
+def fetch_ea_m2_eur() -> pd.Series:
+    """
+    ECB BSI endpoint:
+      /service/data/BSI/{key_without_BSI_prefix}?format=csvdata
+    Note: dataset often in Millions of EUR -> convert by *1e6
+    """
+    key = EA_M2_KEY.replace("BSI.", "", 1) if EA_M2_KEY.startswith("BSI.") else EA_M2_KEY
+    url = f"https://data-api.ecb.europa.eu/service/data/BSI/{key}"
+    txt = http_get(url, params={"format": "csvdata"}).text
+    s = parse_two_col_csv(txt, date_candidates=("TIME_PERIOD",), value_candidates=("OBS_VALUE",))
+    s = s * 1e6  # assumed millions EUR -> EUR
+    s.name = "EA_M2_EUR"
+    return s
 
 
 # =========================
 # UI
 # =========================
-st.title("liq | Global Liquidity Validator (Core12)")
+st.title("liq | US + EA Liquidity (M2 unified) | 2010+ only")
 
 with st.sidebar:
-    st.header("Scope")
-    selected = st.multiselect("Countries", CORE12, default=["US", "EA", "CA"])
-
-    st.divider()
-    strict_mode = st.checkbox(
-        "Strict: require ALL selected countries",
-        value=False,
-        help="OFF: missing manual uploads are excluded with warnings. ON: missing ones stop execution.",
-    )
-
-    st.divider()
-    st.header("EA (ECB BSI)")
-    ea_use_m3 = st.checkbox("Use EA M3 (recommended)", value=True)
-    st.caption("EA series are assumed 'Millions EUR' -> converted by *1e6.")
-
-    st.divider()
-    st.header("Canada (BoC Valet)")
-    boc_group = st.text_input("BoC group", value=BOC_GROUP_DEFAULT)
-    ca_use_m2pp_in_global = st.checkbox("Use CA M2++ in GLOBAL sum", value=True)
-
-    st.divider()
-    st.header("Manual uploads (non-auto)")
-    manual_scale = st.selectbox("Manual M2 unit multiplier (local)", options=[1.0, 1e3, 1e6, 1e9, 1e12], index=0)
-    uploads = {}
-    for c in selected:
-        if c in AUTO_COUNTRIES:
-            continue
-        uploads[c] = st.file_uploader(f"{c} M2 CSV (date,value)", type=["csv"], key=f"up_{c}")
-
-    st.divider()
+    st.header("Fixed Policy")
+    st.write("- US: M2 (FRED M2SL)")
+    st.write("- EA: M2 (ECB BSI M20)")
+    st.write(f"- Clip start: {CLIP_START.date()}")
+    strict_mode = st.checkbox("Strict (require both US and EA)", value=True)
     run_btn = st.button("Run / Refresh")
 
 if not run_btn:
-    st.info("왼쪽에서 설정 후 Run / Refresh를 누르세요.")
+    st.info("Run / Refresh를 누르세요.")
     st.stop()
 
-warnings = []
 errors = []
 
 # =========================
-# Build monthly local + monthly fx
+# Load monthly series
 # =========================
-m2_local_monthly: Dict[str, pd.Series] = {}
-fx_monthly: Dict[str, pd.Series] = {}
-meta_rows = []
+try:
+    us_m2 = clip_2010(fetch_us_m2_usd())
+except Exception as e:
+    us_m2 = pd.Series(dtype=float)
+    errors.append(f"US fetch failed: {e}")
 
-# --- US (auto) ---
-if "US" in selected:
-    try:
-        m2_local_monthly["US"] = fetch_us_m2_fred_usd()
-        fx_monthly["US"] = fx_to_usd_monthly("USD")
-        meta_rows.append({"country": "US", "ccy": "USD", "m2_source": "FRED M2SL (billions->USD)", "fx_source": "USDUSD=1"})
-    except Exception as e:
-        errors.append(f"US auto fetch failed: {e}")
+try:
+    ea_m2_eur = clip_2010(fetch_ea_m2_eur())
+except Exception as e:
+    ea_m2_eur = pd.Series(dtype=float)
+    errors.append(f"EA fetch failed: {e}")
 
-# --- EA (auto) ---
-if "EA" in selected:
-    try:
-        if ea_use_m3:
-            ea_key = "BSI.M.U2.Y.V.M30.X.1.U2.2300.Z01.E"  # M3
-            ea_alias = "EA_M3"
-        else:
-            ea_key = "BSI.M.U2.Y.V.M20.X.1.U2.2300.Z01.E"  # M2
-            ea_alias = "EA_M2"
-
-        ea = fetch_ea_bsi_monthly(ea_key) * 1e6  # assume Millions EUR -> EUR
-        ea.name = ea_alias
-        m2_local_monthly["EA"] = ea
-        fx_monthly["EA"] = fx_to_usd_monthly("EUR")  # EUR special-case fixed
-        meta_rows.append({"country": "EA", "ccy": "EUR", "m2_source": f"ECB BSI {ea_alias}", "m2_series": ea_key, "unit_note": "Assumed millions EUR -> *1e6", "fx_source": "ECB EXR EURUSD"})
-    except Exception as e:
-        errors.append(f"EA auto fetch failed: {e}")
-
-# --- CA (auto with audit + dropdown) ---
-ca_series_table = pd.DataFrame()
-ca_meta = {}
-ca_unit_multiplier = 1e12  # provisional default
-ca_units_m2 = ""
-ca_units_m2pp = ""
-
-if "CA" in selected:
-    try:
-        j = fetch_boc_group_json(boc_group, start_date="2000-01-01")
-        series_detail = j.get("seriesDetail", {})
-        if not series_detail:
-            raise ValueError(f"No seriesDetail in group={boc_group}")
-
-        ca_series_table = pd.DataFrame(
-            [
-                {
-                    "code": code,
-                    "label": meta.get("label", ""),
-                    "units": meta.get("units", ""),
-                    "frequency": meta.get("frequency", ""),
-                }
-                for code, meta in series_detail.items()
-            ]
-        ).sort_values("label")
-
-        # auto guesses (weak; user confirms)
-        guess_m2pp = best_match_series_code(series_detail, include=("m2++",), exclude=())
-        guess_m2 = best_match_series_code(series_detail, include=("m2",), exclude=("m2+", "m2++"))
-
-        codes = ca_series_table["code"].tolist()
-
-        st.sidebar.subheader("CA series mapping (from seriesDetail)")
-        ca_m2_code = st.sidebar.selectbox(
-            "CA 'M2' (comparison) series code",
-            options=codes,
-            index=codes.index(guess_m2) if guess_m2 in codes else 0,
-            help="비교용 시리즈 (라벨을 보고 M2에 해당하는 것을 직접 선택).",
-        )
-        ca_m2pp_code = st.sidebar.selectbox(
-            "CA M2++ series code",
-            options=codes,
-            index=codes.index(guess_m2pp) if guess_m2pp in codes else min(1, len(codes) - 1),
-            help="GLOBAL 합산에 쓰는 M2++ 시리즈.",
-        )
-
-        ca_units_m2 = str(series_detail.get(ca_m2_code, {}).get("units", ""))
-        ca_units_m2pp = str(series_detail.get(ca_m2pp_code, {}).get("units", ""))
-
-        # Suggest multiplier based on units
-        suggested = suggest_multiplier_from_units(ca_units_m2pp or ca_units_m2)
-
-        # Multiplier selector includes 1e12; default to suggested if possible, else 1e12
-        options = [1.0, 1e3, 1e6, 1e9, 1e12]
-        default_val = suggested if suggested in options else 1e12
-        default_idx = options.index(default_val)
-
-        ca_unit_multiplier = st.sidebar.selectbox(
-            "CA unit multiplier (local)",
-            options=options,
-            index=default_idx,
-            help="BoC units(예: Trillion/Billion/Million)에 맞춰 선택. 추천값은 units 기반 자동 추정.",
-        )
-
-        m2_raw, m2pp_raw = boc_extract_two_series(j, ca_m2_code, ca_m2pp_code)
-        m2 = (m2_raw * float(ca_unit_multiplier)).rename("CA_M2_LOCAL")
-        m2pp = (m2pp_raw * float(ca_unit_multiplier)).rename("CA_M2PP_LOCAL")
-
-        m2_local_monthly["CA_M2"] = m2
-        m2_local_monthly["CA_M2PP"] = m2pp
-        fx_monthly["CA"] = fx_to_usd_monthly("CAD")
-
-        ca_meta = {
-            "group": boc_group,
-            "m2_code": ca_m2_code,
-            "m2_label": series_detail.get(ca_m2_code, {}).get("label", ""),
-            "m2_units": ca_units_m2,
-            "m2pp_code": ca_m2pp_code,
-            "m2pp_label": series_detail.get(ca_m2pp_code, {}).get("label", ""),
-            "m2pp_units": ca_units_m2pp,
-            "suggested_multiplier": suggested,
-            "chosen_multiplier": ca_unit_multiplier,
-        }
-        meta_rows.append({"country": "CA", "ccy": "CAD", "m2_source": "BoC Valet group", **ca_meta, "fx_source": "ECB EXR cross"})
-    except Exception as e:
-        errors.append(f"CA auto fetch failed: {e}")
-
-# --- Manual countries ---
-for c in selected:
-    if c in AUTO_COUNTRIES:
-        continue
-    f = uploads.get(c)
-    if f is None:
-        msg = f"Manual M2 missing for {c}"
-        if strict_mode:
-            errors.append(msg)
-        else:
-            warnings.append(msg + " -> excluded")
-        continue
-    try:
-        m2_local_monthly[c] = load_manual_m2(c, f) * float(manual_scale)
-        fx_monthly[c] = fx_to_usd_monthly(CCY[c])
-        meta_rows.append({"country": c, "ccy": CCY[c], "m2_source": "Manual CSV", "manual_multiplier": manual_scale, "fx_source": "ECB EXR cross"})
-    except Exception as e:
-        errors.append(f"{c} manual load failed: {e}")
-
-if warnings:
-    st.warning("Warnings:\n- " + "\n- ".join(warnings))
+try:
+    eurusd = clip_2010(fx_eur_to_usd_monthly())
+except Exception as e:
+    eurusd = pd.Series(dtype=float)
+    errors.append(f"FX(EURUSD) fetch failed: {e}")
 
 if errors:
     st.error("Errors:\n- " + "\n- ".join(errors))
-    st.stop()
+    if strict_mode:
+        st.stop()
 
 # =========================
-# Convert to USD weekly (critical FX alignment fix)
+# Weekly conversion (W-FRI) + FX alignment
 # =========================
-fx_weekly = {k: to_weekly_last_ffill(v) for k, v in fx_monthly.items()}
-usd_weekly: Dict[str, pd.Series] = {}
+us_w = to_weekly_last_ffill(us_m2)
 
-# US already USD
-if "US" in m2_local_monthly:
-    usd_weekly["US"] = to_weekly_last_ffill(m2_local_monthly["US"])
+ea_w_local = to_weekly_last_ffill(ea_m2_eur)
+fx_w = to_weekly_last_ffill(eurusd)
 
-# EA EUR -> USD
-if "EA" in m2_local_monthly and "EA" in fx_weekly:
-    ea_w = to_weekly_last_ffill(m2_local_monthly["EA"])
-    usd_weekly["EA"] = multiply_with_fx_aligned(ea_w, fx_weekly["EA"]).rename("EA_USD")
+ea_w_usd = multiply_with_fx_aligned(ea_w_local, fx_w)
+ea_w_usd.name = "EA_M2_USD"
 
-# CA CAD -> USD (keep both M2 & M2++)
-if "CA_M2" in m2_local_monthly and "CA" in fx_weekly:
-    ca_m2_w = to_weekly_last_ffill(m2_local_monthly["CA_M2"])
-    usd_weekly["CA_M2"] = multiply_with_fx_aligned(ca_m2_w, fx_weekly["CA"]).rename("CA_M2_USD")
+# Clip again in weekly space (safety)
+us_w = clip_2010(us_w)
+ea_w_usd = clip_2010(ea_w_usd)
 
-if "CA_M2PP" in m2_local_monthly and "CA" in fx_weekly:
-    ca_m2pp_w = to_weekly_last_ffill(m2_local_monthly["CA_M2PP"])
-    usd_weekly["CA_M2PP"] = multiply_with_fx_aligned(ca_m2pp_w, fx_weekly["CA"]).rename("CA_M2PP_USD")
+# Align indices (outer join not needed; we control)
+df_components = pd.concat(
+    {
+        "US": us_w,
+        "EA": ea_w_usd,
+    },
+    axis=1
+).sort_index()
 
-# Manual LCY -> USD
-for c in selected:
-    if c in {"US", "EA", "CA"}:
-        continue
-    if c in m2_local_monthly and c in fx_weekly:
-        loc_w = to_weekly_last_ffill(m2_local_monthly[c])
-        usd_weekly[c] = multiply_with_fx_aligned(loc_w, fx_weekly[c]).rename(f"{c}_USD")
+if strict_mode:
+    # require both to compute global
+    global_usd = df_components.dropna().sum(axis=1)
+else:
+    global_usd = df_components.sum(axis=1, min_count=1)
 
-# =========================
-# Build GLOBAL components
-# =========================
-components: Dict[str, pd.Series] = {}
-
-if "US" in usd_weekly:
-    components["US"] = usd_weekly["US"]
-if "EA" in usd_weekly:
-    components["EA"] = usd_weekly["EA"]
-
-if "CA" in selected:
-    if ca_use_m2pp_in_global and "CA_M2PP" in usd_weekly:
-        components["CA"] = usd_weekly["CA_M2PP"]
-    elif (not ca_use_m2pp_in_global) and "CA_M2" in usd_weekly:
-        components["CA"] = usd_weekly["CA_M2"]
-
-for c in selected:
-    if c in {"US", "EA", "CA"}:
-        continue
-    if c in usd_weekly:
-        components[c] = usd_weekly[c]
-
-df_components = pd.concat(components.values(), axis=1) if components else pd.DataFrame()
-if not df_components.empty:
-    df_components.columns = list(components.keys())
-    df_components = df_components.sort_index()
-
-global_usd = df_components.sum(axis=1, min_count=len(df_components.columns) if strict_mode else 1)
 global_usd.name = "GLOBAL_M2_USD"
 
-# Optional: trim any all-NaN tail just in case
-if global_usd.notna().any():
-    last_valid = global_usd.last_valid_index()
+# Trim to last valid
+last_valid = global_usd.last_valid_index()
+if last_valid is not None:
     global_usd = global_usd.loc[:last_valid]
     df_components = df_components.loc[:last_valid]
 
 # Diagnostics
 diag_df = pd.DataFrame(
-    [{"series": k, **validate_series_basic(s)} for k, s in usd_weekly.items()]
-).set_index("series").sort_index()
+    [
+        {"series": "US", **validate_series_basic(df_components["US"])},
+        {"series": "EA", **validate_series_basic(df_components["EA"])},
+        {"series": "GLOBAL", **validate_series_basic(global_usd)},
+    ]
+).set_index("series")
 
 # =========================
 # Display
@@ -539,65 +253,61 @@ diag_df = pd.DataFrame(
 c1, c2 = st.columns([2.2, 1.2], gap="large")
 
 with c1:
-    st.subheader("A) GLOBAL (USD) — Weekly (W-FRI)")
+    st.subheader("A) GLOBAL (USD) — Weekly (W-FRI), 2010+")
     st.line_chart(global_usd)
 
-    st.subheader("B) Components used in GLOBAL (USD) — Weekly")
+    st.subheader("B) Components (USD) — Weekly, 2010+")
     st.line_chart(df_components)
 
-    if "CA" in selected and (("CA_M2" in usd_weekly) or ("CA_M2PP" in usd_weekly)):
-        st.subheader("C) Canada comparison (USD) — M2 vs M2++ (Weekly)")
-        ca_cmp = pd.DataFrame(index=global_usd.index)
-        if "CA_M2" in usd_weekly:
-            ca_cmp["CA_M2_USD"] = usd_weekly["CA_M2"].reindex(global_usd.index)
-        if "CA_M2PP" in usd_weekly:
-            ca_cmp["CA_M2PP_USD"] = usd_weekly["CA_M2PP"].reindex(global_usd.index)
-        st.line_chart(ca_cmp)
-
-    if not ca_series_table.empty:
-        st.subheader("D) Canada seriesDetail (audit)")
-        st.dataframe(ca_series_table)
-
 with c2:
-    st.subheader("E) Diagnostics (weekly series)")
+    st.subheader("C) Diagnostics")
     st.dataframe(diag_df)
 
-    if ca_meta:
-        st.subheader("F) Canada mapping (chosen)")
-        st.json(ca_meta)
+    st.subheader("D) Latest values (USD)")
+    if len(global_usd) > 0:
+        latest_dt = global_usd.index.max()
+        st.write(f"Latest: {latest_dt.date()}")
+        st.write(f"US: {df_components.loc[latest_dt, 'US']:.3e}")
+        st.write(f"EA: {df_components.loc[latest_dt, 'EA']:.3e}")
+        st.write(f"GLOBAL: {global_usd.loc[latest_dt]:.3e}")
 
 # =========================
 # One-click Export (ZIP)
 # =========================
-st.subheader("G) One-click Export (ALL data as ZIP)")
+st.subheader("E) One-click Export (ZIP) — 2010+ only")
 
-weekly_usd_wide = pd.concat([global_usd, df_components], axis=1).sort_index()
+weekly_usd_wide = pd.concat([global_usd, df_components], axis=1)
+weekly_usd_wide.columns = ["GLOBAL_M2_USD", "US_USD", "EA_USD"]
 
-monthly_local_wide = pd.DataFrame({k: v for k, v in m2_local_monthly.items()}).sort_index()
-monthly_fx_wide = pd.DataFrame({k: v for k, v in fx_monthly.items()}).sort_index()
+monthly_m2_local_wide = pd.DataFrame(
+    {
+        "US_M2_USD_monthly": us_m2,      # already USD monthly
+        "EA_M2_EUR_monthly": ea_m2_eur,  # EUR monthly
+    }
+).sort_index()
+
+monthly_fx_to_usd_wide = pd.DataFrame(
+    {
+        "FX_EURUSD_monthly": eurusd,     # USD per EUR monthly
+    }
+).sort_index()
 
 meta_obj = {
     "repo": "liq",
-    "dataset": "liq_global_liquidity_export",
+    "dataset": "US_EA_M2_2010plus",
     "created_utc": datetime.now(timezone.utc).isoformat(),
-    "frequency_policy": {"output": f"weekly {WEEK_RULE} last + ffill"},
-    "selected_countries": selected,
-    "strict_mode": strict_mode,
-    "ea": {
-        "use_m3": ea_use_m3,
-        "unit_note": "ECB BSI assumed millions EUR -> *1e6",
+    "policy": {
+        "US": {"aggregate": "M2", "source": "FRED M2SL", "unit": "USD (billions->*1e9)"},
+        "EA": {"aggregate": "M2", "source": "ECB BSI M20", "unit": "EUR (assumed millions->*1e6)"},
+        "FX": {"series": "EURUSD", "definition": "USD per EUR (ECB EXR M.USD.EUR.SP00.A)"},
+        "clip_start": str(CLIP_START.date()),
+        "weekly_rule": WEEK_RULE,
+        "weekly_method": "last + ffill",
+        "fx_alignment": "FX reindexed to M2 weekly index before multiplication",
     },
-    "canada": {
-        "group": boc_group,
-        "use_m2pp_in_global": ca_use_m2pp_in_global,
-        "mapping": ca_meta,
-    },
-    "manual": {"unit_multiplier": manual_scale},
     "notes": [
-        "FX alignment fix applied: FX reindexed to each local M2 weekly index before multiplication to avoid trailing NaNs.",
-        "weekly_usd_wide.csv is intended for BTC Lead-Lag Lab upload as liquidity input.",
+        "weekly_usd_wide.csv is intended for BTC Lead-Lag Lab upload as liquidity input (2010+).",
     ],
-    "series_meta_rows": meta_rows,
 }
 
 def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
@@ -606,20 +316,15 @@ def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
 zip_buffer = BytesIO()
 with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as z:
     z.writestr("weekly_usd_wide.csv", df_to_csv_bytes(weekly_usd_wide))
-    z.writestr("monthly_m2_local_wide.csv", df_to_csv_bytes(monthly_local_wide))
-    z.writestr("monthly_fx_to_usd_wide.csv", df_to_csv_bytes(monthly_fx_wide))
+    z.writestr("monthly_m2_local_wide.csv", df_to_csv_bytes(monthly_m2_local_wide))
+    z.writestr("monthly_fx_to_usd_wide.csv", df_to_csv_bytes(monthly_fx_to_usd_wide))
     z.writestr("diagnostics_summary.csv", df_to_csv_bytes(diag_df))
     z.writestr("meta.json", json.dumps(meta_obj, ensure_ascii=False, indent=2).encode("utf-8"))
 
 zip_buffer.seek(0)
 st.download_button(
-    "Download ALL as ZIP (weekly+monthly+fx+diagnostics+meta)",
+    "Download ZIP (2010+ only)",
     data=zip_buffer,
-    file_name="liq_global_liquidity_export.zip",
+    file_name="liq_us_ea_m2_2010plus_export.zip",
     mime="application/zip",
-)
-
-st.caption(
-    "다음 단계: ZIP 다운로드 → 여기 업로드 → (1) 단위/스케일 정합성, (2) 갭/업데이트 지연, (3) YoY/성장률 패턴까지 검증 후 "
-    "BTC Lead-Lag Lab에 투입 가능한 최종 스펙으로 확정."
 )
