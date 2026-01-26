@@ -7,3 +7,8 @@ pandas_datareader
 streamlit
 Pillow
 numpy
+streamlit
+pandas
+numpy
+requests
+python-dateutil
