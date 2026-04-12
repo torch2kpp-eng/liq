@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # streamlit_app.py
 # BTC Lead-Lag Lab (Weekly) + TAB5 Forecast/Backtest + MAIN Predicted BTC line
 # v2.16 - Liquidity toggle(Fed Net Liquidity vs G2 M2 USD) + TRUE spaghetti (weekly anchors, dynamic lag per anchor)
@@ -34,6 +35,157 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
+
+
+# =========================
+# ENCODING / UI TEXT SAFETY
+# =========================
+def fix_mojibake_text(text):
+    """
+    Try to recover UTF-8 Korean text that was accidentally decoded as latin1/cp1252.
+    If the text already looks normal, return it unchanged.
+    """
+    if not isinstance(text, str):
+        return text
+
+    suspicious_tokens = ("ì", "ë", "ê", "í", "ã", "Â", "â", "Ð")
+    if not any(tok in text for tok in suspicious_tokens):
+        return text
+
+    def _hangul_score(s):
+        return sum(0xAC00 <= ord(ch) <= 0xD7A3 for ch in s)
+
+    base_score = (_hangul_score(text), -sum(text.count(tok) for tok in suspicious_tokens))
+    best = text
+    best_score = base_score
+
+    for enc in ("latin1", "cp1252"):
+        try:
+            cand = text.encode(enc).decode("utf-8")
+        except Exception:
+            continue
+        cand_score = (_hangul_score(cand), -sum(cand.count(tok) for tok in suspicious_tokens))
+        if cand_score > best_score:
+            best = cand
+            best_score = cand_score
+
+    return best
+
+
+def fix_ui_obj(obj):
+    if isinstance(obj, str):
+        return fix_mojibake_text(obj)
+    if isinstance(obj, list):
+        return [fix_ui_obj(x) for x in obj]
+    if isinstance(obj, tuple):
+        return tuple(fix_ui_obj(x) for x in obj)
+    if isinstance(obj, dict):
+        return {fix_ui_obj(k): fix_ui_obj(v) for k, v in obj.items()}
+    return obj
+
+
+def ui_text(text):
+    return fix_mojibake_text(text)
+
+
+def _patch_streamlit_text_apis():
+    _markdown = st.markdown
+    def markdown(body, *args, **kwargs):
+        return _markdown(fix_ui_obj(body), *args, **kwargs)
+    st.markdown = markdown
+
+    _caption = st.caption
+    def caption(body, *args, **kwargs):
+        return _caption(fix_ui_obj(body), *args, **kwargs)
+    st.caption = caption
+
+    _title = st.title
+    def title(body, *args, **kwargs):
+        return _title(fix_ui_obj(body), *args, **kwargs)
+    st.title = title
+
+    _header = st.header
+    def header(body, *args, **kwargs):
+        return _header(fix_ui_obj(body), *args, **kwargs)
+    st.header = header
+
+    _subheader = st.subheader
+    def subheader(body, *args, **kwargs):
+        return _subheader(fix_ui_obj(body), *args, **kwargs)
+    st.subheader = subheader
+
+    _write = st.write
+    def write(*args, **kwargs):
+        return _write(*[fix_ui_obj(a) for a in args], **kwargs)
+    st.write = write
+
+    _warning = st.warning
+    def warning(body, *args, **kwargs):
+        return _warning(fix_ui_obj(body), *args, **kwargs)
+    st.warning = warning
+
+    _success = st.success
+    def success(body, *args, **kwargs):
+        return _success(fix_ui_obj(body), *args, **kwargs)
+    st.success = success
+
+    _error = st.error
+    def error(body, *args, **kwargs):
+        return _error(fix_ui_obj(body), *args, **kwargs)
+    st.error = error
+
+    _info = st.info
+    def info(body, *args, **kwargs):
+        return _info(fix_ui_obj(body), *args, **kwargs)
+    st.info = info
+
+    _metric = st.metric
+    def metric(label, value=None, delta=None, *args, **kwargs):
+        return _metric(fix_ui_obj(label), fix_ui_obj(value), fix_ui_obj(delta), *args, **kwargs)
+    st.metric = metric
+
+    _spinner = st.spinner
+    def spinner(text="In progress...", *args, **kwargs):
+        return _spinner(fix_ui_obj(text), *args, **kwargs)
+    st.spinner = spinner
+
+    _tabs = st.tabs
+    def tabs(tabs, *args, **kwargs):
+        return _tabs(fix_ui_obj(tabs), *args, **kwargs)
+    st.tabs = tabs
+
+    _button = st.button
+    def button(label, *args, **kwargs):
+        return _button(fix_ui_obj(label), *args, **kwargs)
+    st.button = button
+
+    _download_button = st.download_button
+    def download_button(label, *args, **kwargs):
+        return _download_button(fix_ui_obj(label), *args, **kwargs)
+    st.download_button = download_button
+
+    _checkbox = st.checkbox
+    def checkbox(label, *args, **kwargs):
+        return _checkbox(fix_ui_obj(label), *args, **kwargs)
+    st.checkbox = checkbox
+
+    _radio = st.radio
+    def radio(label, options, *args, **kwargs):
+        return _radio(fix_ui_obj(label), fix_ui_obj(options), *args, **kwargs)
+    st.radio = radio
+
+    _selectbox = st.selectbox
+    def selectbox(label, options, *args, **kwargs):
+        return _selectbox(fix_ui_obj(label), fix_ui_obj(options), *args, **kwargs)
+    st.selectbox = selectbox
+
+    _multiselect = st.multiselect
+    def multiselect(label, options, *args, **kwargs):
+        return _multiselect(fix_ui_obj(label), fix_ui_obj(options), *args, **kwargs)
+    st.multiselect = multiselect
+
+
+_patch_streamlit_text_apis()
 
 
 # =========================
@@ -176,14 +328,14 @@ with st.sidebar:
 FORECAST_MODEL = st.selectbox(
         "Forecast model (MAIN/TAB4)",
         [
-            "Drivers-only Î (legacy)",
-            "ECM on LDLI level (gap + ÎLDLI)",
+            "Drivers-only Δ (legacy)",
+            "ECM on LDLI level (gap + ΔLDLI)",
         ],
         index=1,
-        help="Legacy uses only Î(liquidity) and Î(DXY) drivers. ECM uses LDLI level alignment + error-correction (gap) to avoid flat/always-up spaghetti.",
+        help="Legacy uses only Δ(liquidity) and Δ(DXY) drivers. ECM uses LDLI level alignment + error-correction (gap) to avoid flat/always-up spaghetti.",
     )
 
-with st.expander("ê³ ì  íë¼ë¯¸í°(ìë ¥ê°) ë³´ê¸°", expanded=False):
+with st.expander(ui_text("고정 파라미터(입력값) 보기"), expanded=False):
     st.code(
         "\n".join([
             f"APP_VERSION = {APP_VERSION}",
@@ -549,7 +701,7 @@ def rolling_maps_weekly(y_w: pd.Series, x_w: pd.Series, invert_x: bool, lags_wee
     idx = df.index
     max_lag = max(lags_weeks)
     if len(idx) < WINDOW_WEEKS + max_lag + 5:
-        raise RuntimeError("ë°ì´í° ê¸¸ì´ê° ë¶ì¡±í©ëë¤. (ê¸°ê°/ìëì°/lag ì¬ê²í  íì)")
+        raise RuntimeError("데이터 길이가 부족합니다. (기간/윈도우/lag 재검토 필요)")
 
     end_positions = list(range(WINDOW_WEEKS, len(idx), STEP_WEEKS))
     end_dates = idx[end_positions]
@@ -634,7 +786,7 @@ def rolling_best_pair_and_multivar(
     idx = base.index
     max_lag = max(lags_weeks)
     if len(idx) < window_weeks + max_lag + 5:
-        raise RuntimeError("2D ë¶ìì ìí ë°ì´í° ê¸¸ì´ê° ë¶ì¡±í©ëë¤.")
+        raise RuntimeError("2D 분석을 위한 데이터 길이가 부족합니다.")
 
     end_positions = list(range(window_weeks, len(idx), step_weeks))
     end_dates = idx[end_positions]
@@ -890,10 +1042,10 @@ def summarize_block(out: pd.DataFrame, tstat_masked: pd.DataFrame):
     sig_cells_ratio = float(np.isfinite(tstat_masked.to_numpy(dtype=float)).mean())
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("ì í¨ best ë¹ì¨", f"{valid_ratio:.1%}")
-    c2.metric("max(|corr|) ì¤ìê°", f"{med_max_abs:.4f}")
-    c3.metric("best_corr ì¤ìê°", f"{med_best:.4f}")
-    c4.metric("ì ì t-stat ì ë¹ì¨(|t|â¥2)", f"{sig_cells_ratio:.1%}")
+    c1.metric("유효 best 비율", f"{valid_ratio:.1%}")
+    c2.metric("max(|corr|) 중앙값", f"{med_max_abs:.4f}")
+    c3.metric("best_corr 중앙값", f"{med_best:.4f}")
+    c4.metric("유의 t-stat 셀 비율(|t|≥2)", f"{sig_cells_ratio:.1%}")
 
 
 def render_model_section(label: str, corr_masked, beta_map, tstat_masked, out):
@@ -1047,7 +1199,7 @@ def load_liquidity_source_daily(liq_source: str):
 
 
 # =========================
-# CORE: MAIN/TAB4ê° TAB1~3 ì í ì¤í ìì´ë ëìíëë¡
+# CORE: MAIN/TAB4가 TAB1~3 선행 실행 없이도 동작하도록
 # =========================
 def ensure_tab3_state_ready(base: pd.DataFrame, combo_ret: pd.Series, combo_dlt: pd.Series):
     xx = st.session_state.get("tab3_xx_weeks", None)
@@ -1057,7 +1209,7 @@ def ensure_tab3_state_ready(base: pd.DataFrame, combo_ret: pd.Series, combo_dlt:
     if xx is not None and chosen is not None and best_corr_last is not None:
         return int(xx), str(chosen), float(best_corr_last)
 
-    with st.spinner("MAIN: TAB3 ê°ì´ ìì´ ìµì  lag(xx) ìë ì°ì¶ ì¤..."):
+    with st.spinner("MAIN: TAB3 값이 없어 최적 lag(xx) 자동 산출 중..."):
         y = base["btc_wret"]
         lags_weeks = range(LAG_MIN_WEEKS, LAG_MAX_WEEKS + 1)
 
@@ -1241,7 +1393,7 @@ def forecast_path_from_drivers_driversonly(
     df_fit = df_fit.dropna()
 
     if df_fit.empty or df_drv.empty:
-        raise RuntimeError("Drivers/Price ë°ì´í°ê° ë¶ì¡±í©ëë¤.")
+        raise RuntimeError("Drivers/Price 데이터가 부족합니다.")
 
     if end_dt_requested not in df_fit.index:
         idx = df_fit.index[df_fit.index <= end_dt_requested]
@@ -1268,7 +1420,7 @@ def forecast_path_from_drivers_driversonly(
     h = int(min(int(horizon_w), int(max_h)))
     if h <= 0:
         raise RuntimeError(
-            f"Forecast ê°ë¥í ìµë horizon: 0ì£¼ (drivers ê¸°ì¤ max_h=0ì£¼, end_dt_eff={end_dt_eff.date()})"
+            f"Forecast 가능한 최대 horizon: 0주 (drivers 기준 max_h=0주, end_dt_eff={end_dt_eff.date()})"
         )
 
     w = df_fit.iloc[pos_fit - fit_window_w:pos_fit]
@@ -1361,7 +1513,7 @@ def fit_ecm_params_from_level(
     """
     Fit:
       1) Level mapping: log(BTC) ~= c + gamma * LDLI_shifted_level
-      2) ECM step model (weekly): Îlog(BTC)_t = a + b_gap * gap_{t-1} + b_dldli * ÎLDLI_t
+      2) ECM step model (weekly): Δlog(BTC)_t = a + b_gap * gap_{t-1} + b_dldli * ΔLDLI_t
 
     LDLI is shifted by `lag_weeks` (index shift) so that LDLI leads BTC on the same x-axis.
     """
@@ -1533,7 +1685,7 @@ def build_forward_overlay_payload(liq_source: str, alpha_mode: str, forecast_mod
 
     base = pd.concat([btc_wret, btc_wclose.rename("btc_close"), dxy_wret, liq_ret, liq_dlt], axis=1).dropna()
     if len(base) < (WINDOW_WEEKS + LAG_MAX_WEEKS + 10):
-        raise RuntimeError("Forward overlay ê³ì°ì íìí ì£¼ê° ìíì´ ë¶ì¡±í©ëë¤.")
+        raise RuntimeError("Forward overlay 계산에 필요한 주간 샘플이 부족합니다.")
 
     z_dxy_inv = zscore(-base["dxy_wret"]).rename("z(-dxy_ret)")
     z_liq_ret = zscore(base[liq_ret.name]).rename("z(liq_ret)")
@@ -2107,8 +2259,8 @@ def run_main_tab():
 
     xx = int(payload["xx_latest"])
     st.info(
-        f"Liquidity={payload['liq_label']} | DXY={payload['dxy_used']} | combo={payload['chosen']} | latest xx={xx}ì£¼"
-        f" | ìµê·¼ best_corr_raw={payload['best_corr_last']:.4f}"
+        f"Liquidity={payload['liq_label']} | DXY={payload['dxy_used']} | combo={payload['chosen']} | latest xx={xx}주"
+        f" | 최근 best_corr_raw={payload['best_corr_last']:.4f}"
         f" | Spaghetti anchors=weekly (dynamic xx per anchor)"
     )
 
@@ -2173,10 +2325,10 @@ def run_main_tab():
         )
         st.pyplot(fig3)
 
-    st.markdown("### Regime ì±ê³¼ ìì½ (BTC timeline ê¸°ì¤, regimeë +xxì£¼ shift ì ì©)")
+    st.markdown(ui_text("### Regime 성과 요약 (BTC timeline 기준, regime는 +xx주 shift 적용)"))
     met = payload.get("metrics", pd.DataFrame())
     if met is None or met.empty:
-        st.warning("ì±ê³¼ ìì½ì ê³ì°í  ë°ì´í°ê° ë¶ì¡±í©ëë¤.")
+        st.warning("성과 요약을 계산할 데이터가 부족합니다.")
     else:
         show = met.copy()
         for col in ["mean_fwd", "median_fwd", "avg_gain", "avg_loss", "mae_median", "mfe_median"]:
@@ -2185,7 +2337,7 @@ def run_main_tab():
         st.dataframe(show)
 
     # ---- ONE FILE CSV DOWNLOAD (Past 416w + Future +xx_latest) ----
-    st.markdown("### ONE FILE CSV ë¤ì´ë¡ë (MAIN/TAB4 ë¶ìì©, Past 416w + Future +xx)")
+    st.markdown("### ONE FILE CSV 다운로드 (MAIN/TAB4 분석용, Past 416w + Future +xx)")
     try:
         full_idx = disp_416["full_idx"]
         df_one = pd.DataFrame(index=full_idx)
@@ -2210,19 +2362,19 @@ def run_main_tab():
 
         st.download_button(
             "Download MAIN/TAB4 one-file CSV",
-            data=df_one.reset_index().rename(columns={"index": "date"}).to_csv(index=False).encode("utf-8"),
+            data=df_one.reset_index().rename(columns={"index": "date"}).to_csv(index=False).encode("utf-8-sig"),
             file_name=f"MAIN_TAB4_ONEFILE_{payload['liq_source'].replace(' ','_')}_past{PAST_WEEKS_LONG}w_future{xx}w_{APP_VERSION}.csv",
             mime="text/csv",
         )
     except Exception as e:
-        st.warning(f"ONE FILE CSV ìì± ì¤ ì¤ë¥: {e}")
+        st.warning(f"ONE FILE CSV 생성 중 오류: {e}")
 
     # Liquidity snapshot + Spaghetti CSV
     st.markdown("### Liquidity snapshot (raw series alignment)")
     st.dataframe(payload["liq_snapshot"].tail(60))
     st.download_button(
         "Download Liquidity Snapshot CSV",
-        data=payload["liq_snapshot"].assign(alpha_mode=payload.get("alpha_mode", "OLS (learn alpha)")).reset_index().to_csv(index=False).encode("utf-8"),
+        data=payload["liq_snapshot"].assign(alpha_mode=payload.get("alpha_mode", "OLS (learn alpha)")).reset_index().to_csv(index=False).encode("utf-8-sig"),
         file_name=f"liquidity_snapshot_{payload['liq_source'].replace(' ','_')}.csv",
         mime="text/csv",
     )
@@ -2232,7 +2384,7 @@ def run_main_tab():
     st.dataframe(sp_long.tail(200))
     st.download_button(
         "Download Spaghetti CSV (long format)",
-        data=sp_long.to_csv(index=False).encode("utf-8"),
+        data=sp_long.to_csv(index=False).encode("utf-8-sig"),
         file_name=f"spaghetti_long_dynamicLag_weeklyAnchors_{payload['liq_source'].replace(' ','_')}_xxLatest{xx}_{APP_VERSION}.csv",
         mime="text/csv",
     )
@@ -2242,7 +2394,7 @@ def run_main_tab():
 # TAB1
 # =========================
 def run_tab_dxy():
-    st.subheader("TAB1) DXY(ì­ì¶) â BTC (Weekly Returns)")
+    st.subheader("TAB1) DXY(역축) → BTC (Weekly Returns)")
 
     btc_close = load_btc_close()
     dxy_close, dxy_used = load_dxy_close()
@@ -2252,7 +2404,7 @@ def run_tab_dxy():
     dxy_wret = weekly_log_returns(dxy_close, WEEK_RULE).rename("dxy_wret")
 
     lags_weeks = range(LAG_MIN_WEEKS, LAG_MAX_WEEKS + 1)
-    with st.spinner("Rolling heatmaps ê³ì° ì¤..."):
+    with st.spinner("Rolling heatmaps 계산 중..."):
         corr_raw, corr_masked, beta_map, tstat_map, tstat_masked, out = rolling_maps_weekly(
             y_w=btc_wret,
             x_w=dxy_wret,
@@ -2261,14 +2413,14 @@ def run_tab_dxy():
             quiet=False
         )
 
-    render_model_section("DXY(ì­ì¶) vs BTC", corr_masked, beta_map, tstat_masked, out)
+    render_model_section("DXY(역축) vs BTC", corr_masked, beta_map, tstat_masked, out)
 
 
 # =========================
 # TAB2
 # =========================
 def run_tab_liquidity():
-    st.subheader("TAB2) Liquidity â BTC (Weekly; RETURNS vs DELTA ë¹êµ)")
+    st.subheader("TAB2) Liquidity → BTC (Weekly; RETURNS vs DELTA 비교)")
 
     btc_close = load_btc_close()
     btc_wret = weekly_log_returns(btc_close, WEEK_RULE).rename("btc_wret")
@@ -2288,7 +2440,7 @@ def run_tab_liquidity():
     liq_dlt = weekly_delta(liq_level_daily, WEEK_RULE).rename("liq_delta_level")
 
     lags_weeks = range(LAG_MIN_WEEKS, LAG_MAX_WEEKS + 1)
-    with st.spinner("RETURNS/DELTA ë ëª¨ë¸ì ëª¨ë ê³ì° ì¤..."):
+    with st.spinner("RETURNS/DELTA 두 모델을 모두 계산 중..."):
         corr_raw_r, corr_masked_r, beta_map_r, tstat_map_r, tstat_masked_r, out_r = rolling_maps_weekly(
             y_w=btc_wret, x_w=liq_ret, invert_x=TAB2_INVERT_X, lags_weeks=lags_weeks, quiet=False
         )
@@ -2296,19 +2448,19 @@ def run_tab_liquidity():
             y_w=btc_wret, x_w=liq_dlt, invert_x=TAB2_INVERT_X, lags_weeks=lags_weeks, quiet=False
         )
 
-    sub1, sub2 = st.tabs(["Liquidity Returns", "Liquidity Delta(Î)"])
+    sub1, sub2 = st.tabs(["Liquidity Returns", "Liquidity Delta(Δ)"])
     with sub1:
         render_model_section("Liquidity RETURNS vs BTC", corr_masked_r, beta_map_r, tstat_masked_r, out_r)
     with sub2:
-        render_model_section("Liquidity DELTA(Î) vs BTC", corr_masked_d, beta_map_d, tstat_masked_d, out_d)
+        render_model_section("Liquidity DELTA(Δ) vs BTC", corr_masked_d, beta_map_d, tstat_masked_d, out_d)
 
 
 # =========================
 # TAB3
 # =========================
 def run_tab_combo():
-    st.subheader("TAB3) Combo(ì ëì± + ë¬ë¬ê°ë) â BTC")
-    st.caption("corr-ìµë ë°©ì ì ì§ | 1D Combo + 2D lag-pair(corr-max) + ë¤ë³ë(ì°¸ê³ )")
+    st.subheader("TAB3) Combo(유동성 + 달러강도) → BTC")
+    st.caption("corr-최대 방식 유지 | 1D Combo + 2D lag-pair(corr-max) + 다변량(참고)")
 
     btc_close = load_btc_close()
     dxy_close, dxy_used = load_dxy_close()
@@ -2342,7 +2494,7 @@ def run_tab_combo():
 
     y = base["btc_wret"]
 
-    with st.spinner("1D Combo(RET/DELTA) ê³ì° ì¤..."):
+    with st.spinner("1D Combo(RET/DELTA) 계산 중..."):
         corr_raw_cr, corr_masked_cr, beta_map_cr, tstat_map_cr, tstat_masked_cr, out_cr = rolling_maps_weekly(
             y_w=y, x_w=combo_ret, invert_x=TAB3_INVERT_X, lags_weeks=lags_weeks, quiet=False
         )
@@ -2372,17 +2524,17 @@ def run_tab_combo():
 
     sub1, sub2 = st.tabs(["1D Combo", "2D Lag-Pair + Multivariate"])
     with sub1:
-        s1, s2 = st.tabs(["Combo using Liquidity RETURNS", "Combo using Liquidity DELTA(Î)"])
+        s1, s2 = st.tabs(["Combo using Liquidity RETURNS", "Combo using Liquidity DELTA(Δ)"])
         with s1:
             render_model_section("1D COMBO (z(Liq RETURNS) + z(-DXY_ret)) vs BTC", corr_masked_cr, beta_map_cr, tstat_masked_cr, out_cr)
         with s2:
             render_model_section("1D COMBO (z(Liq DELTA) + z(-DXY_ret)) vs BTC", corr_masked_cd, beta_map_cd, tstat_masked_cd, out_cd)
 
-        st.success(f"TAB4/MAINì ì¬ì©ë  ìµì  lag(xx): {xx}ì£¼ | ì í combo={chosen} | ìµê·¼ best_corr_raw={best_corr_last:.4f}")
+        st.success(f"TAB4/MAIN에 사용될 최신 lag(xx): {xx}주 | 선택 combo={chosen} | 최근 best_corr_raw={best_corr_last:.4f}")
 
     with sub2:
-        st.caption(f"2D/ë¤ë³ëì ê³ì°ë ëë¬¸ì STEP={STEP_WEEKS_2D}ì£¼ë¡ íê°í©ëë¤. (pair ì íì corr-max)")
-        with st.spinner("2D lag-pair + ë¤ë³ë(RET/DELTA) ê³ì° ì¤..."):
+        st.caption(f"2D/다변량은 계산량 때문에 STEP={STEP_WEEKS_2D}주로 평가합니다. (pair 선택은 corr-max)")
+        with st.spinner("2D lag-pair + 다변량(RET/DELTA) 계산 중..."):
             best2d_ret, pair_counts_ret, lags_list = rolling_best_pair_and_multivar(
                 y=y, liq=base[liq_ret.name], dxy_ret=base["dxy_wret"],
                 lags_weeks=lags_weeks, window_weeks=WINDOW_WEEKS, step_weeks=STEP_WEEKS_2D
@@ -2392,7 +2544,7 @@ def run_tab_combo():
                 lags_weeks=lags_weeks, window_weeks=WINDOW_WEEKS, step_weeks=STEP_WEEKS_2D
             )
 
-        s1, s2 = st.tabs(["2D using Liquidity RETURNS", "2D using Liquidity DELTA(Î)"])
+        s1, s2 = st.tabs(["2D using Liquidity RETURNS", "2D using Liquidity DELTA(Δ)"])
         with s1:
             st.pyplot(plot_pair_count_heatmap(pair_counts_ret, lags_list, "Best (L_liq, L_dxy) selection counts (RET)"))
             st.dataframe(best2d_ret.tail(30))
@@ -2405,7 +2557,7 @@ def run_tab_combo():
 # TAB4 (LDLI vs BTC)
 # =========================
 def run_tab_forward_overlay():
-    st.subheader("TAB4) BTC vs LDLI(ì ëì±+ë¬ë¬ê°ë) ì í ì¤ë²ë ì´ (Forward-Look Window)")
+    st.subheader("TAB4) BTC vs LDLI(유동성+달러강도) 선행 오버레이 (Forward-Look Window)")
 
     try:
         payload = build_forward_overlay_payload(LIQ_SOURCE, ALPHA_MODE, FORECAST_MODEL)
@@ -2415,7 +2567,7 @@ def run_tab_forward_overlay():
 
     xx = int(payload["xx_latest"])
     st.success(
-        f"ì¬ì© lag(latest xx)={xx}ì£¼ | ì í combo={payload['chosen']} | ìµê·¼ best_corr_raw={payload['best_corr_last']:.4f}"
+        f"사용 lag(latest xx)={xx}주 | 선택 combo={payload['chosen']} | 최근 best_corr_raw={payload['best_corr_last']:.4f}"
     )
 
     full_idx = payload["full_idx"]
@@ -2457,7 +2609,7 @@ def run_tab5_multiasset():
     horizon_w = int(min(int(horizon_w_sel), xx))
     fit_w = st.selectbox("Fit window (weeks)", [78, 104, 156], index=1)
 
-    st.markdown("### TAB5 í¬ì§ì ì¤ì  (ì¥ê¸° ì¶ì¸ í¬ìí)")
+    st.markdown("### TAB5 포지션 설정 (장기 추세 투자형)")
     mode = st.selectbox(
         "Strategy / Position mode",
         [
@@ -2493,7 +2645,7 @@ def run_tab5_multiasset():
 
     asset_wclose = s_close.resample(WEEK_RULE).last().dropna()
     if asset_wclose.empty or asset_wclose.shape[0] < (fit_w + horizon_w + 20):
-        st.warning("ìì° ì£¼ê° ë°ì´í°ê° ë¶ì¡±í©ëë¤. (ê¸°ê°/fit/horizon ì¡°ì  íì)")
+        st.warning("자산 주간 데이터가 부족합니다. (기간/fit/horizon 조정 필요)")
         return
 
     # Drivers on weekly axis (use latest-shifted drivers)
@@ -2518,7 +2670,7 @@ def run_tab5_multiasset():
         return
 
     st.caption(
-        f"Forecast anchor: requested end_dt={pd.Timestamp(end_dt_req).date()} â used end_dt_eff={pd.Timestamp(fc['end_dt_eff']).date()} "
+        f"Forecast anchor: requested end_dt={pd.Timestamp(end_dt_req).date()} → used end_dt_eff={pd.Timestamp(fc['end_dt_eff']).date()} "
         f"| drivers-max_h(at end_dt_eff)={fc.get('max_h', np.nan)}w | h_used={fc.get('h', np.nan)}w"
     )
 
@@ -2542,8 +2694,8 @@ def run_tab5_multiasset():
     fig.tight_layout()
     st.pyplot(fig)
 
-    st.markdown("### Walk-forward Backtest (drivers-only future; realized at tât+h)")
-    with st.spinner("Backtest ê³ì° ì¤..."):
+    st.markdown("### Walk-forward Backtest (drivers-only future; realized at t→t+h)")
+    with st.spinner("Backtest 계산 중..."):
         bt = walk_forward_backtest_overlapping_driversonly(
             px_wclose=asset_wclose,
             liq_shifted_full=liq_shifted_full,
@@ -2555,7 +2707,7 @@ def run_tab5_multiasset():
         )
 
     if bt is None or bt.empty:
-        st.warning("Backtest ê²°ê³¼ê° ë¹ì´ ììµëë¤. (ê³µíµêµ¬ê° ë¶ì¡±)")
+        st.warning("Backtest 결과가 비어 있습니다. (공통구간 부족)")
         return
 
     bt = bt.copy()
@@ -2596,7 +2748,7 @@ def run_tab5_multiasset():
     st.markdown("#### Backtest table (tail)")
     st.dataframe(bt2.tail(80))
 
-    st.markdown("### TAB5 One-file CSV ë¤ì´ë¡ë (bt + pos + trades-marks)")
+    st.markdown("### TAB5 One-file CSV 다운로드 (bt + pos + trades-marks)")
     try:
         df_u = bt2.copy()
         df_u["trade_flag_nonoverlap"] = 0
@@ -2608,23 +2760,23 @@ def run_tab5_multiasset():
 
         st.download_button(
             "Download TAB5 unified CSV",
-            data=df_u.to_csv(index=True).encode("utf-8"),
+            data=df_u.to_csv(index=True).encode("utf-8-sig"),
             file_name=f"tab5_UNIFIED_{asset_key.replace(' ', '_')}_h{horizon_w}w_fit{fit_w}w_xx{xx}w_{APP_VERSION}.csv",
             mime="text/csv",
         )
     except Exception as e:
-        st.warning(f"Unified CSV ìì± ì¤ ì¤ë¥: {e}")
+        st.warning(f"Unified CSV 생성 중 오류: {e}")
 
     st.download_button(
         "Download TAB5 backtest CSV",
-        data=bt2.to_csv(index=True).encode("utf-8"),
+        data=bt2.to_csv(index=True).encode("utf-8-sig"),
         file_name=f"tab5_backtest_{asset_key.replace(' ', '_')}_h{horizon_w}w_fit{fit_w}w_xx{xx}w_{APP_VERSION}.csv",
         mime="text/csv",
     )
     if trades is not None and not trades.empty:
         st.download_button(
             "Download TAB5 trades CSV",
-            data=trades.to_csv(index=True).encode("utf-8"),
+            data=trades.to_csv(index=True).encode("utf-8-sig"),
             file_name=f"tab5_trades_{asset_key.replace(' ', '_')}_h{horizon_w}w_fit{fit_w}w_xx{xx}w_{APP_VERSION}.csv",
             mime="text/csv",
         )
@@ -2635,7 +2787,7 @@ def run_tab5_multiasset():
 # =========================
 tab_main, tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "MAIN (True-history + Spaghetti)",
-    "TAB1 DXY(ì­ì¶) vs BTC",
+    "TAB1 DXY(역축) vs BTC",
     "TAB2 Liquidity vs BTC",
     "TAB3 Combo + 2D Lag-Pair",
     "TAB4 Forward Overlay (LDLI vs BTC)",
