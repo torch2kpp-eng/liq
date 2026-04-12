@@ -14,7 +14,7 @@
 #     - latest_forecast_path (current anchor forecast)
 #
 # Data sources:
-#  - BTC, DXY, multi-assets: Stooq (daily -> weekly last)
+#  - BTC, DXY, multi-assets: Yahoo primary (yfinance), Stooq fallback
 #  - Liquidity:
 #     A) Fed Net Liquidity (FRED): WALCL - TGA - RRPONTSYD (RRP in billions -> millions)
 #     B) G2 M2 USD: US M2SL (FRED, billions USD) + EA M2 (ECB, EUR) * EURUSD (ECB)
@@ -22,6 +22,7 @@
 # Notes:
 #  - This app intentionally favors correctness/traceability over speed (spaghetti is expensive).
 #  - If ECB endpoints change, G2 mode may error; Fed mode remains available.
+#  - Price loader was upgraded in v2.18.1 because Stooq CSV can return non-CSV payloads.
 
 import io
 import math
@@ -38,7 +39,7 @@ import matplotlib.pyplot as plt
 # =========================
 # FIXED CONFIG (NO CONTROLS)
 # =========================
-APP_VERSION = "v2.18-ecm-ldli-level-spaghetti-dynlag-weekly"
+APP_VERSION = "v2.18.1-pricefix-yahoo-primary"
 
 START_DATE = "2015-01-01"
 
@@ -65,7 +66,12 @@ TAB1_INVERT_X = True
 TAB2_INVERT_X = False
 TAB3_INVERT_X = False
 
-# Stooq symbols
+# Price symbols / source preference
+# Primary: Yahoo Finance via yfinance
+# Fallback: Stooq (kept only as secondary backup; Stooq CSV endpoint can change)
+YAHOO_BTC = "BTC-USD"
+YAHOO_DXY = "DX-Y.NYB"
+
 STOOQ_BTC = "btcusd"
 STOOQ_DXY_PRIMARY = "dx.f"
 STOOQ_DXY_FALLBACK = "usd_i"
@@ -111,9 +117,22 @@ SPAGHETTI_LW = 1.1               # spaghetti linewidth
 SPAGHETTI_MAX_ANCHORS = None     # None means use all anchors
 
 # =========================
-# Multi-asset mapping (Stooq candidates)
+# Multi-asset mapping (Yahoo primary / Stooq fallback)
 # =========================
-ASSET_SYMBOLS: Dict[str, List[str]] = {
+ASSET_SYMBOLS_YAHOO: Dict[str, List[str]] = {
+    "Bitcoin (BTCUSD)": [YAHOO_BTC],
+    "Gold (XAUUSD)": ["GC=F"],
+    "Silver (XAGUSD)": ["SI=F"],
+    "Nasdaq (Composite)": ["^IXIC"],
+    "KOSPI": ["^KS11"],
+
+    "Ethereum (ETH)": ["ETH-USD"],
+    "Dogecoin (DOGE)": ["DOGE-USD"],
+    "Chainlink (LINK)": ["LINK-USD"],
+    "Cardano (ADA)": ["ADA-USD"],
+}
+
+ASSET_SYMBOLS_STOOQ: Dict[str, List[str]] = {
     "Bitcoin (BTCUSD)": [STOOQ_BTC, "btc.v"],
     "Gold (XAUUSD)": ["xauusd"],
     "Silver (XAGUSD)": ["xagusd"],
@@ -196,8 +215,73 @@ with st.expander("ê³ ì  íë¼ë¯¸í°(ìë ¥ê°) ë³
 
 
 # =========================
-# Robust Stooq loader
+# Price loaders (Yahoo primary / Stooq fallback)
 # =========================
+def _strip_tz_index(idx: pd.Index) -> pd.DatetimeIndex:
+    idx = pd.to_datetime(idx)
+    tz = getattr(idx, "tz", None)
+    if tz is not None:
+        idx = idx.tz_convert(None)
+    return pd.DatetimeIndex(idx)
+
+
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def fetch_yahoo_daily(symbol: str) -> pd.Series:
+    try:
+        import yfinance as yf
+    except Exception as e:
+        raise RuntimeError(
+            "Yahoo loader requires yfinance. Install with: pip install yfinance"
+        ) from e
+
+    end_plus_one = (pd.to_datetime(END_DATE) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    try:
+        df = yf.download(
+            symbol,
+            start=START_DATE,
+            end=end_plus_one,
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+        )
+    except Exception as e:
+        raise RuntimeError(f"Yahoo download failed for symbol={symbol}: {e}") from e
+
+    if df is None or df.empty:
+        raise RuntimeError(f"Yahoo returned empty data for symbol={symbol}")
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+
+    cols = {str(c).strip().lower(): c for c in df.columns}
+    close_col = cols.get("adj close") or cols.get("close")
+    if close_col is None:
+        raise RuntimeError(f"Yahoo schema unexpected for {symbol}: cols={list(df.columns)[:10]}")
+
+    s = df[close_col]
+    if isinstance(s, pd.DataFrame):
+        s = s.iloc[:, 0]
+    s = pd.to_numeric(s, errors="coerce").dropna()
+    s.index = _strip_tz_index(s.index)
+    s = s.sort_index()
+    s.name = symbol
+    return s
+
+
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def fetch_yahoo_daily_multi(candidates: List[str]) -> Tuple[pd.Series, str]:
+    last_err = None
+    for sym in candidates:
+        try:
+            s = fetch_yahoo_daily(sym)
+            if s is not None and not s.empty:
+                return s, sym
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"Failed to load from Yahoo candidates={candidates}. Last error={last_err}")
+
+
 @st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
 def fetch_stooq_daily(symbol: str) -> pd.Series:
     sym_q = quote_plus(symbol.strip().lower())
@@ -206,7 +290,9 @@ def fetch_stooq_daily(symbol: str) -> pd.Series:
     r.raise_for_status()
     txt = (r.text or "").strip()
 
-    head = txt[:250].lower()
+    head = txt[:500].lower()
+    if "get your apikey" in head or "apikey" in head and "stooq" in head and ("date" not in head or "close" not in head):
+        raise RuntimeError(f"Stooq CSV endpoint requires apikey or returned a non-CSV response for symbol={symbol}")
     if head.startswith("<") or "document.write" in head or ("date" not in head and "close" not in head):
         raise RuntimeError(f"Non-CSV payload from Stooq for symbol={symbol}")
 
@@ -219,9 +305,9 @@ def fetch_stooq_daily(symbol: str) -> pd.Series:
 
     df[date_col] = pd.to_datetime(df[date_col])
     df = df.sort_values(date_col).set_index(date_col)
-    s = df[close_col].astype(float)
+    s = pd.to_numeric(df[close_col], errors="coerce").dropna()
     s.name = symbol
-    return s.dropna()
+    return s
 
 
 @st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
@@ -236,6 +322,27 @@ def fetch_stooq_daily_multi(candidates: List[str]) -> Tuple[pd.Series, str]:
             last_err = e
             continue
     raise RuntimeError(f"Failed to load from Stooq candidates={candidates}. Last error={last_err}")
+
+
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def fetch_price_daily_multi(yahoo_candidates: List[str], stooq_candidates: Optional[List[str]] = None) -> Tuple[pd.Series, str]:
+    errs = []
+
+    if yahoo_candidates:
+        try:
+            s, used = fetch_yahoo_daily_multi(yahoo_candidates)
+            return s, f"Yahoo:{used}"
+        except Exception as e:
+            errs.append(f"Yahoo={e}")
+
+    if stooq_candidates:
+        try:
+            s, used = fetch_stooq_daily_multi(stooq_candidates)
+            return s, f"Stooq:{used}"
+        except Exception as e:
+            errs.append(f"Stooq={e}")
+
+    raise RuntimeError(" | ".join(errs) if errs else "No price source candidates provided")
 
 
 # =========================
@@ -826,27 +933,24 @@ def render_model_section(label: str, corr_masked, beta_map, tstat_masked, out):
 # =========================
 @st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
 def load_asset_close(asset_key: str) -> Tuple[pd.Series, str]:
-    candidates = ASSET_SYMBOLS.get(asset_key, None)
-    if not candidates:
+    yahoo_candidates = ASSET_SYMBOLS_YAHOO.get(asset_key, [])
+    stooq_candidates = ASSET_SYMBOLS_STOOQ.get(asset_key, [])
+    if not yahoo_candidates and not stooq_candidates:
         raise RuntimeError(f"Unknown asset_key={asset_key}")
-    s, used = fetch_stooq_daily_multi(candidates)
+
+    s, used = fetch_price_daily_multi(yahoo_candidates, stooq_candidates)
     return s.loc[START_DATE:END_DATE], used
 
 
 @st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
 def load_btc_close() -> pd.Series:
-    s = fetch_stooq_daily(STOOQ_BTC)
+    s, _used = fetch_price_daily_multi([YAHOO_BTC], [STOOQ_BTC, "btc.v"])
     return s.loc[START_DATE:END_DATE]
 
 
 @st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
 def load_dxy_close() -> Tuple[pd.Series, str]:
-    try:
-        s = fetch_stooq_daily(STOOQ_DXY_PRIMARY)
-        used = STOOQ_DXY_PRIMARY
-    except Exception:
-        s = fetch_stooq_daily(STOOQ_DXY_FALLBACK)
-        used = STOQ_DXY_FALLBACK if 'STOQ_DXY_FALLBACK' in globals() else STOOQ_DXY_FALLBACK
+    s, used = fetch_price_daily_multi([YAHOO_DXY], [STOOQ_DXY_PRIMARY, STOOQ_DXY_FALLBACK])
     return s.loc[START_DATE:END_DATE], used
 
 
@@ -2142,7 +2246,7 @@ def run_tab_dxy():
 
     btc_close = load_btc_close()
     dxy_close, dxy_used = load_dxy_close()
-    st.caption(f"Data: Stooq | BTC={STOOQ_BTC}, DXY={dxy_used}")
+    st.caption(f"Price data loaded | DXY={dxy_used}")
 
     btc_wret = weekly_log_returns(btc_close, WEEK_RULE).rename("btc_wret")
     dxy_wret = weekly_log_returns(dxy_close, WEEK_RULE).rename("dxy_wret")
@@ -2210,7 +2314,7 @@ def run_tab_combo():
     dxy_close, dxy_used = load_dxy_close()
     liq_level_daily, snapshot, liq_label, unit_label = load_liquidity_source_daily(LIQ_SOURCE)
 
-    st.write(f"Data: Stooq | BTC={STOOQ_BTC}, DXY={dxy_used} | Liquidity: {liq_label}")
+    st.write(f"Price data loaded | DXY={dxy_used} | Liquidity: {liq_label}")
     st.dataframe(snapshot.tail(5))
 
     btc_wret = weekly_log_returns(btc_close, WEEK_RULE).rename("btc_wret")
@@ -2382,7 +2486,7 @@ def run_tab5_multiasset():
 
     try:
         s_close, used_sym = load_asset_close(asset_key)
-        st.caption(f"{asset_key} loaded via Stooq: {used_sym}")
+        st.caption(f"{asset_key} loaded via {used_sym}")
     except Exception as e:
         st.error(f"Asset load failed: {e}")
         return
