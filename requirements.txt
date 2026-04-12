@@ -13,3 +13,8 @@ numpy
 requests
 python-dateutil
 matplotlib
+
+scikit-learn
+xgboost
+
+yfinance>=1.2.1
