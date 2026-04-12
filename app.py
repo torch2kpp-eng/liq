@@ -768,6 +768,7 @@ def load_alpha_inputs_weekly(
             "mvrv_source": mvrv_file_name or "none",
             "funding_loaded": bool(not funding_z.dropna().empty),
             "funding_symbol": funding_symbol if use_binance_funding else "disabled",
+            "funding_source": (f"binance:{funding_symbol.upper()}" if use_binance_funding else "disabled"),
             "funding_error": funding_error,
         },
     }
@@ -1614,6 +1615,126 @@ def compute_regime_multipliers(regime_state: pd.Series) -> pd.DataFrame:
     }, index=idx)
 
 
+
+def add_raw_regime_diagnostics(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    one-file exportìì raw regime íë¨ ê·¼ê±°ë¥¼ ì­ì¶ì íê¸° ìí ì§ë¨ ì»¬ë¼ ì¶ê°.
+    ê¸°ë ìë ¥ ì»¬ë¼:
+      - z_liq_s
+      - z_dxy_s
+      - dir_liq_sum
+      - dir_dxy_sum
+      - regime_shifted
+      - conflict_flag
+    """
+    out = df.copy()
+    out["dir_liq_s"] = np.sign(pd.to_numeric(out.get("dir_liq_sum"), errors="coerce"))
+    out["dir_dxy_s"] = np.sign(pd.to_numeric(out.get("dir_dxy_sum"), errors="coerce"))
+    out["dir_sum"] = pd.to_numeric(out["dir_liq_s"], errors="coerce") + pd.to_numeric(out["dir_dxy_s"], errors="coerce")
+    out["raw_regime_base"] = out.get("regime_shifted", pd.Series(index=out.index, dtype="object")).fillna("NEUTRAL")
+    out["raw_conflict_flag"] = out.get("conflict_flag", pd.Series(index=out.index, dtype="float64")).fillna(0).astype(int)
+
+    def _rule_code(row):
+        a = row.get("dir_liq_s", np.nan)
+        b = row.get("dir_dxy_s", np.nan)
+        if pd.isna(a) or pd.isna(b):
+            return np.nan
+
+        def enc(v):
+            if v > 0:
+                return "1"
+            if v < 0:
+                return "m1"
+            return "0"
+
+        base = str(row.get("raw_regime_base", "NEUTRAL"))
+        return f"{base}_{enc(a)}_{enc(b)}"
+
+    out["raw_regime_rule_code"] = out.apply(_rule_code, axis=1)
+    return out
+
+
+def summarize_alpha_merge_status(df: pd.DataFrame, alpha_inputs: dict) -> dict:
+    """
+    funding / mvrvê° ì¤ì ë¡ mergeëìëì§ one-fileì ë¨ê¸¸ ë©í ìì½.
+    """
+    meta = alpha_inputs.get("meta", {}) if isinstance(alpha_inputs, dict) else {}
+    funding_series = pd.to_numeric(df.get("funding_rate_w"), errors="coerce") if "funding_rate_w" in df.columns else pd.Series(dtype="float64")
+    funding_8w_ma = pd.to_numeric(df.get("funding_8w_ma"), errors="coerce") if "funding_8w_ma" in df.columns else pd.Series(dtype="float64")
+    funding_z = pd.to_numeric(df.get("funding_z"), errors="coerce") if "funding_z" in df.columns else pd.Series(dtype="float64")
+    mvrv_z = pd.to_numeric(df.get("mvrv_z"), errors="coerce") if "mvrv_z" in df.columns else pd.Series(dtype="float64")
+
+    funding_nonnull_count = int(funding_series.notna().sum()) if len(funding_series) else 0
+    mvrv_nonnull_count = int(mvrv_z.notna().sum()) if len(mvrv_z) else 0
+
+    funding_last_valid_dt = funding_series.dropna().index.max() if funding_nonnull_count > 0 else pd.NaT
+    mvrv_last_valid_dt = mvrv_z.dropna().index.max() if mvrv_nonnull_count > 0 else pd.NaT
+
+    if (funding_nonnull_count > 0) and (mvrv_nonnull_count > 0):
+        alpha_ready = "full"
+    elif (funding_nonnull_count > 0) or (mvrv_nonnull_count > 0):
+        alpha_ready = "partial"
+    else:
+        alpha_ready = "none"
+
+    return {
+        "funding_available_flag": int(funding_nonnull_count > 0),
+        "funding_source": str(meta.get("funding_source", "none")),
+        "funding_last_valid_dt": funding_last_valid_dt,
+        "funding_nonnull_count": funding_nonnull_count,
+        "funding_weekly_mean_latest": float(funding_series.dropna().iloc[-1]) if funding_nonnull_count > 0 else np.nan,
+        "funding_8w_ma_latest": float(funding_8w_ma.dropna().iloc[-1]) if len(funding_8w_ma.dropna()) > 0 else np.nan,
+        "funding_8w_ma_z_latest": float(funding_z.dropna().iloc[-1]) if len(funding_z.dropna()) > 0 else np.nan,
+        "funding_state_latest": str(df["funding_state"].dropna().iloc[-1]) if ("funding_state" in df.columns and len(df["funding_state"].dropna()) > 0) else "alpha_neutral",
+        "mvrv_available_flag": int(mvrv_nonnull_count > 0),
+        "mvrv_source": str(meta.get("mvrv_source", "none")),
+        "mvrv_last_valid_dt": mvrv_last_valid_dt,
+        "mvrv_nonnull_count": mvrv_nonnull_count,
+        "alpha_inputs_ready_flag": alpha_ready,
+    }
+
+
+def compute_current_h19_decision_row(
+    btc_end: pd.Timestamp,
+    btc_last_px: float,
+    current_regime_state: str,
+    current_confidence_bucket: str,
+    current_path_mult: float,
+    current_pos_mult: float,
+    pred_path_current_h19_raw: pd.Series,
+    pred_path_current_h19_adj: pd.Series,
+) -> dict:
+    """
+    íì¬ anchor ê¸°ì¤ fixed-H19 decision ê°ì one-file exportì ë°ë³µ ì ì¥íê¸° ìí row ë©í ìì±.
+    """
+    out = {
+        "current_anchor_dt": btc_end,
+        "current_predicted_ret_19w_raw": np.nan,
+        "current_predicted_ret_19w_adj": np.nan,
+        "current_predicted_px_19w_raw": np.nan,
+        "current_predicted_px_19w_adj": np.nan,
+        "current_regime_state": current_regime_state,
+        "current_confidence_bucket": current_confidence_bucket,
+        "current_regime_path_multiplier": current_path_mult,
+        "current_regime_position_multiplier": current_pos_mult,
+        "current_suggested_exposure": np.nan,
+    }
+
+    if pred_path_current_h19_raw is not None and len(pred_path_current_h19_raw.dropna()) > 0:
+        px_raw = float(pred_path_current_h19_raw.dropna().iloc[-1])
+        out["current_predicted_px_19w_raw"] = px_raw
+        out["current_predicted_ret_19w_raw"] = float(np.log(px_raw / float(btc_last_px)))
+
+    if pred_path_current_h19_adj is not None and len(pred_path_current_h19_adj.dropna()) > 0:
+        px_adj = float(pred_path_current_h19_adj.dropna().iloc[-1])
+        out["current_predicted_px_19w_adj"] = px_adj
+        out["current_predicted_ret_19w_adj"] = float(np.log(px_adj / float(btc_last_px)))
+        if np.isfinite(out["current_predicted_ret_19w_adj"]) and np.isfinite(current_pos_mult):
+            out["current_suggested_exposure"] = float(np.sign(out["current_predicted_ret_19w_adj"]) * float(current_pos_mult))
+
+    return out
+
+
 def apply_path_multiplier_to_price_path(
     raw_path: pd.Series,
     anchor_px: float,
@@ -2379,6 +2500,7 @@ def build_forward_overlay_payload(
             if _c in regime_diag_shifted.columns:
                 overlay_master_df[_c] = pd.to_numeric(regime_diag_shifted[_c], errors="coerce").reindex(overlay_master_df.index)
     overlay_master_df["conflict_flag"] = (overlay_master_df["regime_shifted"] == "CONFLICT").astype(int)
+    overlay_master_df = add_raw_regime_diagnostics(overlay_master_df)
     overlay_master_df = add_recent_slice_flags(overlay_master_df)
     overlay_master_df = add_horizon_targets(overlay_master_df, px_col="btc_close", horizon_w=H19_DIAG_W)
 
@@ -2391,6 +2513,11 @@ def build_forward_overlay_payload(
     )
     overlay_master_df["mvrv_z"] = alpha_inputs["mvrv_z"].reindex(overlay_master_df.index)
     overlay_master_df["funding_rate_w"] = alpha_inputs["funding_rate_w"].reindex(overlay_master_df.index)
+    overlay_master_df["funding_8w_ma"] = (
+        pd.to_numeric(overlay_master_df["funding_rate_w"], errors="coerce")
+        .rolling(8, min_periods=4)
+        .mean()
+    )
     overlay_master_df["funding_z"] = alpha_inputs["funding_z"].reindex(overlay_master_df.index)
     overlay_master_df["mvrv_state"] = classify_mvrv_state(overlay_master_df["mvrv_z"])
     overlay_master_df["funding_state"] = classify_funding_state(overlay_master_df["funding_z"])
@@ -2493,6 +2620,26 @@ def build_forward_overlay_payload(
     except Exception:
         pass
 
+    current_decision = compute_current_h19_decision_row(
+        btc_end=btc_end,
+        btc_last_px=float(btc_wclose_full.iloc[-1]),
+        current_regime_state=str(current_row.get("regime_state", "NEUTRAL")),
+        current_confidence_bucket=str(current_row.get("confidence_bucket", "MID")),
+        current_path_mult=float(current_path_mult),
+        current_pos_mult=float(current_pos_mult) if np.isfinite(current_pos_mult) else np.nan,
+        pred_path_current_h19_raw=pred_path_current_h19_raw,
+        pred_path_current_h19_adj=pred_path_current_h19_adj,
+    )
+    current_decision["current_alpha_state"] = str(current_row.get("alpha_state", "alpha_neutral"))
+    current_decision["current_path_multiplier"] = current_decision["current_regime_path_multiplier"]
+    current_decision["current_position_multiplier"] = current_decision["current_regime_position_multiplier"]
+    for _k, _v in current_decision.items():
+        overlay_master_df[_k] = _v
+
+    alpha_merge_meta = summarize_alpha_merge_status(overlay_master_df, alpha_inputs)
+    for _k, _v in alpha_merge_meta.items():
+        overlay_master_df[_k] = _v
+
     scorecard_h19_full_raw = build_horizon_scorecard(
         overlay_master_df, horizon_w=H19_DIAG_W, group_col=None,
         pred_ret_col="predicted_fwd_ret_19w", real_ret_col="realized_fwd_ret_19w"
@@ -2541,16 +2688,6 @@ def build_forward_overlay_payload(
 
     alpha_meta = alpha_inputs.get("meta", {}) if isinstance(alpha_inputs, dict) else {}
 
-    current_decision = {
-        "current_regime_state": str(current_row.get("regime_state", "NA")),
-        "current_alpha_state": str(current_row.get("alpha_state", "alpha_neutral")),
-        "current_confidence_bucket": str(current_row.get("confidence_bucket", "NA")),
-        "current_pred_ret_19w_raw": float(current_pred_ret_19w_raw) if np.isfinite(current_pred_ret_19w_raw) else float(current_row.get("predicted_fwd_ret_19w", np.nan)),
-        "current_pred_ret_19w_adj": float(current_pred_ret_19w_adj) if np.isfinite(current_pred_ret_19w_adj) else float(current_row.get("predicted_fwd_ret_19w_adj", np.nan)),
-        "current_position_multiplier": float(current_row.get("regime_position_multiplier", np.nan)),
-        "current_path_multiplier": float(current_row.get("regime_path_multiplier", np.nan)),
-        "current_suggested_exposure": float(current_suggested_exposure) if np.isfinite(current_suggested_exposure) else float(current_row.get("suggested_exposure", np.nan)),
-    }
 
     return {
         "liq_source": liq_source,
@@ -2605,6 +2742,7 @@ def build_forward_overlay_payload(
         "regime_diag_recent52": regime_diag_recent52,
         "current_decision": current_decision,
         "alpha_meta": alpha_meta,
+        "alpha_merge_meta": alpha_merge_meta,
     }
 
 
@@ -3112,7 +3250,17 @@ def run_main_tab():
             "predicted_fwd_px_19w_adj", "predicted_fwd_ret_19w_adj", "predicted_sign_19w_adj",
             "signal_hit_19w", "regime_state", "regime_path_multiplier", "regime_position_multiplier",
             "confidence_bucket", "suggested_exposure", "recent_52w_flag", "recent_104w_flag",
-            "alpha_state", "mvrv_state", "funding_state", "endpoint_dt_h19", "lag_weeks_h19"
+            "alpha_state", "mvrv_state", "funding_state", "endpoint_dt_h19", "lag_weeks_h19",
+            "z_liq_s", "z_dxy_s", "dir_liq_sum", "dir_dxy_sum", "dir_liq_s", "dir_dxy_s", "dir_sum",
+            "raw_regime_base", "raw_regime_rule_code", "raw_conflict_flag",
+            "funding_rate_w", "funding_8w_ma", "funding_z", "mvrv_z",
+            "funding_available_flag", "funding_source", "funding_last_valid_dt", "funding_nonnull_count",
+            "funding_weekly_mean_latest", "funding_8w_ma_latest", "funding_8w_ma_z_latest", "funding_state_latest",
+            "mvrv_available_flag", "mvrv_source", "mvrv_last_valid_dt", "mvrv_nonnull_count", "alpha_inputs_ready_flag",
+            "current_anchor_dt", "current_predicted_ret_19w_raw", "current_predicted_ret_19w_adj",
+            "current_predicted_px_19w_raw", "current_predicted_px_19w_adj",
+            "current_regime_state", "current_confidence_bucket",
+            "current_regime_path_multiplier", "current_regime_position_multiplier", "current_suggested_exposure"
         ]
         for c in enrich_cols:
             if c in master.columns:
@@ -3122,6 +3270,31 @@ def run_main_tab():
         df_one["alpha_mode"] = payload.get("alpha_mode", "OLS (learn alpha)")
         df_one["combo_type"] = payload["chosen"]
         df_one["xx_latest"] = xx
+
+        preferred_cols = [
+            "btc_close",
+            "ldli_shifted_total", "ldli_shifted_liq", "ldli_shifted_dxy",
+            "regime_shifted", "conflict_flag", "regime_state",
+            "z_liq_s", "z_dxy_s", "dir_liq_sum", "dir_dxy_sum", "dir_liq_s", "dir_dxy_s", "dir_sum",
+            "raw_regime_base", "raw_regime_rule_code", "raw_conflict_flag",
+            "realized_fwd_ret_19w", "predicted_fwd_ret_19w", "predicted_fwd_ret_19w_adj",
+            "realized_sign_19w", "predicted_sign_19w", "predicted_sign_19w_adj", "signal_hit_19w",
+            "regime_path_multiplier", "regime_position_multiplier", "confidence_bucket", "suggested_exposure",
+            "funding_rate_w", "funding_8w_ma", "funding_z", "funding_state",
+            "mvrv_z", "mvrv_state", "alpha_state",
+            "funding_available_flag", "funding_source", "funding_last_valid_dt", "funding_nonnull_count",
+            "funding_weekly_mean_latest", "funding_8w_ma_latest", "funding_8w_ma_z_latest", "funding_state_latest",
+            "mvrv_available_flag", "mvrv_source", "mvrv_last_valid_dt", "mvrv_nonnull_count", "alpha_inputs_ready_flag",
+            "current_anchor_dt", "current_predicted_ret_19w_raw", "current_predicted_ret_19w_adj",
+            "current_predicted_px_19w_raw", "current_predicted_px_19w_adj",
+            "current_regime_state", "current_confidence_bucket",
+            "current_regime_path_multiplier", "current_regime_position_multiplier", "current_suggested_exposure",
+            f"latest_forecast_path_raw_to_{xx}w", f"latest_forecast_path_adj_to_{xx}w",
+            "liq_source", "alpha_mode", "combo_type", "xx_latest",
+        ]
+        existing_cols = [c for c in preferred_cols if c in df_one.columns]
+        other_cols = [c for c in df_one.columns if c not in existing_cols]
+        df_one = df_one[existing_cols + other_cols]
 
         st.download_button(
             "Download MAIN/TAB4 one-file CSV",
@@ -3381,6 +3554,27 @@ def run_tab_forward_overlay():
     with col6:
         st.caption("Regime diagnostic means")
         st.dataframe(payload.get("regime_diag_recent104", pd.DataFrame()))
+
+    st.markdown("### Current Decision Audit")
+    cur = payload.get("current_decision", {})
+    if cur:
+        st.dataframe(pd.DataFrame([{
+            "anchor_dt": cur.get("current_anchor_dt"),
+            "pred_ret_19w_raw": cur.get("current_predicted_ret_19w_raw", cur.get("current_pred_ret_19w_raw")),
+            "pred_ret_19w_adj": cur.get("current_predicted_ret_19w_adj", cur.get("current_pred_ret_19w_adj")),
+            "pred_px_19w_raw": cur.get("current_predicted_px_19w_raw"),
+            "pred_px_19w_adj": cur.get("current_predicted_px_19w_adj"),
+            "regime_state": cur.get("current_regime_state"),
+            "confidence": cur.get("current_confidence_bucket"),
+            "path_mult": cur.get("current_regime_path_multiplier", cur.get("current_path_multiplier")),
+            "pos_mult": cur.get("current_regime_position_multiplier", cur.get("current_position_multiplier")),
+            "suggested_exposure": cur.get("current_suggested_exposure"),
+        }]), use_container_width=True)
+
+    st.markdown("### Funding / Alpha Merge Audit")
+    meta = payload.get("alpha_merge_meta", {})
+    if meta:
+        st.dataframe(pd.DataFrame([meta]), use_container_width=True)
 
     master = payload.get("overlay_master_df", pd.DataFrame())
     if master is not None and not master.empty:
