@@ -191,7 +191,8 @@ _patch_streamlit_text_apis()
 # =========================
 # FIXED CONFIG (NO CONTROLS)
 # =========================
-APP_VERSION = "v2.18.1-pricefix-yahoo-primary"
+APP_VERSION = "v2.18.3-signal-calibration-h19"
+H19_DIAG_W = 19
 
 START_DATE = "2015-01-01"
 
@@ -324,6 +325,22 @@ with st.sidebar:
         ],
         index=0,
     )
+
+    with st.expander(ui_text("Alpha Inputs (MVRV / Funding)"), expanded=False):
+        USE_BINANCE_FUNDING = st.checkbox(
+            "Use Binance funding auto-loader",
+            value=True,
+            help="Auto-load BTCUSDT funding history from Binance Futures and convert it to weekly funding z-score.",
+        )
+        FUNDING_SYMBOL = st.text_input("Funding symbol", value="BTCUSDT")
+        MVRV_FILE = st.file_uploader(
+            "MVRV Z CSV upload (optional)",
+            type=["csv"],
+            help="Upload a CSV with a date column and an MVRV Z / Z-score value column.",
+        )
+
+MVRV_FILE_BYTES = MVRV_FILE.getvalue() if MVRV_FILE is not None else None
+MVRV_FILE_NAME = MVRV_FILE.name if MVRV_FILE is not None else None
 
 FORECAST_MODEL = st.selectbox(
         "Forecast model (MAIN/TAB4)",
@@ -587,6 +604,173 @@ def zscore(s: pd.Series) -> pd.Series:
     if sd == 0 or not np.isfinite(sd):
         return s * np.nan
     return (s - mu) / sd
+
+
+def rolling_zscore(s: pd.Series, window: int = 104, min_periods: int = 26) -> pd.Series:
+    s = pd.to_numeric(s, errors="coerce")
+    mu = s.rolling(window, min_periods=min_periods).mean()
+    sd = s.rolling(window, min_periods=min_periods).std(ddof=0).replace(0.0, np.nan)
+    z = (s - mu) / sd
+    if z.dropna().empty:
+        z = zscore(s)
+    return z
+
+
+def decode_csv_bytes(file_bytes: bytes) -> str:
+    last_err = None
+    for enc in ("utf-8-sig", "utf-8", "cp949", "latin1"):
+        try:
+            return file_bytes.decode(enc)
+        except Exception as e:
+            last_err = e
+    raise RuntimeError(f"Unable to decode uploaded CSV bytes: {last_err}")
+
+
+def detect_date_column(df: pd.DataFrame) -> Optional[str]:
+    normalized = {str(c).strip().lower(): c for c in df.columns}
+    for key in ["date", "datetime", "time", "timestamp", "week", "dt"]:
+        if key in normalized:
+            return normalized[key]
+    return df.columns[0] if len(df.columns) else None
+
+
+def detect_value_column(df: pd.DataFrame, preferred: List[str]) -> Optional[str]:
+    normalized = {str(c).strip().lower(): c for c in df.columns}
+    for key in preferred:
+        if key in normalized:
+            return normalized[key]
+    for c in df.columns:
+        if str(c).strip().lower() not in {"date", "datetime", "time", "timestamp", "week", "dt"}:
+            if pd.api.types.is_numeric_dtype(df[c]):
+                return c
+    for c in df.columns:
+        if str(c).strip().lower() not in {"date", "datetime", "time", "timestamp", "week", "dt"}:
+            return c
+    return None
+
+
+def parse_datetime_series(raw: pd.Series) -> pd.Series:
+    if pd.api.types.is_numeric_dtype(raw):
+        dt_ms = pd.to_datetime(raw, unit="ms", errors="coerce")
+        if dt_ms.notna().mean() >= 0.5:
+            return dt_ms
+        return pd.to_datetime(raw, unit="s", errors="coerce")
+    return pd.to_datetime(raw, errors="coerce")
+
+
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def load_uploaded_mvrv_weekly(file_bytes: Optional[bytes], file_name: Optional[str], week_rule: str = WEEK_RULE) -> pd.Series:
+    if not file_bytes:
+        return pd.Series(dtype=float, name="mvrv_z")
+    csv_text = decode_csv_bytes(file_bytes)
+    df = pd.read_csv(io.StringIO(csv_text))
+    if df is None or df.empty:
+        return pd.Series(dtype=float, name="mvrv_z")
+
+    date_col = detect_date_column(df)
+    value_col = detect_value_column(
+        df,
+        preferred=[
+            "mvrv_z", "mvrv z", "mvrv_zscore", "mvrv z-score", "mvrv_z_score",
+            "zscore", "z_score", "value", "mvrv"
+        ],
+    )
+    if date_col is None or value_col is None:
+        raise RuntimeError(f"MVRV CSV parsing failed: date_col={date_col}, value_col={value_col}, file={file_name}")
+
+    dt = parse_datetime_series(df[date_col])
+    vals = pd.to_numeric(df[value_col], errors="coerce")
+    s = pd.Series(vals.values, index=dt).dropna()
+    s = s[~s.index.isna()]
+    s = s.sort_index()
+    s = s[~s.index.duplicated(keep="last")]
+    s = s.resample(week_rule).last()
+    s.name = "mvrv_z"
+    return s.dropna()
+
+
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def fetch_binance_funding_history(symbol: str = "BTCUSDT", start_date: str = START_DATE) -> pd.Series:
+    base_url = "https://fapi.binance.com/fapi/v1/fundingRate"
+    start_ms = int(pd.Timestamp(start_date, tz="UTC").timestamp() * 1000)
+    out_rows = []
+    cursor = start_ms
+
+    while True:
+        params = {"symbol": symbol.upper(), "startTime": cursor, "limit": 1000}
+        r = requests.get(base_url, params=params, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        rows = r.json()
+        if not rows:
+            break
+        out_rows.extend(rows)
+        last_ms = int(rows[-1]["fundingTime"])
+        if len(rows) < 1000:
+            break
+        cursor = last_ms + 1
+
+    if not out_rows:
+        return pd.Series(dtype=float, name="funding_rate")
+
+    df = pd.DataFrame(out_rows)
+    df["fundingTime"] = pd.to_datetime(pd.to_numeric(df["fundingTime"], errors="coerce"), unit="ms", utc=True).dt.tz_localize(None)
+    df["fundingRate"] = pd.to_numeric(df["fundingRate"], errors="coerce")
+    s = pd.Series(df["fundingRate"].values, index=df["fundingTime"]).sort_index()
+    s = s[~s.index.duplicated(keep="last")]
+    s.name = "funding_rate"
+    return s.dropna()
+
+
+def build_funding_weekly_zscore(
+    funding_raw: Optional[pd.Series],
+    week_rule: str = WEEK_RULE,
+    ma_weeks: int = 8,
+    z_window: int = 104,
+) -> Tuple[pd.Series, pd.Series]:
+    if funding_raw is None or len(funding_raw) == 0:
+        return pd.Series(dtype=float, name="funding_rate_w"), pd.Series(dtype=float, name="funding_z")
+    f = funding_raw.sort_index().dropna()
+    funding_w = f.resample(week_rule).mean()
+    funding_ma = funding_w.rolling(ma_weeks, min_periods=max(3, ma_weeks // 2)).mean()
+    funding_z = rolling_zscore(funding_ma, window=z_window, min_periods=max(26, ma_weeks * 2))
+    funding_w.name = "funding_rate_w"
+    funding_z.name = "funding_z"
+    return funding_w, funding_z
+
+
+def load_alpha_inputs_weekly(
+    mvrv_file_bytes: Optional[bytes],
+    mvrv_file_name: Optional[str],
+    use_binance_funding: bool,
+    funding_symbol: str,
+    week_rule: str = WEEK_RULE,
+) -> Dict[str, object]:
+    mvrv_z = load_uploaded_mvrv_weekly(mvrv_file_bytes, mvrv_file_name, week_rule=week_rule)
+    funding_raw = pd.Series(dtype=float, name="funding_rate")
+    funding_w = pd.Series(dtype=float, name="funding_rate_w")
+    funding_z = pd.Series(dtype=float, name="funding_z")
+    funding_error = None
+
+    if use_binance_funding:
+        try:
+            funding_raw = fetch_binance_funding_history(symbol=funding_symbol, start_date=START_DATE)
+            funding_w, funding_z = build_funding_weekly_zscore(funding_raw, week_rule=week_rule)
+        except Exception as e:
+            funding_error = str(e)
+
+    return {
+        "mvrv_z": mvrv_z,
+        "funding_raw": funding_raw,
+        "funding_rate_w": funding_w,
+        "funding_z": funding_z,
+        "meta": {
+            "mvrv_loaded": bool(not mvrv_z.dropna().empty),
+            "mvrv_source": mvrv_file_name or "none",
+            "funding_loaded": bool(not funding_z.dropna().empty),
+            "funding_symbol": funding_symbol if use_binance_funding else "disabled",
+            "funding_error": funding_error,
+        },
+    }
 
 
 # =========================
@@ -948,6 +1132,7 @@ def _shade_segments(ax, dates: pd.DatetimeIndex, mask: np.ndarray, alpha: float 
             seg_start = None
 
 
+
 def plot_main_overlay_with_predline(
     dates,
     btc_price,
@@ -960,7 +1145,8 @@ def plot_main_overlay_with_predline(
     title,
     btc_end,
     conflict_mask=None,
-    y2_label="LDLI components (shifted)"
+    y2_label="LDLI components (shifted)",
+    pred_path_latest_adj: Optional[pd.Series] = None,
 ):
     fig, ax1 = plt.subplots(figsize=(14, 8.0))
 
@@ -972,7 +1158,6 @@ def plot_main_overlay_with_predline(
     dmin = pd.DatetimeIndex(dates).min()
     dmax = pd.DatetimeIndex(dates).max()
 
-    # --- Spaghetti (true history paths) ---
     if spaghetti_paths:
         for ps in spaghetti_paths:
             if ps is None or ps.dropna().empty:
@@ -987,7 +1172,6 @@ def plot_main_overlay_with_predline(
                 alpha=float(SPAGHETTI_ALPHA),
             )
 
-    # --- Historical endpoint line (true history) ---
     if pred_hist_endpoint is not None and not pred_hist_endpoint.dropna().empty:
         s = pred_hist_endpoint.loc[(pred_hist_endpoint.index >= dmin) & (pred_hist_endpoint.index <= dmax)]
         if not s.dropna().empty:
@@ -998,15 +1182,24 @@ def plot_main_overlay_with_predline(
                 color="tab:green", alpha=0.85
             )
 
-    # --- Latest forecast path (current anchor) ---
     if pred_path_latest is not None and not pred_path_latest.dropna().empty:
         s2 = pred_path_latest.loc[(pred_path_latest.index >= dmin) & (pred_path_latest.index <= dmax)]
         if not s2.dropna().empty:
             ax1.plot(
                 s2.index, s2.values,
                 linewidth=2.6, linestyle="--",
-                label="Latest forecast path (to +xx)",
+                label="Latest forecast path (raw)",
                 color="tab:blue", alpha=0.55
+            )
+
+    if pred_path_latest_adj is not None and not pred_path_latest_adj.dropna().empty:
+        s3 = pred_path_latest_adj.loc[(pred_path_latest_adj.index >= dmin) & (pred_path_latest_adj.index <= dmax)]
+        if not s3.dropna().empty:
+            ax1.plot(
+                s3.index, s3.values,
+                linewidth=2.6, linestyle=":",
+                label="Latest forecast path (adjusted)",
+                color="tab:red", alpha=0.9
             )
 
     if conflict_mask is not None:
@@ -1015,7 +1208,6 @@ def plot_main_overlay_with_predline(
     if btc_end is not None and len(dates) > 0:
         ax1.axvspan(btc_end, pd.DatetimeIndex(dates).max(), color="gray", alpha=0.12)
 
-    # LDLI (different color from BTC)
     ax2 = ax1.twinx()
     ax2.plot(pd.DatetimeIndex(dates), ldli_level, label="LDLI Total (shifted)", linewidth=2.8, color="tab:orange", alpha=0.95)
     ax2.plot(pd.DatetimeIndex(dates), ldli_liq, label="LDLI Liquidity contrib (shifted)", linewidth=2.0, color="tab:purple", alpha=0.75)
@@ -1027,9 +1219,9 @@ def plot_main_overlay_with_predline(
     h1, l1 = ax1.get_legend_handles_labels()
     h2, l2 = ax2.get_legend_handles_labels()
     ax1.legend(h1 + h2, l1 + l2, loc="upper left")
-
     fig.tight_layout()
     return fig
+
 
 
 # =========================
@@ -1294,6 +1486,286 @@ def label_regime_v2(
     })
 
     return regime, diag
+
+
+
+def add_recent_slice_flags(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if out.empty:
+        out["recent_52w_flag"] = pd.Series(dtype="int64")
+        out["recent_104w_flag"] = pd.Series(dtype="int64")
+        return out
+    last_dt = pd.DatetimeIndex(out.index).max()
+    out["recent_52w_flag"] = (pd.DatetimeIndex(out.index) >= (last_dt - pd.Timedelta(weeks=52))).astype(int)
+    out["recent_104w_flag"] = (pd.DatetimeIndex(out.index) >= (last_dt - pd.Timedelta(weeks=104))).astype(int)
+    return out
+
+
+def add_horizon_targets(
+    df: pd.DataFrame,
+    px_col: str = "btc_close",
+    horizon_w: int = H19_DIAG_W,
+) -> pd.DataFrame:
+    out = df.copy()
+    px = pd.to_numeric(out[px_col], errors="coerce")
+    out[f"realized_fwd_px_{horizon_w}w"] = px.shift(-horizon_w)
+    out[f"realized_fwd_ret_{horizon_w}w"] = np.log(out[f"realized_fwd_px_{horizon_w}w"] / px)
+    out[f"realized_sign_{horizon_w}w"] = np.sign(out[f"realized_fwd_ret_{horizon_w}w"])
+    return out
+
+
+def classify_mvrv_state(mvrv_z: pd.Series) -> pd.Series:
+    if mvrv_z is None or len(mvrv_z) == 0:
+        return pd.Series(dtype="object")
+    s = pd.to_numeric(mvrv_z, errors="coerce")
+    out = pd.Series(index=s.index, dtype="object")
+    out[s <= 0.5] = "alpha_bull"
+    out[(s > 0.5) & (s < 3.0)] = "alpha_neutral"
+    out[s >= 3.0] = "alpha_bear"
+    return out.fillna("alpha_neutral")
+
+
+def classify_funding_state(funding_z: pd.Series) -> pd.Series:
+    if funding_z is None or len(funding_z) == 0:
+        return pd.Series(dtype="object")
+    s = pd.to_numeric(funding_z, errors="coerce")
+    out = pd.Series(index=s.index, dtype="object")
+    out[s <= -1.5] = "alpha_bull"
+    out[(s > -1.5) & (s < 1.5)] = "alpha_neutral"
+    out[s >= 1.5] = "alpha_bear"
+    return out.fillna("alpha_neutral")
+
+
+def compute_alpha_state(
+    mvrv_state: Optional[pd.Series],
+    funding_state: Optional[pd.Series],
+    index: Optional[pd.Index] = None,
+) -> pd.Series:
+    if mvrv_state is None and funding_state is None:
+        return pd.Series("alpha_neutral", index=index, dtype="object")
+    if mvrv_state is None:
+        return funding_state.fillna("alpha_neutral").astype("object")
+    if funding_state is None:
+        return mvrv_state.fillna("alpha_neutral").astype("object")
+    idx = mvrv_state.index.union(funding_state.index)
+    m = mvrv_state.reindex(idx).fillna("alpha_neutral")
+    f = funding_state.reindex(idx).fillna("alpha_neutral")
+    score = (
+        (m == "alpha_bull").astype(int) - (m == "alpha_bear").astype(int) +
+        (f == "alpha_bull").astype(int) - (f == "alpha_bear").astype(int)
+    )
+    out = pd.Series(index=idx, dtype="object")
+    out[score >= 1] = "alpha_bull"
+    out[score == 0] = "alpha_neutral"
+    out[score <= -1] = "alpha_bear"
+    return out.fillna("alpha_neutral")
+
+
+def split_conflict_state(
+    regime: pd.Series,
+    alpha_state: Optional[pd.Series] = None,
+    conflict_flag: Optional[pd.Series] = None,
+) -> pd.Series:
+    out = regime.copy().astype("object")
+    if alpha_state is None:
+        alpha_state = pd.Series("alpha_neutral", index=out.index, dtype="object")
+    else:
+        alpha_state = alpha_state.reindex(out.index).fillna("alpha_neutral")
+    if conflict_flag is None:
+        conflict_flag = (out == "CONFLICT")
+    else:
+        conflict_flag = conflict_flag.reindex(out.index).fillna(False).astype(bool)
+
+    out[(conflict_flag) & (alpha_state == "alpha_bull")] = "CONFLICT_BULLISH_ALPHA"
+    out[(conflict_flag) & (alpha_state != "alpha_bull")] = "CONFLICT_WEAK_ALPHA"
+    return out.fillna("NEUTRAL")
+
+
+def compute_regime_multipliers(regime_state: pd.Series) -> pd.DataFrame:
+    idx = regime_state.index
+    path_mult = pd.Series(0.90, index=idx, dtype="float64")
+    pos_mult = pd.Series(0.85, index=idx, dtype="float64")
+    conf = pd.Series("MID", index=idx, dtype="object")
+
+    path_mult[regime_state == "TAILWIND"] = 1.00
+    pos_mult[regime_state == "TAILWIND"] = 1.00
+    conf[regime_state == "TAILWIND"] = "HIGH"
+
+    path_mult[regime_state == "NEUTRAL"] = 0.90
+    pos_mult[regime_state == "NEUTRAL"] = 0.85
+    conf[regime_state == "NEUTRAL"] = "MID"
+
+    path_mult[regime_state == "CONFLICT_BULLISH_ALPHA"] = 0.80
+    pos_mult[regime_state == "CONFLICT_BULLISH_ALPHA"] = 0.70
+    conf[regime_state == "CONFLICT_BULLISH_ALPHA"] = "MID-LOW"
+
+    path_mult[regime_state == "CONFLICT_WEAK_ALPHA"] = 0.70
+    pos_mult[regime_state == "CONFLICT_WEAK_ALPHA"] = 0.55
+    conf[regime_state == "CONFLICT_WEAK_ALPHA"] = "LOW"
+
+    path_mult[regime_state == "HEADWIND"] = 0.60
+    pos_mult[regime_state == "HEADWIND"] = 0.40
+    conf[regime_state == "HEADWIND"] = "LOW"
+
+    return pd.DataFrame({
+        "regime_path_multiplier": path_mult,
+        "regime_position_multiplier": pos_mult,
+        "confidence_bucket": conf,
+    }, index=idx)
+
+
+def apply_path_multiplier_to_price_path(
+    raw_path: pd.Series,
+    anchor_px: float,
+    path_multiplier: float,
+) -> pd.Series:
+    if raw_path is None or len(raw_path) == 0 or not np.isfinite(anchor_px):
+        return pd.Series(dtype="float64")
+    s = pd.to_numeric(raw_path, errors="coerce").dropna().copy()
+    if s.empty:
+        return s
+    ret = np.log(s / float(anchor_px))
+    adj_ret = ret * float(path_multiplier)
+    adj_px = float(anchor_px) * np.exp(adj_ret)
+    adj_px.name = getattr(raw_path, "name", "adjusted_path")
+    return adj_px
+
+
+def build_horizon_scorecard(
+    df: pd.DataFrame,
+    horizon_w: int = H19_DIAG_W,
+    recent_key: Optional[str] = None,
+    group_col: Optional[str] = None,
+    pred_ret_col: Optional[str] = None,
+    real_ret_col: Optional[str] = None,
+) -> pd.DataFrame:
+    pred_ret_col = pred_ret_col or f"predicted_fwd_ret_{horizon_w}w"
+    real_ret_col = real_ret_col or f"realized_fwd_ret_{horizon_w}w"
+    pred_sign_col = pred_ret_col.replace("_ret_", "_sign_")
+    real_sign_col = real_ret_col.replace("_ret_", "_sign_")
+
+    cols = [pred_ret_col, real_ret_col]
+    if pred_sign_col in df.columns:
+        cols.append(pred_sign_col)
+    if real_sign_col in df.columns:
+        cols.append(real_sign_col)
+    if group_col is not None and group_col in df.columns:
+        cols.append(group_col)
+    if recent_key is not None and recent_key in df.columns:
+        cols.append(recent_key)
+
+    tmp = df[cols].copy()
+    if recent_key is not None and recent_key in tmp.columns:
+        tmp = tmp[tmp[recent_key].fillna(0).astype(int) == 1]
+    tmp = tmp.dropna(subset=[pred_ret_col, real_ret_col])
+    if tmp.empty:
+        return pd.DataFrame()
+
+    if pred_sign_col not in tmp.columns:
+        tmp[pred_sign_col] = np.sign(tmp[pred_ret_col])
+    if real_sign_col not in tmp.columns:
+        tmp[real_sign_col] = np.sign(tmp[real_ret_col])
+
+    if group_col is None or group_col not in tmp.columns:
+        grouped_items = [("ALL", tmp)]
+    else:
+        grouped_items = list(tmp.groupby(group_col, dropna=False))
+
+    rows = []
+    for gname, sub in grouped_items:
+        n = int(len(sub))
+        if n == 0:
+            continue
+        corr = float(sub[pred_ret_col].corr(sub[real_ret_col])) if n >= 2 else np.nan
+        rank_ic = float(sub[pred_ret_col].rank().corr(sub[real_ret_col].rank())) if n >= 2 else np.nan
+        sign_acc = float((np.sign(sub[pred_ret_col]) == np.sign(sub[real_ret_col])).mean())
+        mae_ret = float((sub[pred_ret_col] - sub[real_ret_col]).abs().mean())
+        rmse_ret = float(np.sqrt(np.mean((sub[pred_ret_col] - sub[real_ret_col]) ** 2)))
+        up_mask = sub[real_ret_col] > 0
+        dn_mask = sub[real_ret_col] < 0
+        hit_up = float((np.sign(sub.loc[up_mask, pred_ret_col]) == 1).mean()) if up_mask.any() else np.nan
+        hit_down = float((np.sign(sub.loc[dn_mask, pred_ret_col]) == -1).mean()) if dn_mask.any() else np.nan
+        rows.append({
+            "group": str(gname),
+            "n": n,
+            "return_corr": corr,
+            "rank_ic": rank_ic,
+            "sign_acc": sign_acc,
+            "mae_ret": mae_ret,
+            "rmse_ret": rmse_ret,
+            "avg_pred_ret": float(sub[pred_ret_col].mean()),
+            "avg_realized_ret": float(sub[real_ret_col].mean()),
+            "hit_rate_up": hit_up,
+            "hit_rate_down": hit_down,
+        })
+    return pd.DataFrame(rows).sort_values(["group"]).reset_index(drop=True)
+
+
+def build_fixed_horizon_signal_panel(
+    px_wclose: pd.Series,
+    ldli_level: pd.Series,
+    ldli_liq_contrib: pd.Series,
+    ldli_dxy_contrib: pd.Series,
+    lag_series: pd.Series,
+    horizon_w: int = H19_DIAG_W,
+    fit_window_w: int = TAB5_DEFAULT_FIT_W,
+    alpha_mode: str = "OLS (learn alpha)",
+    forecast_model: str = "Drivers only",
+) -> pd.DataFrame:
+    rows = []
+    anchors = list(px_wclose.index)
+    max_anchor = px_wclose.index.max() - pd.Timedelta(weeks=horizon_w)
+    for anchor_dt in anchors:
+        if pd.Timestamp(anchor_dt) > max_anchor:
+            continue
+        xx_a = lag_series.reindex([anchor_dt]).iloc[0] if anchor_dt in lag_series.index else np.nan
+        if not np.isfinite(xx_a):
+            continue
+        xx_a = int(np.clip(int(round(float(xx_a))), LAG_MIN_WEEKS, LAG_MAX_WEEKS))
+        liq_shift_a = _shift_weeks_index(ldli_liq_contrib, xx_a, f"liq_shift_{xx_a}w")
+        dxy_shift_a = _shift_weeks_index(ldli_dxy_contrib, xx_a, f"dxy_shift_{xx_a}w")
+        try:
+            if str(forecast_model).startswith("ECM"):
+                fc = forecast_path_ecm_level(
+                    btc_px=px_wclose,
+                    ldli_level=ldli_level,
+                    anchor_dt=anchor_dt,
+                    lag_weeks=xx_a,
+                    horizon_w=horizon_w,
+                    fit_window_w=fit_window_w,
+                    alpha_mode=alpha_mode,
+                )
+                ps = fc["path_series"]
+            else:
+                fc = forecast_path_from_drivers_driversonly(
+                    px_wclose=px_wclose,
+                    liq_shifted=liq_shift_a,
+                    dxy_shifted=dxy_shift_a,
+                    horizon_w=horizon_w,
+                    fit_window_w=fit_window_w,
+                    end_dt_requested=anchor_dt,
+                    alpha_mode=alpha_mode,
+                )
+                ps = fc["path_series"]
+            if ps is None or ps.dropna().empty:
+                continue
+            pred_px = float(ps.dropna().iloc[-1])
+            anchor_px = float(px_wclose.loc[anchor_dt])
+            rows.append({
+                "anchor_dt": pd.Timestamp(anchor_dt),
+                "endpoint_dt_h19": pd.Timestamp(ps.dropna().index[-1]),
+                "lag_weeks_h19": int(xx_a),
+                "predicted_fwd_px_19w": pred_px,
+                "predicted_fwd_ret_19w": float(np.log(pred_px / anchor_px)),
+                "predicted_sign_19w": float(np.sign(np.log(pred_px / anchor_px))),
+            })
+        except Exception:
+            continue
+    if not rows:
+        return pd.DataFrame(index=px_wclose.index)
+    out = pd.DataFrame(rows).set_index("anchor_dt").sort_index()
+    return out
+
 
 
 def compute_forward_metrics(price_w: pd.Series, regime_shifted: pd.Series, horizons: List[int]) -> pd.DataFrame:
@@ -1667,7 +2139,16 @@ def forecast_path_ecm_level(
 # MAIN/TAB4 payload builder
 # =========================
 @st.cache_data(ttl=60 * 60 * 2, show_spinner=False)
-def build_forward_overlay_payload(liq_source: str, alpha_mode: str, forecast_model: str):
+
+def build_forward_overlay_payload(
+    liq_source: str,
+    alpha_mode: str,
+    forecast_model: str,
+    use_binance_funding: bool = True,
+    funding_symbol: str = "BTCUSDT",
+    mvrv_file_bytes: Optional[bytes] = None,
+    mvrv_file_name: Optional[str] = None,
+):
     btc_close = load_btc_close()
     dxy_close, dxy_used = load_dxy_close()
     liq_level_daily, liq_snapshot, liq_label, _liq_units = load_liquidity_source_daily(liq_source)
@@ -1694,7 +2175,6 @@ def build_forward_overlay_payload(liq_source: str, alpha_mode: str, forecast_mod
     combo_ret = (z_liq_ret + z_dxy_inv).rename("combo_ret")
     combo_dlt = (z_liq_dlt + z_dxy_inv).rename("combo_delta")
 
-    # Compute rolling maps quietly once (needed for dynamic lag per anchor)
     lags_weeks = range(LAG_MIN_WEEKS, LAG_MAX_WEEKS + 1)
     y = base["btc_wret"]
 
@@ -1714,12 +2194,10 @@ def build_forward_overlay_payload(liq_source: str, alpha_mode: str, forecast_mod
         best_corr_last = float(last_d["best_corr_raw"])
         z_liq_use = z_liq_dlt.reindex(base.index)
 
-    # Dynamic lag series (weekly)
     lag_s = out_use["best_lag_valid_smooth_weeks"].copy()
     lag_s = lag_s.reindex(base.index).ffill()
     lag_s.name = "xx_dynamic_weeks"
 
-    # Latest xx (for main overlay and "latest forecast path")
     lag_latest = lag_s.dropna().iloc[-1] if lag_s.dropna().size > 0 else out_use.dropna(subset=["best_lag_raw_weeks"]).iloc[-1]["best_lag_raw_weeks"]
     xx_latest = int(np.clip(int(round(float(lag_latest))), LAG_MIN_WEEKS, LAG_MAX_WEEKS))
 
@@ -1739,7 +2217,6 @@ def build_forward_overlay_payload(liq_source: str, alpha_mode: str, forecast_mod
     )
     regime = regime.rename("regime")
 
-    # Shifted series for display using latest xx (overlay)
     ldli_shifted = _shift_weeks_index(ldli_level, xx_latest, f"LDLI_shifted_{xx_latest}w")
     liq_shifted_latest = _shift_weeks_index(ldli_liq_contrib, xx_latest, f"LDLI_liq_contrib_shifted_{xx_latest}w")
     dxy_shifted_latest = _shift_weeks_index(ldli_dxy_contrib, xx_latest, f"LDLI_dxy_contrib_shifted_{xx_latest}w")
@@ -1748,7 +2225,6 @@ def build_forward_overlay_payload(liq_source: str, alpha_mode: str, forecast_mod
 
     btc_end = base.index.max()
 
-    # Display index: past fixed + future +xx_latest
     start_disp = btc_end - pd.to_timedelta(PAST_WEEKS_FIXED * 7, unit="D")
     end_disp = btc_end + pd.to_timedelta(xx_latest * 7, unit="D")
     full_idx = pd.date_range(start=start_disp, end=end_disp, freq=WEEK_RULE)
@@ -1760,17 +2236,15 @@ def build_forward_overlay_payload(liq_source: str, alpha_mode: str, forecast_mod
     regime_plot = regime_shifted.reindex(full_idx)
     conflict_mask = (regime_plot == "CONFLICT").fillna(False).to_numpy(dtype=bool)
 
-    # Regime metrics (BTC timeline)
     btc_wclose_full = base["btc_close"].copy()
-    regime_on_btc_timeline = regime_shifted.reindex(btc_wclose_full.index)
+    regime_on_btc_timeline = regime_shifted.reindex(btc_wclose_full.index).fillna("NEUTRAL")
+
     metrics = compute_forward_metrics(
         price_w=btc_wclose_full,
         regime_shifted=regime_on_btc_timeline,
         horizons=REGIME_HORIZONS_WEEKS
     )
 
-    # Latest forecast path (current anchor, using latest lag)
-    # Latest forecast path (used as MAIN blue dotted path)
     if str(forecast_model).startswith("ECM"):
         fc_latest = forecast_path_ecm_level(
             btc_px=btc_wclose_full,
@@ -1794,7 +2268,6 @@ def build_forward_overlay_payload(liq_source: str, alpha_mode: str, forecast_mod
         )
         pred_path_latest = fc_latest["path_series"]
 
-    # --- TRUE spaghetti + true-history endpoint line (weekly anchors, dynamic lag) ---
     spaghetti_paths = []
     spaghetti_long_rows = []
     pred_endpoint_map = {}
@@ -1811,7 +2284,6 @@ def build_forward_overlay_payload(liq_source: str, alpha_mode: str, forecast_mod
             continue
         xx_a = int(np.clip(int(round(float(xx_a))), LAG_MIN_WEEKS, LAG_MAX_WEEKS))
 
-        # per-anchor shifted drivers
         liq_shift_a = _shift_weeks_index(ldli_liq_contrib, xx_a, f"liq_shift_{xx_a}w")
         dxy_shift_a = _shift_weeks_index(ldli_dxy_contrib, xx_a, f"dxy_shift_{xx_a}w")
 
@@ -1841,12 +2313,10 @@ def build_forward_overlay_payload(liq_source: str, alpha_mode: str, forecast_mod
             if ps is None or ps.dropna().empty:
                 continue
         except Exception:
-            # Not enough history/future etc. -> skip
             continue
 
         spaghetti_paths.append(ps)
 
-        # long rows
         for dt, v in ps.items():
             spaghetti_long_rows.append({
                 "liq_source": liq_source,
@@ -1858,7 +2328,6 @@ def build_forward_overlay_payload(liq_source: str, alpha_mode: str, forecast_mod
                 "lag_weeks": int(xx_a),
             })
 
-        # endpoint at last date
         end_dt = ps.index[-1]
         pred_endpoint_map[end_dt] = float(ps.iloc[-1])
 
@@ -1867,48 +2336,162 @@ def build_forward_overlay_payload(liq_source: str, alpha_mode: str, forecast_mod
 
     spaghetti_long = pd.DataFrame(spaghetti_long_rows)
 
+    # === H19 signal / calibration master panel (anchor timeline) ===
+    overlay_master_df = pd.DataFrame(index=btc_wclose_full.index)
+    overlay_master_df["btc_close"] = btc_wclose_full
+    overlay_master_df["ldli_shifted_total"] = ldli_shifted.reindex(overlay_master_df.index)
+    overlay_master_df["ldli_shifted_liq"] = liq_shifted_latest.reindex(overlay_master_df.index)
+    overlay_master_df["ldli_shifted_dxy"] = dxy_shifted_latest.reindex(overlay_master_df.index)
+    overlay_master_df["regime_shifted"] = regime_on_btc_timeline
+    overlay_master_df["conflict_flag"] = (overlay_master_df["regime_shifted"] == "CONFLICT").astype(int)
+    overlay_master_df = add_recent_slice_flags(overlay_master_df)
+    overlay_master_df = add_horizon_targets(overlay_master_df, px_col="btc_close", horizon_w=H19_DIAG_W)
+
+    alpha_inputs = load_alpha_inputs_weekly(
+        mvrv_file_bytes=mvrv_file_bytes,
+        mvrv_file_name=mvrv_file_name,
+        use_binance_funding=use_binance_funding,
+        funding_symbol=funding_symbol,
+        week_rule=WEEK_RULE,
+    )
+    overlay_master_df["mvrv_z"] = alpha_inputs["mvrv_z"].reindex(overlay_master_df.index)
+    overlay_master_df["funding_rate_w"] = alpha_inputs["funding_rate_w"].reindex(overlay_master_df.index)
+    overlay_master_df["funding_z"] = alpha_inputs["funding_z"].reindex(overlay_master_df.index)
+    overlay_master_df["mvrv_state"] = classify_mvrv_state(overlay_master_df["mvrv_z"])
+    overlay_master_df["funding_state"] = classify_funding_state(overlay_master_df["funding_z"])
+    overlay_master_df["alpha_state"] = compute_alpha_state(
+        overlay_master_df["mvrv_state"], overlay_master_df["funding_state"], index=overlay_master_df.index
+    ).reindex(overlay_master_df.index).fillna("alpha_neutral")
+
+    h19_signals = build_fixed_horizon_signal_panel(
+        px_wclose=btc_wclose_full,
+        ldli_level=ldli_level,
+        ldli_liq_contrib=ldli_liq_contrib,
+        ldli_dxy_contrib=ldli_dxy_contrib,
+        lag_series=lag_s,
+        horizon_w=H19_DIAG_W,
+        fit_window_w=TAB5_DEFAULT_FIT_W,
+        alpha_mode=alpha_mode,
+        forecast_model=forecast_model,
+    )
+    overlay_master_df = overlay_master_df.join(h19_signals, how="left")
+    if "predicted_sign_19w" not in overlay_master_df.columns and "predicted_fwd_ret_19w" in overlay_master_df.columns:
+        overlay_master_df["predicted_sign_19w"] = np.sign(overlay_master_df["predicted_fwd_ret_19w"])
+
+    overlay_master_df["signal_hit_19w"] = (
+        np.sign(pd.to_numeric(overlay_master_df.get("predicted_fwd_ret_19w"), errors="coerce")) ==
+        np.sign(pd.to_numeric(overlay_master_df.get("realized_fwd_ret_19w"), errors="coerce"))
+    ).astype(float)
+
+    overlay_master_df["regime_state"] = split_conflict_state(
+        overlay_master_df["regime_shifted"],
+        alpha_state=overlay_master_df["alpha_state"],
+        conflict_flag=overlay_master_df["conflict_flag"].astype(bool),
+    )
+    mult_df = compute_regime_multipliers(overlay_master_df["regime_state"])
+    overlay_master_df = overlay_master_df.join(mult_df, how="left")
+
+    overlay_master_df["predicted_fwd_ret_19w_adj"] = (
+        pd.to_numeric(overlay_master_df["predicted_fwd_ret_19w"], errors="coerce") *
+        pd.to_numeric(overlay_master_df["regime_path_multiplier"], errors="coerce")
+    )
+    overlay_master_df["predicted_fwd_px_19w_adj"] = overlay_master_df["btc_close"] * np.exp(overlay_master_df["predicted_fwd_ret_19w_adj"])
+    overlay_master_df["predicted_sign_19w_adj"] = np.sign(overlay_master_df["predicted_fwd_ret_19w_adj"])
+    overlay_master_df["suggested_exposure"] = np.sign(overlay_master_df["predicted_fwd_ret_19w_adj"]) * overlay_master_df["regime_position_multiplier"]
+
+    current_row = overlay_master_df.iloc[-1].copy()
+    current_path_mult = float(current_row.get("regime_path_multiplier", 1.0)) if np.isfinite(current_row.get("regime_path_multiplier", np.nan)) else 1.0
+    pred_path_latest_adj = apply_path_multiplier_to_price_path(
+        raw_path=pred_path_latest,
+        anchor_px=float(btc_wclose_full.iloc[-1]),
+        path_multiplier=current_path_mult,
+    )
+
+    scorecard_h19_full_raw = build_horizon_scorecard(
+        overlay_master_df, horizon_w=H19_DIAG_W, group_col=None,
+        pred_ret_col="predicted_fwd_ret_19w", real_ret_col="realized_fwd_ret_19w"
+    )
+    scorecard_h19_recent104_raw = build_horizon_scorecard(
+        overlay_master_df, horizon_w=H19_DIAG_W, recent_key="recent_104w_flag", group_col=None,
+        pred_ret_col="predicted_fwd_ret_19w", real_ret_col="realized_fwd_ret_19w"
+    )
+    scorecard_h19_by_regime_raw = build_horizon_scorecard(
+        overlay_master_df, horizon_w=H19_DIAG_W, group_col="regime_state",
+        pred_ret_col="predicted_fwd_ret_19w", real_ret_col="realized_fwd_ret_19w"
+    )
+
+    scorecard_h19_full_adj = build_horizon_scorecard(
+        overlay_master_df, horizon_w=H19_DIAG_W, group_col=None,
+        pred_ret_col="predicted_fwd_ret_19w_adj", real_ret_col="realized_fwd_ret_19w"
+    )
+    scorecard_h19_recent104_adj = build_horizon_scorecard(
+        overlay_master_df, horizon_w=H19_DIAG_W, recent_key="recent_104w_flag", group_col=None,
+        pred_ret_col="predicted_fwd_ret_19w_adj", real_ret_col="realized_fwd_ret_19w"
+    )
+    scorecard_h19_by_regime_adj = build_horizon_scorecard(
+        overlay_master_df, horizon_w=H19_DIAG_W, group_col="regime_state",
+        pred_ret_col="predicted_fwd_ret_19w_adj", real_ret_col="realized_fwd_ret_19w"
+    )
+
+    alpha_meta = alpha_inputs.get("meta", {}) if isinstance(alpha_inputs, dict) else {}
+
+    current_decision = {
+        "current_regime_state": str(current_row.get("regime_state", "NA")),
+        "current_alpha_state": str(current_row.get("alpha_state", "alpha_neutral")),
+        "current_confidence_bucket": str(current_row.get("confidence_bucket", "NA")),
+        "current_pred_ret_19w_raw": float(current_row.get("predicted_fwd_ret_19w", np.nan)),
+        "current_pred_ret_19w_adj": float(current_row.get("predicted_fwd_ret_19w_adj", np.nan)),
+        "current_position_multiplier": float(current_row.get("regime_position_multiplier", np.nan)),
+        "current_path_multiplier": float(current_row.get("regime_path_multiplier", np.nan)),
+        "current_suggested_exposure": float(current_row.get("suggested_exposure", np.nan)),
+    }
+
     return {
         "liq_source": liq_source,
         "alpha_mode": str(alpha_mode),
         "liq_label": liq_label,
         "liq_snapshot": liq_snapshot,
-
         "dxy_used": dxy_used,
         "chosen": chosen,
         "best_corr_last": best_corr_last,
         "xx_latest": xx_latest,
         "xx_series": lag_s,
-
         "btc_end": btc_end,
         "base": base,
         "liq_ret_name": liq_ret.name,
-
         "full_idx": full_idx,
         "btc_plot": btc_plot,
         "ldli_plot": ldli_plot,
         "liq_plot": liq_plot,
         "dxy_plot": dxy_plot,
         "conflict_mask": conflict_mask,
-
         "ldli_shifted_latest": ldli_shifted,
         "liq_shifted_latest": liq_shifted_latest,
         "dxy_shifted_latest": dxy_shifted_latest,
-
         "ldli_level": ldli_level,
         "ldli_liq_contrib": ldli_liq_contrib,
         "ldli_dxy_contrib": ldli_dxy_contrib,
         "regime": regime,
         "regime_shifted": regime_shifted,
         "regime_diag_shifted": regime_diag_shifted,
-
         "metrics": metrics,
-
         "pred_hist_endpoint": pred_hist_endpoint,
         "pred_path_latest": pred_path_latest,
+        "pred_path_latest_adj": pred_path_latest_adj,
         "spaghetti_paths": spaghetti_paths,
         "spaghetti_long": spaghetti_long,
         "fc_latest_debug": fc_latest,
+        "overlay_master_df": overlay_master_df,
+        "scorecard_h19_full_raw": scorecard_h19_full_raw,
+        "scorecard_h19_recent104_raw": scorecard_h19_recent104_raw,
+        "scorecard_h19_by_regime_raw": scorecard_h19_by_regime_raw,
+        "scorecard_h19_full_adj": scorecard_h19_full_adj,
+        "scorecard_h19_recent104_adj": scorecard_h19_recent104_adj,
+        "scorecard_h19_by_regime_adj": scorecard_h19_by_regime_adj,
+        "current_decision": current_decision,
+        "alpha_meta": alpha_meta,
     }
+
 
 
 def make_display_window(payload: dict, past_weeks: int):
@@ -2248,14 +2831,25 @@ def plot_equity_curve(equity: pd.Series, title: str):
 # =========================
 # MAIN TAB
 # =========================
+
 def run_main_tab():
     st.subheader("MAIN) BTC vs LDLI (+ True-history predicted + Spaghetti)")
 
     try:
-        payload = build_forward_overlay_payload(LIQ_SOURCE, ALPHA_MODE, FORECAST_MODEL)
+        payload = build_forward_overlay_payload(LIQ_SOURCE, ALPHA_MODE, FORECAST_MODEL, use_binance_funding=USE_BINANCE_FUNDING, funding_symbol=FUNDING_SYMBOL, mvrv_file_bytes=MVRV_FILE_BYTES, mvrv_file_name=MVRV_FILE_NAME)
     except Exception as e:
         st.error(str(e))
         return
+
+    alpha_meta = payload.get("alpha_meta", {})
+    st.caption(
+        ui_text(
+            f"Alpha inputs | Funding: {'loaded' if alpha_meta.get('funding_loaded', False) else ('error' if alpha_meta.get('funding_error') else 'disabled')} ({alpha_meta.get('funding_symbol', 'NA')})"
+            f" | MVRV: {'loaded' if alpha_meta.get('mvrv_loaded', False) else 'not loaded'} ({alpha_meta.get('mvrv_source', 'none')})"
+        )
+    )
+    if alpha_meta.get("funding_error"):
+        st.warning(ui_text(f"Funding auto-loader warning: {alpha_meta['funding_error']}"))
 
     xx = int(payload["xx_latest"])
     st.info(
@@ -2264,12 +2858,43 @@ def run_main_tab():
         f" | Spaghetti anchors=weekly (dynamic xx per anchor)"
     )
 
+    alpha_meta = payload.get("alpha_meta", {})
+    funding_status = "loaded" if alpha_meta.get("funding_loaded", False) else ("error" if alpha_meta.get("funding_error") else "disabled")
+    mvrv_status = "loaded" if alpha_meta.get("mvrv_loaded", False) else "not loaded"
+    st.caption(
+        ui_text(
+            f"Alpha inputs | Funding: {funding_status} ({alpha_meta.get('funding_symbol', 'NA')})"
+            f" | MVRV: {mvrv_status} ({alpha_meta.get('mvrv_source', 'none')})"
+        )
+    )
+    if alpha_meta.get("funding_error"):
+        st.warning(ui_text(f"Funding auto-loader warning: {alpha_meta['funding_error']}"))
+
+    decision = payload.get("current_decision", {})
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Regime", decision.get("current_regime_state", "NA"))
+    c2.metric("Confidence", decision.get("current_confidence_bucket", "NA"))
+    c3.metric("Pred 19w (raw)", f"{(np.exp(decision.get('current_pred_ret_19w_raw', np.nan)) - 1.0) * 100.0:.1f}%" if np.isfinite(decision.get("current_pred_ret_19w_raw", np.nan)) else "NA")
+    c4.metric("Pred 19w (adj)", f"{(np.exp(decision.get('current_pred_ret_19w_adj', np.nan)) - 1.0) * 100.0:.1f}%" if np.isfinite(decision.get("current_pred_ret_19w_adj", np.nan)) else "NA")
+
+    c5, c6, c7, c8 = st.columns(4)
+    c5.metric("Suggested exposure", f"{decision.get('current_suggested_exposure', np.nan):.2f}" if np.isfinite(decision.get("current_suggested_exposure", np.nan)) else "NA")
+    c6.metric("Path multiplier", f"{decision.get('current_path_multiplier', np.nan):.2f}" if np.isfinite(decision.get("current_path_multiplier", np.nan)) else "NA")
+    c7.metric("Position multiplier", f"{decision.get('current_position_multiplier', np.nan):.2f}" if np.isfinite(decision.get("current_position_multiplier", np.nan)) else "NA")
+    recent104 = payload.get("scorecard_h19_recent104_adj", pd.DataFrame())
+    if recent104 is not None and not recent104.empty:
+        row = recent104.iloc[0]
+        c8.metric("Recent104 sign acc", f"{row['sign_acc'] * 100.0:.1f}%")
+    else:
+        c8.metric("Recent104 sign acc", "NA")
+
     disp_52 = make_display_window(payload, PAST_WEEKS_FIXED)
     disp_208 = make_display_window(payload, PAST_WEEKS_EXTENDED)
     disp_416 = make_display_window(payload, PAST_WEEKS_LONG)
 
     pred_hist = payload.get("pred_hist_endpoint", pd.Series(dtype=float))
     pred_path_latest = payload.get("pred_path_latest", pd.Series(dtype=float))
+    pred_path_latest_adj = payload.get("pred_path_latest_adj", pd.Series(dtype=float))
     spaghetti_paths = payload.get("spaghetti_paths", [])
 
     t52, t208, t416 = st.tabs([f"Past {PAST_WEEKS_FIXED}w", f"Past {PAST_WEEKS_EXTENDED}w", f"Past {PAST_WEEKS_LONG}w"])
@@ -2283,6 +2908,7 @@ def run_main_tab():
             ldli_dxy=disp_52["dxy_plot"].values,
             pred_hist_endpoint=pred_hist,
             pred_path_latest=pred_path_latest,
+            pred_path_latest_adj=pred_path_latest_adj,
             spaghetti_paths=spaghetti_paths,
             title=f"BTC vs LDLI + True-history predicted + Spaghetti (latest shift +{xx}w; past={PAST_WEEKS_FIXED}w, future=+{xx}w)",
             btc_end=payload["btc_end"],
@@ -2300,6 +2926,7 @@ def run_main_tab():
             ldli_dxy=disp_208["dxy_plot"].values,
             pred_hist_endpoint=pred_hist,
             pred_path_latest=pred_path_latest,
+            pred_path_latest_adj=pred_path_latest_adj,
             spaghetti_paths=spaghetti_paths,
             title=f"BTC vs LDLI + True-history predicted + Spaghetti (latest shift +{xx}w; past={PAST_WEEKS_EXTENDED}w, future=+{xx}w)",
             btc_end=payload["btc_end"],
@@ -2317,6 +2944,7 @@ def run_main_tab():
             ldli_dxy=disp_416["dxy_plot"].values,
             pred_hist_endpoint=pred_hist,
             pred_path_latest=pred_path_latest,
+            pred_path_latest_adj=pred_path_latest_adj,
             spaghetti_paths=spaghetti_paths,
             title=f"BTC vs LDLI + True-history predicted + Spaghetti (latest shift +{xx}w; past={PAST_WEEKS_LONG}w, future=+{xx}w)",
             btc_end=payload["btc_end"],
@@ -2336,10 +2964,19 @@ def run_main_tab():
         show["win_rate"] = show["win_rate"] * 100.0
         st.dataframe(show)
 
-    # ---- ONE FILE CSV DOWNLOAD (Past 416w + Future +xx_latest) ----
+    st.markdown("### H19 Scorecard (Adjusted)")
+    s1, s2, s3 = st.tabs(["Full sample", "Recent 104w", "By regime"])
+    with s1:
+        st.dataframe(payload.get("scorecard_h19_full_adj", pd.DataFrame()))
+    with s2:
+        st.dataframe(payload.get("scorecard_h19_recent104_adj", pd.DataFrame()))
+    with s3:
+        st.dataframe(payload.get("scorecard_h19_by_regime_adj", pd.DataFrame()))
+
     st.markdown("### ONE FILE CSV 다운로드 (MAIN/TAB4 분석용, Past 416w + Future +xx)")
     try:
         full_idx = disp_416["full_idx"]
+        master = payload.get("overlay_master_df", pd.DataFrame())
         df_one = pd.DataFrame(index=full_idx)
         df_one["btc_close"] = payload["base"]["btc_close"].reindex(full_idx)
 
@@ -2350,11 +2987,22 @@ def run_main_tab():
         df_one["regime_shifted"] = payload["regime_shifted"].reindex(full_idx)
         df_one["conflict_flag"] = (df_one["regime_shifted"] == "CONFLICT").astype(int)
 
-        # NEW: true-history endpoints + latest path
         df_one["pred_hist_endpoint_dynamic"] = payload["pred_hist_endpoint"].reindex(full_idx)
-        df_one[f"latest_forecast_path_to_{xx}w"] = payload["pred_path_latest"].reindex(full_idx)
+        df_one[f"latest_forecast_path_raw_to_{xx}w"] = payload["pred_path_latest"].reindex(full_idx)
+        df_one[f"latest_forecast_path_adj_to_{xx}w"] = payload["pred_path_latest_adj"].reindex(full_idx)
 
-        # metadata
+        enrich_cols = [
+            "realized_fwd_px_19w", "realized_fwd_ret_19w", "realized_sign_19w",
+            "predicted_fwd_px_19w", "predicted_fwd_ret_19w", "predicted_sign_19w",
+            "predicted_fwd_px_19w_adj", "predicted_fwd_ret_19w_adj", "predicted_sign_19w_adj",
+            "signal_hit_19w", "regime_state", "regime_path_multiplier", "regime_position_multiplier",
+            "confidence_bucket", "suggested_exposure", "recent_52w_flag", "recent_104w_flag",
+            "alpha_state", "mvrv_state", "funding_state", "endpoint_dt_h19", "lag_weeks_h19"
+        ]
+        for c in enrich_cols:
+            if c in master.columns:
+                df_one[c] = master[c].reindex(full_idx)
+
         df_one["liq_source"] = payload["liq_source"]
         df_one["alpha_mode"] = payload.get("alpha_mode", "OLS (learn alpha)")
         df_one["combo_type"] = payload["chosen"]
@@ -2369,7 +3017,6 @@ def run_main_tab():
     except Exception as e:
         st.warning(f"ONE FILE CSV 생성 중 오류: {e}")
 
-    # Liquidity snapshot + Spaghetti CSV
     st.markdown("### Liquidity snapshot (raw series alignment)")
     st.dataframe(payload["liq_snapshot"].tail(60))
     st.download_button(
@@ -2390,9 +3037,6 @@ def run_main_tab():
     )
 
 
-# =========================
-# TAB1
-# =========================
 def run_tab_dxy():
     st.subheader("TAB1) DXY(역축) → BTC (Weekly Returns)")
 
@@ -2556,11 +3200,12 @@ def run_tab_combo():
 # =========================
 # TAB4 (LDLI vs BTC)
 # =========================
+
 def run_tab_forward_overlay():
     st.subheader("TAB4) BTC vs LDLI(유동성+달러강도) 선행 오버레이 (Forward-Look Window)")
 
     try:
-        payload = build_forward_overlay_payload(LIQ_SOURCE, ALPHA_MODE, FORECAST_MODEL)
+        payload = build_forward_overlay_payload(LIQ_SOURCE, ALPHA_MODE, FORECAST_MODEL, use_binance_funding=USE_BINANCE_FUNDING, funding_symbol=FUNDING_SYMBOL, mvrv_file_bytes=MVRV_FILE_BYTES, mvrv_file_name=MVRV_FILE_NAME)
     except Exception as e:
         st.error(str(e))
         return
@@ -2577,6 +3222,11 @@ def run_tab_forward_overlay():
     ax1.set_ylabel("BTC Price")
     ax1.grid(True, alpha=0.25)
 
+    if payload.get("pred_path_latest") is not None and not payload["pred_path_latest"].dropna().empty:
+        ax1.plot(payload["pred_path_latest"].index, payload["pred_path_latest"].values, label="Latest path (raw)", linewidth=2.0, linestyle="--", color="tab:blue", alpha=0.6)
+    if payload.get("pred_path_latest_adj") is not None and not payload["pred_path_latest_adj"].dropna().empty:
+        ax1.plot(payload["pred_path_latest_adj"].index, payload["pred_path_latest_adj"].values, label="Latest path (adjusted)", linewidth=2.2, linestyle=":", color="tab:red", alpha=0.9)
+
     ax2 = ax1.twinx()
     ax2.plot(full_idx, payload["ldli_plot"].values, label=f"LDLI Level (shifted +{xx}w)", linewidth=2.3, color="tab:orange")
     ax2.set_ylabel(f"LDLI (shifted +{xx}w)")
@@ -2588,15 +3238,71 @@ def run_tab_forward_overlay():
     fig.tight_layout()
     st.pyplot(fig)
 
+    st.markdown("### H19 Scorecard (Raw vs Adjusted)")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.caption("Raw")
+        st.dataframe(payload.get("scorecard_h19_by_regime_raw", pd.DataFrame()))
+    with col2:
+        st.caption("Adjusted")
+        st.dataframe(payload.get("scorecard_h19_by_regime_adj", pd.DataFrame()))
+
+    st.markdown("### H19 Recent 104w")
+    col3, col4 = st.columns(2)
+    with col3:
+        st.caption("Raw")
+        st.dataframe(payload.get("scorecard_h19_recent104_raw", pd.DataFrame()))
+    with col4:
+        st.caption("Adjusted")
+        st.dataframe(payload.get("scorecard_h19_recent104_adj", pd.DataFrame()))
+
+    master = payload.get("overlay_master_df", pd.DataFrame())
+    if master is not None and not master.empty:
+        st.markdown("### Enriched H19 Master (tail)")
+        st.dataframe(master.tail(30))
+        st.download_button(
+            "Download Enriched H19 Master CSV",
+            data=master.reset_index().rename(columns={"index": "date"}).to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"overlay_master_h19_{payload['liq_source'].replace(' ','_')}_{APP_VERSION}.csv",
+            mime="text/csv",
+        )
+
+        score_full = payload.get("scorecard_h19_full_adj", pd.DataFrame())
+        score_recent = payload.get("scorecard_h19_recent104_adj", pd.DataFrame())
+        score_reg = payload.get("scorecard_h19_by_regime_adj", pd.DataFrame())
+        if score_full is not None and not score_full.empty:
+            st.download_button(
+                "Download H19 Scorecard Full CSV",
+                data=score_full.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"scorecard_h19_full_{APP_VERSION}.csv",
+                mime="text/csv",
+            )
+        if score_recent is not None and not score_recent.empty:
+            st.download_button(
+                "Download H19 Scorecard Recent104 CSV",
+                data=score_recent.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"scorecard_h19_recent104_{APP_VERSION}.csv",
+                mime="text/csv",
+            )
+        if score_reg is not None and not score_reg.empty:
+            st.download_button(
+                "Download H19 Scorecard By-Regime CSV",
+                data=score_reg.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"scorecard_h19_by_regime_{APP_VERSION}.csv",
+                mime="text/csv",
+            )
+
 
 # =========================
 # TAB5 (Multi-Asset Forecast/Backtest)
 # =========================
+
+
 def run_tab5_multiasset():
     st.subheader("TAB5) Multi-Asset Forecast + Walk-forward Backtest (drivers-only future; long-trend position modes)")
 
     try:
-        payload = build_forward_overlay_payload(LIQ_SOURCE, ALPHA_MODE, FORECAST_MODEL)
+        payload = build_forward_overlay_payload(LIQ_SOURCE, ALPHA_MODE, FORECAST_MODEL, use_binance_funding=USE_BINANCE_FUNDING, funding_symbol=FUNDING_SYMBOL, mvrv_file_bytes=MVRV_FILE_BYTES, mvrv_file_name=MVRV_FILE_NAME)
     except Exception as e:
         st.error(str(e))
         return
