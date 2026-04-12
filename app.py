@@ -48,7 +48,7 @@ def fix_mojibake_text(text):
     if not isinstance(text, str):
         return text
 
-    suspicious_tokens = ("Ã¬", "Ã«", "Ãª", "Ã­", "Ã£", "Ã", "Ã¢", "Ã")
+    suspicious_tokens = ("ì", "ë", "ê", "í", "ã", "Â", "â", "Ð")
     if not any(tok in text for tok in suspicious_tokens):
         return text
 
@@ -345,14 +345,14 @@ MVRV_FILE_NAME = MVRV_FILE.name if MVRV_FILE is not None else None
 FORECAST_MODEL = st.selectbox(
         "Forecast model (MAIN/TAB4)",
         [
-            "Drivers-only Î (legacy)",
-            "ECM on LDLI level (gap + ÎLDLI)",
+            "Drivers-only Δ (legacy)",
+            "ECM on LDLI level (gap + ΔLDLI)",
         ],
         index=1,
-        help="Legacy uses only Î(liquidity) and Î(DXY) drivers. ECM uses LDLI level alignment + error-correction (gap) to avoid flat/always-up spaghetti.",
+        help="Legacy uses only Δ(liquidity) and Δ(DXY) drivers. ECM uses LDLI level alignment + error-correction (gap) to avoid flat/always-up spaghetti.",
     )
 
-with st.expander(ui_text("ê³ ì  íë¼ë¯¸í°(ìë ¥ê°) ë³´ê¸°"), expanded=False):
+with st.expander(ui_text("고정 파라미터(입력값) 보기"), expanded=False):
     st.code(
         "\n".join([
             f"APP_VERSION = {APP_VERSION}",
@@ -886,7 +886,7 @@ def rolling_maps_weekly(y_w: pd.Series, x_w: pd.Series, invert_x: bool, lags_wee
     idx = df.index
     max_lag = max(lags_weeks)
     if len(idx) < WINDOW_WEEKS + max_lag + 5:
-        raise RuntimeError("ë°ì´í° ê¸¸ì´ê° ë¶ì¡±í©ëë¤. (ê¸°ê°/ìëì°/lag ì¬ê²í  íì)")
+        raise RuntimeError("데이터 길이가 부족합니다. (기간/윈도우/lag 재검토 필요)")
 
     end_positions = list(range(WINDOW_WEEKS, len(idx), STEP_WEEKS))
     end_dates = idx[end_positions]
@@ -971,7 +971,7 @@ def rolling_best_pair_and_multivar(
     idx = base.index
     max_lag = max(lags_weeks)
     if len(idx) < window_weeks + max_lag + 5:
-        raise RuntimeError("2D ë¶ìì ìí ë°ì´í° ê¸¸ì´ê° ë¶ì¡±í©ëë¤.")
+        raise RuntimeError("2D 분석을 위한 데이터 길이가 부족합니다.")
 
     end_positions = list(range(window_weeks, len(idx), step_weeks))
     end_dates = idx[end_positions]
@@ -1235,10 +1235,10 @@ def summarize_block(out: pd.DataFrame, tstat_masked: pd.DataFrame):
     sig_cells_ratio = float(np.isfinite(tstat_masked.to_numpy(dtype=float)).mean())
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("ì í¨ best ë¹ì¨", f"{valid_ratio:.1%}")
-    c2.metric("max(|corr|) ì¤ìê°", f"{med_max_abs:.4f}")
-    c3.metric("best_corr ì¤ìê°", f"{med_best:.4f}")
-    c4.metric("ì ì t-stat ì ë¹ì¨(|t|â¥2)", f"{sig_cells_ratio:.1%}")
+    c1.metric("유효 best 비율", f"{valid_ratio:.1%}")
+    c2.metric("max(|corr|) 중앙값", f"{med_max_abs:.4f}")
+    c3.metric("best_corr 중앙값", f"{med_best:.4f}")
+    c4.metric("유의 t-stat 셀 비율(|t|≥2)", f"{sig_cells_ratio:.1%}")
 
 
 def render_model_section(label: str, corr_masked, beta_map, tstat_masked, out):
@@ -1392,7 +1392,7 @@ def load_liquidity_source_daily(liq_source: str):
 
 
 # =========================
-# CORE: MAIN/TAB4ê° TAB1~3 ì í ì¤í ìì´ë ëìíëë¡
+# CORE: MAIN/TAB4가 TAB1~3 선행 실행 없이도 동작하도록
 # =========================
 def ensure_tab3_state_ready(base: pd.DataFrame, combo_ret: pd.Series, combo_dlt: pd.Series):
     xx = st.session_state.get("tab3_xx_weeks", None)
@@ -1402,7 +1402,7 @@ def ensure_tab3_state_ready(base: pd.DataFrame, combo_ret: pd.Series, combo_dlt:
     if xx is not None and chosen is not None and best_corr_last is not None:
         return int(xx), str(chosen), float(best_corr_last)
 
-    with st.spinner("MAIN: TAB3 ê°ì´ ìì´ ìµì  lag(xx) ìë ì°ì¶ ì¤..."):
+    with st.spinner("MAIN: TAB3 값이 없어 최적 lag(xx) 자동 산출 중..."):
         y = base["btc_wret"]
         lags_weeks = range(LAG_MIN_WEEKS, LAG_MAX_WEEKS + 1)
 
@@ -1562,51 +1562,77 @@ def compute_alpha_state(
     return out.fillna("alpha_neutral")
 
 
-def split_conflict_state(
-    regime: pd.Series,
-    alpha_state: Optional[pd.Series] = None,
-    conflict_flag: Optional[pd.Series] = None,
+def classify_driver_geometry(
+    z_liq_s: pd.Series,
+    z_dxy_s: pd.Series,
+    min_abs_threshold: float = 0.15,
+    strength_threshold: float = 0.45,
 ) -> pd.Series:
-    out = regime.copy().astype("object")
-    if alpha_state is None:
-        alpha_state = pd.Series("alpha_neutral", index=out.index, dtype="object")
-    else:
-        alpha_state = alpha_state.reindex(out.index).fillna("alpha_neutral")
-    if conflict_flag is None:
-        conflict_flag = (out == "CONFLICT")
-    else:
-        conflict_flag = conflict_flag.reindex(out.index).fillna(False).astype(bool)
+    """
+    Raw driver geometry classification based on sign alignment and minimum signal strength.
+    Output labels are intentionally descriptive rather than directional promises.
+    """
+    z_liq_s = pd.to_numeric(z_liq_s, errors="coerce")
+    z_dxy_s = pd.to_numeric(z_dxy_s, errors="coerce")
+    idx = z_liq_s.index.union(z_dxy_s.index)
+    z_liq_s = z_liq_s.reindex(idx)
+    z_dxy_s = z_dxy_s.reindex(idx)
 
-    out[(conflict_flag) & (alpha_state == "alpha_bull")] = "CONFLICT_BULLISH_ALPHA"
-    out[(conflict_flag) & (alpha_state != "alpha_bull")] = "CONFLICT_WEAK_ALPHA"
-    return out.fillna("NEUTRAL")
+    min_abs = pd.concat([z_liq_s.abs(), z_dxy_s.abs()], axis=1).min(axis=1)
+    strength = z_liq_s.abs().fillna(0.0) + z_dxy_s.abs().fillna(0.0)
+
+    dir_liq = np.sign(z_liq_s)
+    dir_dxy = np.sign(z_dxy_s)
+
+    out = pd.Series(index=idx, dtype="object")
+    weak_mask = (min_abs < float(min_abs_threshold)) | (strength < float(strength_threshold))
+    out[weak_mask] = "LOW_SIGNAL_TRANSITION"
+
+    strong_mask = ~weak_mask
+    out[strong_mask & (dir_liq > 0) & (dir_dxy > 0)] = "POS_ALIGN"
+    out[strong_mask & (dir_liq < 0) & (dir_dxy < 0)] = "NEG_ALIGN"
+    out[strong_mask & (dir_liq > 0) & (dir_dxy < 0)] = "LIQUIDITY_LED_DIVERGENCE"
+    out[strong_mask & (dir_liq < 0) & (dir_dxy > 0)] = "DXY_LED_DIVERGENCE"
+    return out.fillna("LOW_SIGNAL_TRANSITION")
 
 
-def compute_regime_multipliers(regime_state: pd.Series) -> pd.DataFrame:
-    idx = regime_state.index
-    path_mult = pd.Series(0.90, index=idx, dtype="float64")
-    pos_mult = pd.Series(0.85, index=idx, dtype="float64")
-    conf = pd.Series("MID", index=idx, dtype="object")
+def map_action_regime(driver_geometry: pd.Series) -> pd.Series:
+    """Map diagnostic geometry labels to action regimes used for calibration."""
+    dg = driver_geometry.astype("object").fillna("LOW_SIGNAL_TRANSITION")
+    out = pd.Series(index=dg.index, dtype="object")
+    out[dg == "LIQUIDITY_LED_DIVERGENCE"] = "FOLLOW"
+    out[dg == "POS_ALIGN"] = "FOLLOW_LIGHT"
+    out[dg == "NEG_ALIGN"] = "DEFENSIVE"
+    out[dg == "DXY_LED_DIVERGENCE"] = "SHRINK"
+    out[dg == "LOW_SIGNAL_TRANSITION"] = "TRANSITION"
+    return out.fillna("TRANSITION")
 
-    path_mult[regime_state == "TAILWIND"] = 1.00
-    pos_mult[regime_state == "TAILWIND"] = 1.00
-    conf[regime_state == "TAILWIND"] = "HIGH"
 
-    path_mult[regime_state == "NEUTRAL"] = 0.90
-    pos_mult[regime_state == "NEUTRAL"] = 0.85
-    conf[regime_state == "NEUTRAL"] = "MID"
+def compute_regime_multipliers(action_regime: pd.Series) -> pd.DataFrame:
+    idx = action_regime.index
+    path_mult = pd.Series(0.80, index=idx, dtype="float64")
+    pos_mult = pd.Series(0.60, index=idx, dtype="float64")
+    conf = pd.Series("LOW", index=idx, dtype="object")
 
-    path_mult[regime_state == "CONFLICT_BULLISH_ALPHA"] = 0.80
-    pos_mult[regime_state == "CONFLICT_BULLISH_ALPHA"] = 0.70
-    conf[regime_state == "CONFLICT_BULLISH_ALPHA"] = "MID-LOW"
+    path_mult[action_regime == "FOLLOW"] = 0.95
+    pos_mult[action_regime == "FOLLOW"] = 0.75
+    conf[action_regime == "FOLLOW"] = "MID-HIGH"
 
-    path_mult[regime_state == "CONFLICT_WEAK_ALPHA"] = 0.70
-    pos_mult[regime_state == "CONFLICT_WEAK_ALPHA"] = 0.55
-    conf[regime_state == "CONFLICT_WEAK_ALPHA"] = "LOW"
+    path_mult[action_regime == "FOLLOW_LIGHT"] = 0.85
+    pos_mult[action_regime == "FOLLOW_LIGHT"] = 0.70
+    conf[action_regime == "FOLLOW_LIGHT"] = "MID"
 
-    path_mult[regime_state == "HEADWIND"] = 0.60
-    pos_mult[regime_state == "HEADWIND"] = 0.40
-    conf[regime_state == "HEADWIND"] = "LOW"
+    path_mult[action_regime == "TRANSITION"] = 0.80
+    pos_mult[action_regime == "TRANSITION"] = 0.60
+    conf[action_regime == "TRANSITION"] = "LOW"
+
+    path_mult[action_regime == "SHRINK"] = 0.70
+    pos_mult[action_regime == "SHRINK"] = 0.50
+    conf[action_regime == "SHRINK"] = "LOW-MID"
+
+    path_mult[action_regime == "DEFENSIVE"] = 0.65
+    pos_mult[action_regime == "DEFENSIVE"] = 0.45
+    conf[action_regime == "DEFENSIVE"] = "LOW"
 
     return pd.DataFrame({
         "regime_path_multiplier": path_mult,
@@ -1615,11 +1641,10 @@ def compute_regime_multipliers(regime_state: pd.Series) -> pd.DataFrame:
     }, index=idx)
 
 
-
 def add_raw_regime_diagnostics(df: pd.DataFrame) -> pd.DataFrame:
     """
-    one-file exportìì raw regime íë¨ ê·¼ê±°ë¥¼ ì­ì¶ì íê¸° ìí ì§ë¨ ì»¬ë¼ ì¶ê°.
-    ê¸°ë ìë ¥ ì»¬ë¼:
+    one-file export에서 raw regime 판단 근거를 역추적하기 위한 진단 컬럼 추가.
+    기대 입력 컬럼:
       - z_liq_s
       - z_dxy_s
       - dir_liq_sum
@@ -1651,12 +1676,16 @@ def add_raw_regime_diagnostics(df: pd.DataFrame) -> pd.DataFrame:
         return f"{base}_{enc(a)}_{enc(b)}"
 
     out["raw_regime_rule_code"] = out.apply(_rule_code, axis=1)
+    out["driver_geometry"] = classify_driver_geometry(out.get("z_liq_s"), out.get("z_dxy_s"))
+    out["action_regime"] = map_action_regime(out["driver_geometry"])
+    # backward-compatible alias used by downstream scorecards / panels
+    out["regime_state"] = out["action_regime"]
     return out
 
 
 def summarize_alpha_merge_status(df: pd.DataFrame, alpha_inputs: dict) -> dict:
     """
-    funding / mvrvê° ì¤ì ë¡ mergeëìëì§ one-fileì ë¨ê¸¸ ë©í ìì½.
+    funding / mvrv가 실제로 merge되었는지 one-file에 남길 메타 요약.
     """
     meta = alpha_inputs.get("meta", {}) if isinstance(alpha_inputs, dict) else {}
     funding_series = pd.to_numeric(df.get("funding_rate_w"), errors="coerce") if "funding_rate_w" in df.columns else pd.Series(dtype="float64")
@@ -1698,6 +1727,7 @@ def compute_current_h19_decision_row(
     btc_end: pd.Timestamp,
     btc_last_px: float,
     current_regime_state: str,
+    current_driver_geometry: str,
     current_confidence_bucket: str,
     current_path_mult: float,
     current_pos_mult: float,
@@ -1705,7 +1735,7 @@ def compute_current_h19_decision_row(
     pred_path_current_h19_adj: pd.Series,
 ) -> dict:
     """
-    íì¬ anchor ê¸°ì¤ fixed-H19 decision ê°ì one-file exportì ë°ë³µ ì ì¥íê¸° ìí row ë©í ìì±.
+    현재 anchor 기준 fixed-H19 decision 값을 one-file export에 반복 저장하기 위한 row 메타 생성.
     """
     out = {
         "current_anchor_dt": btc_end,
@@ -1714,6 +1744,7 @@ def compute_current_h19_decision_row(
         "current_predicted_px_19w_raw": np.nan,
         "current_predicted_px_19w_adj": np.nan,
         "current_regime_state": current_regime_state,
+        "current_driver_geometry": current_driver_geometry,
         "current_confidence_bucket": current_confidence_bucket,
         "current_regime_path_multiplier": current_path_mult,
         "current_regime_position_multiplier": current_pos_mult,
@@ -2017,7 +2048,7 @@ def forecast_path_from_drivers_driversonly(
     df_fit = df_fit.dropna()
 
     if df_fit.empty or df_drv.empty:
-        raise RuntimeError("Drivers/Price ë°ì´í°ê° ë¶ì¡±í©ëë¤.")
+        raise RuntimeError("Drivers/Price 데이터가 부족합니다.")
 
     if end_dt_requested not in df_fit.index:
         idx = df_fit.index[df_fit.index <= end_dt_requested]
@@ -2044,7 +2075,7 @@ def forecast_path_from_drivers_driversonly(
     h = int(min(int(horizon_w), int(max_h)))
     if h <= 0:
         raise RuntimeError(
-            f"Forecast ê°ë¥í ìµë horizon: 0ì£¼ (drivers ê¸°ì¤ max_h=0ì£¼, end_dt_eff={end_dt_eff.date()})"
+            f"Forecast 가능한 최대 horizon: 0주 (drivers 기준 max_h=0주, end_dt_eff={end_dt_eff.date()})"
         )
 
     w = df_fit.iloc[pos_fit - fit_window_w:pos_fit]
@@ -2137,7 +2168,7 @@ def fit_ecm_params_from_level(
     """
     Fit:
       1) Level mapping: log(BTC) ~= c + gamma * LDLI_shifted_level
-      2) ECM step model (weekly): Îlog(BTC)_t = a + b_gap * gap_{t-1} + b_dldli * ÎLDLI_t
+      2) ECM step model (weekly): Δlog(BTC)_t = a + b_gap * gap_{t-1} + b_dldli * ΔLDLI_t
 
     LDLI is shifted by `lag_weeks` (index shift) so that LDLI leads BTC on the same x-axis.
     """
@@ -2318,7 +2349,7 @@ def build_forward_overlay_payload(
 
     base = pd.concat([btc_wret, btc_wclose.rename("btc_close"), dxy_wret, liq_ret, liq_dlt], axis=1).dropna()
     if len(base) < (WINDOW_WEEKS + LAG_MAX_WEEKS + 10):
-        raise RuntimeError("Forward overlay ê³ì°ì íìí ì£¼ê° ìíì´ ë¶ì¡±í©ëë¤.")
+        raise RuntimeError("Forward overlay 계산에 필요한 주간 샘플이 부족합니다.")
 
     z_dxy_inv = zscore(-base["dxy_wret"]).rename("z(-dxy_ret)")
     z_liq_ret = zscore(base[liq_ret.name]).rename("z(liq_ret)")
@@ -2548,12 +2579,14 @@ def build_forward_overlay_payload(
         np.nan,
     )
 
-    overlay_master_df["regime_state"] = split_conflict_state(
-        overlay_master_df["regime_shifted"],
-        alpha_state=overlay_master_df["alpha_state"],
-        conflict_flag=overlay_master_df["conflict_flag"].astype(bool),
+    # New regime redesign: keep raw regime diagnostics, but drive calibration off
+    # driver geometry -> action regime instead of legacy tailwind/headwind labels.
+    overlay_master_df["driver_geometry"] = classify_driver_geometry(
+        overlay_master_df["z_liq_s"], overlay_master_df["z_dxy_s"]
     )
-    mult_df = compute_regime_multipliers(overlay_master_df["regime_state"])
+    overlay_master_df["action_regime"] = map_action_regime(overlay_master_df["driver_geometry"])
+    overlay_master_df["regime_state"] = overlay_master_df["action_regime"]
+    mult_df = compute_regime_multipliers(overlay_master_df["action_regime"])
     overlay_master_df = overlay_master_df.join(mult_df, how="left")
 
     overlay_master_df["predicted_fwd_ret_19w_adj"] = (
@@ -2623,8 +2656,9 @@ def build_forward_overlay_payload(
     current_decision = compute_current_h19_decision_row(
         btc_end=btc_end,
         btc_last_px=float(btc_wclose_full.iloc[-1]),
-        current_regime_state=str(current_row.get("regime_state", "NEUTRAL")),
-        current_confidence_bucket=str(current_row.get("confidence_bucket", "MID")),
+        current_regime_state=str(current_row.get("regime_state", "TRANSITION")),
+        current_driver_geometry=str(current_row.get("driver_geometry", "LOW_SIGNAL_TRANSITION")),
+        current_confidence_bucket=str(current_row.get("confidence_bucket", "LOW")),
         current_path_mult=float(current_path_mult),
         current_pos_mult=float(current_pos_mult) if np.isfinite(current_pos_mult) else np.nan,
         pred_path_current_h19_raw=pred_path_current_h19_raw,
@@ -2674,7 +2708,11 @@ def build_forward_overlay_payload(
         pred_ret_col="predicted_fwd_ret_19w_adj", real_ret_col="realized_fwd_ret_19w"
     )
     scorecard_h19_by_regime_adj = build_horizon_scorecard(
-        overlay_master_df, horizon_w=H19_DIAG_W, group_col="regime_state",
+        overlay_master_df, horizon_w=H19_DIAG_W, group_col="action_regime",
+        pred_ret_col="predicted_fwd_ret_19w_adj", real_ret_col="realized_fwd_ret_19w"
+    )
+    scorecard_h19_by_driver_geometry_adj = build_horizon_scorecard(
+        overlay_master_df, horizon_w=H19_DIAG_W, group_col="driver_geometry",
         pred_ret_col="predicted_fwd_ret_19w_adj", real_ret_col="realized_fwd_ret_19w"
     )
     scorecard_h19_by_raw_regime_adj = build_horizon_scorecard(
@@ -2682,9 +2720,12 @@ def build_forward_overlay_payload(
         pred_ret_col="predicted_fwd_ret_19w_adj", real_ret_col="realized_fwd_ret_19w"
     )
 
-    regime_diag_full = build_regime_diagnostic_table(overlay_master_df, group_col="regime_shifted", recent_key=None)
-    regime_diag_recent104 = build_regime_diagnostic_table(overlay_master_df, group_col="regime_shifted", recent_key="recent_104w_flag")
-    regime_diag_recent52 = build_regime_diagnostic_table(overlay_master_df, group_col="regime_shifted", recent_key="recent_52w_flag")
+    regime_diag_full = build_regime_diagnostic_table(overlay_master_df, group_col="driver_geometry", recent_key=None)
+    regime_diag_recent104 = build_regime_diagnostic_table(overlay_master_df, group_col="driver_geometry", recent_key="recent_104w_flag")
+    regime_diag_recent52 = build_regime_diagnostic_table(overlay_master_df, group_col="driver_geometry", recent_key="recent_52w_flag")
+    action_regime_diag_full = build_regime_diagnostic_table(overlay_master_df, group_col="action_regime", recent_key=None)
+    action_regime_diag_recent104 = build_regime_diagnostic_table(overlay_master_df, group_col="action_regime", recent_key="recent_104w_flag")
+    action_regime_diag_recent52 = build_regime_diagnostic_table(overlay_master_df, group_col="action_regime", recent_key="recent_52w_flag")
 
     alpha_meta = alpha_inputs.get("meta", {}) if isinstance(alpha_inputs, dict) else {}
 
@@ -2736,10 +2777,14 @@ def build_forward_overlay_payload(
         "scorecard_h19_recent104_adj": scorecard_h19_recent104_adj,
         "scorecard_h19_recent52_adj": scorecard_h19_recent52_adj,
         "scorecard_h19_by_regime_adj": scorecard_h19_by_regime_adj,
+        "scorecard_h19_by_driver_geometry_adj": scorecard_h19_by_driver_geometry_adj,
         "scorecard_h19_by_raw_regime_adj": scorecard_h19_by_raw_regime_adj,
         "regime_diag_full": regime_diag_full,
         "regime_diag_recent104": regime_diag_recent104,
         "regime_diag_recent52": regime_diag_recent52,
+        "action_regime_diag_full": action_regime_diag_full,
+        "action_regime_diag_recent104": action_regime_diag_recent104,
+        "action_regime_diag_recent52": action_regime_diag_recent52,
         "current_decision": current_decision,
         "alpha_meta": alpha_meta,
         "alpha_merge_meta": alpha_merge_meta,
@@ -3106,8 +3151,8 @@ def run_main_tab():
 
     xx = int(payload["xx_latest"])
     st.info(
-        f"Liquidity={payload['liq_label']} | DXY={payload['dxy_used']} | combo={payload['chosen']} | latest xx={xx}ì£¼"
-        f" | ìµê·¼ best_corr_raw={payload['best_corr_last']:.4f}"
+        f"Liquidity={payload['liq_label']} | DXY={payload['dxy_used']} | combo={payload['chosen']} | latest xx={xx}주"
+        f" | 최근 best_corr_raw={payload['best_corr_last']:.4f}"
         f" | Spaghetti anchors=weekly (dynamic xx per anchor)"
     )
 
@@ -3206,10 +3251,10 @@ def run_main_tab():
         )
         st.pyplot(fig3)
 
-    st.markdown(ui_text("### Regime ì±ê³¼ ìì½ (BTC timeline ê¸°ì¤, regimeë +xxì£¼ shift ì ì©)"))
+    st.markdown(ui_text("### Regime 성과 요약 (BTC timeline 기준, regime는 +xx주 shift 적용)"))
     met = payload.get("metrics", pd.DataFrame())
     if met is None or met.empty:
-        st.warning("ì±ê³¼ ìì½ì ê³ì°í  ë°ì´í°ê° ë¶ì¡±í©ëë¤.")
+        st.warning("성과 요약을 계산할 데이터가 부족합니다.")
     else:
         show = met.copy()
         for col in ["mean_fwd", "median_fwd", "avg_gain", "avg_loss", "mae_median", "mfe_median"]:
@@ -3226,7 +3271,7 @@ def run_main_tab():
     with s3:
         st.dataframe(payload.get("scorecard_h19_by_regime_adj", pd.DataFrame()))
 
-    st.markdown("### ONE FILE CSV ë¤ì´ë¡ë (MAIN/TAB4 ë¶ìì©, Past 416w + Future +xx)")
+    st.markdown("### ONE FILE CSV 다운로드 (MAIN/TAB4 분석용, Past 416w + Future +xx)")
     try:
         full_idx = disp_416["full_idx"]
         master = payload.get("overlay_master_df", pd.DataFrame())
@@ -3259,7 +3304,7 @@ def run_main_tab():
             "mvrv_available_flag", "mvrv_source", "mvrv_last_valid_dt", "mvrv_nonnull_count", "alpha_inputs_ready_flag",
             "current_anchor_dt", "current_predicted_ret_19w_raw", "current_predicted_ret_19w_adj",
             "current_predicted_px_19w_raw", "current_predicted_px_19w_adj",
-            "current_regime_state", "current_confidence_bucket",
+            "current_regime_state", "current_driver_geometry", "current_confidence_bucket",
             "current_regime_path_multiplier", "current_regime_position_multiplier", "current_suggested_exposure"
         ]
         for c in enrich_cols:
@@ -3287,7 +3332,7 @@ def run_main_tab():
             "mvrv_available_flag", "mvrv_source", "mvrv_last_valid_dt", "mvrv_nonnull_count", "alpha_inputs_ready_flag",
             "current_anchor_dt", "current_predicted_ret_19w_raw", "current_predicted_ret_19w_adj",
             "current_predicted_px_19w_raw", "current_predicted_px_19w_adj",
-            "current_regime_state", "current_confidence_bucket",
+            "current_regime_state", "current_driver_geometry", "current_confidence_bucket",
             "current_regime_path_multiplier", "current_regime_position_multiplier", "current_suggested_exposure",
             f"latest_forecast_path_raw_to_{xx}w", f"latest_forecast_path_adj_to_{xx}w",
             "liq_source", "alpha_mode", "combo_type", "xx_latest",
@@ -3303,7 +3348,7 @@ def run_main_tab():
             mime="text/csv",
         )
     except Exception as e:
-        st.warning(f"ONE FILE CSV ìì± ì¤ ì¤ë¥: {e}")
+        st.warning(f"ONE FILE CSV 생성 중 오류: {e}")
 
     st.markdown("### Liquidity snapshot (raw series alignment)")
     st.dataframe(payload["liq_snapshot"].tail(60))
@@ -3326,7 +3371,7 @@ def run_main_tab():
 
 
 def run_tab_dxy():
-    st.subheader("TAB1) DXY(ì­ì¶) â BTC (Weekly Returns)")
+    st.subheader("TAB1) DXY(역축) → BTC (Weekly Returns)")
 
     btc_close = load_btc_close()
     dxy_close, dxy_used = load_dxy_close()
@@ -3336,7 +3381,7 @@ def run_tab_dxy():
     dxy_wret = weekly_log_returns(dxy_close, WEEK_RULE).rename("dxy_wret")
 
     lags_weeks = range(LAG_MIN_WEEKS, LAG_MAX_WEEKS + 1)
-    with st.spinner("Rolling heatmaps ê³ì° ì¤..."):
+    with st.spinner("Rolling heatmaps 계산 중..."):
         corr_raw, corr_masked, beta_map, tstat_map, tstat_masked, out = rolling_maps_weekly(
             y_w=btc_wret,
             x_w=dxy_wret,
@@ -3345,14 +3390,14 @@ def run_tab_dxy():
             quiet=False
         )
 
-    render_model_section("DXY(ì­ì¶) vs BTC", corr_masked, beta_map, tstat_masked, out)
+    render_model_section("DXY(역축) vs BTC", corr_masked, beta_map, tstat_masked, out)
 
 
 # =========================
 # TAB2
 # =========================
 def run_tab_liquidity():
-    st.subheader("TAB2) Liquidity â BTC (Weekly; RETURNS vs DELTA ë¹êµ)")
+    st.subheader("TAB2) Liquidity → BTC (Weekly; RETURNS vs DELTA 비교)")
 
     btc_close = load_btc_close()
     btc_wret = weekly_log_returns(btc_close, WEEK_RULE).rename("btc_wret")
@@ -3372,7 +3417,7 @@ def run_tab_liquidity():
     liq_dlt = weekly_delta(liq_level_daily, WEEK_RULE).rename("liq_delta_level")
 
     lags_weeks = range(LAG_MIN_WEEKS, LAG_MAX_WEEKS + 1)
-    with st.spinner("RETURNS/DELTA ë ëª¨ë¸ì ëª¨ë ê³ì° ì¤..."):
+    with st.spinner("RETURNS/DELTA 두 모델을 모두 계산 중..."):
         corr_raw_r, corr_masked_r, beta_map_r, tstat_map_r, tstat_masked_r, out_r = rolling_maps_weekly(
             y_w=btc_wret, x_w=liq_ret, invert_x=TAB2_INVERT_X, lags_weeks=lags_weeks, quiet=False
         )
@@ -3380,19 +3425,19 @@ def run_tab_liquidity():
             y_w=btc_wret, x_w=liq_dlt, invert_x=TAB2_INVERT_X, lags_weeks=lags_weeks, quiet=False
         )
 
-    sub1, sub2 = st.tabs(["Liquidity Returns", "Liquidity Delta(Î)"])
+    sub1, sub2 = st.tabs(["Liquidity Returns", "Liquidity Delta(Δ)"])
     with sub1:
         render_model_section("Liquidity RETURNS vs BTC", corr_masked_r, beta_map_r, tstat_masked_r, out_r)
     with sub2:
-        render_model_section("Liquidity DELTA(Î) vs BTC", corr_masked_d, beta_map_d, tstat_masked_d, out_d)
+        render_model_section("Liquidity DELTA(Δ) vs BTC", corr_masked_d, beta_map_d, tstat_masked_d, out_d)
 
 
 # =========================
 # TAB3
 # =========================
 def run_tab_combo():
-    st.subheader("TAB3) Combo(ì ëì± + ë¬ë¬ê°ë) â BTC")
-    st.caption("corr-ìµë ë°©ì ì ì§ | 1D Combo + 2D lag-pair(corr-max) + ë¤ë³ë(ì°¸ê³ )")
+    st.subheader("TAB3) Combo(유동성 + 달러강도) → BTC")
+    st.caption("corr-최대 방식 유지 | 1D Combo + 2D lag-pair(corr-max) + 다변량(참고)")
 
     btc_close = load_btc_close()
     dxy_close, dxy_used = load_dxy_close()
@@ -3426,7 +3471,7 @@ def run_tab_combo():
 
     y = base["btc_wret"]
 
-    with st.spinner("1D Combo(RET/DELTA) ê³ì° ì¤..."):
+    with st.spinner("1D Combo(RET/DELTA) 계산 중..."):
         corr_raw_cr, corr_masked_cr, beta_map_cr, tstat_map_cr, tstat_masked_cr, out_cr = rolling_maps_weekly(
             y_w=y, x_w=combo_ret, invert_x=TAB3_INVERT_X, lags_weeks=lags_weeks, quiet=False
         )
@@ -3456,17 +3501,17 @@ def run_tab_combo():
 
     sub1, sub2 = st.tabs(["1D Combo", "2D Lag-Pair + Multivariate"])
     with sub1:
-        s1, s2 = st.tabs(["Combo using Liquidity RETURNS", "Combo using Liquidity DELTA(Î)"])
+        s1, s2 = st.tabs(["Combo using Liquidity RETURNS", "Combo using Liquidity DELTA(Δ)"])
         with s1:
             render_model_section("1D COMBO (z(Liq RETURNS) + z(-DXY_ret)) vs BTC", corr_masked_cr, beta_map_cr, tstat_masked_cr, out_cr)
         with s2:
             render_model_section("1D COMBO (z(Liq DELTA) + z(-DXY_ret)) vs BTC", corr_masked_cd, beta_map_cd, tstat_masked_cd, out_cd)
 
-        st.success(f"TAB4/MAINì ì¬ì©ë  ìµì  lag(xx): {xx}ì£¼ | ì í combo={chosen} | ìµê·¼ best_corr_raw={best_corr_last:.4f}")
+        st.success(f"TAB4/MAIN에 사용될 최신 lag(xx): {xx}주 | 선택 combo={chosen} | 최근 best_corr_raw={best_corr_last:.4f}")
 
     with sub2:
-        st.caption(f"2D/ë¤ë³ëì ê³ì°ë ëë¬¸ì STEP={STEP_WEEKS_2D}ì£¼ë¡ íê°í©ëë¤. (pair ì íì corr-max)")
-        with st.spinner("2D lag-pair + ë¤ë³ë(RET/DELTA) ê³ì° ì¤..."):
+        st.caption(f"2D/다변량은 계산량 때문에 STEP={STEP_WEEKS_2D}주로 평가합니다. (pair 선택은 corr-max)")
+        with st.spinner("2D lag-pair + 다변량(RET/DELTA) 계산 중..."):
             best2d_ret, pair_counts_ret, lags_list = rolling_best_pair_and_multivar(
                 y=y, liq=base[liq_ret.name], dxy_ret=base["dxy_wret"],
                 lags_weeks=lags_weeks, window_weeks=WINDOW_WEEKS, step_weeks=STEP_WEEKS_2D
@@ -3476,7 +3521,7 @@ def run_tab_combo():
                 lags_weeks=lags_weeks, window_weeks=WINDOW_WEEKS, step_weeks=STEP_WEEKS_2D
             )
 
-        s1, s2 = st.tabs(["2D using Liquidity RETURNS", "2D using Liquidity DELTA(Î)"])
+        s1, s2 = st.tabs(["2D using Liquidity RETURNS", "2D using Liquidity DELTA(Δ)"])
         with s1:
             st.pyplot(plot_pair_count_heatmap(pair_counts_ret, lags_list, "Best (L_liq, L_dxy) selection counts (RET)"))
             st.dataframe(best2d_ret.tail(30))
@@ -3490,7 +3535,7 @@ def run_tab_combo():
 # =========================
 
 def run_tab_forward_overlay():
-    st.subheader("TAB4) BTC vs LDLI(ì ëì±+ë¬ë¬ê°ë) ì í ì¤ë²ë ì´ (Forward-Look Window)")
+    st.subheader("TAB4) BTC vs LDLI(유동성+달러강도) 선행 오버레이 (Forward-Look Window)")
 
     try:
         payload = build_forward_overlay_payload(LIQ_SOURCE, ALPHA_MODE, FORECAST_MODEL, use_binance_funding=USE_BINANCE_FUNDING, funding_symbol=FUNDING_SYMBOL, mvrv_file_bytes=MVRV_FILE_BYTES, mvrv_file_name=MVRV_FILE_NAME)
@@ -3500,7 +3545,7 @@ def run_tab_forward_overlay():
 
     xx = int(payload["xx_latest"])
     st.success(
-        f"ì¬ì© lag(latest xx)={xx}ì£¼ | ì í combo={payload['chosen']} | ìµê·¼ best_corr_raw={payload['best_corr_last']:.4f}"
+        f"사용 lag(latest xx)={xx}주 | 선택 combo={payload['chosen']} | 최근 best_corr_raw={payload['best_corr_last']:.4f}"
     )
 
     full_idx = payload["full_idx"]
@@ -3526,7 +3571,7 @@ def run_tab_forward_overlay():
     fig.tight_layout()
     st.pyplot(fig)
 
-    st.markdown("### H19 Scorecard (Raw vs Adjusted)")
+    st.markdown("### H19 Scorecard (Action Regime, Raw vs Adjusted)")
     col1, col2 = st.columns(2)
     with col1:
         st.caption("Raw")
@@ -3534,6 +3579,9 @@ def run_tab_forward_overlay():
     with col2:
         st.caption("Adjusted")
         st.dataframe(payload.get("scorecard_h19_by_regime_adj", pd.DataFrame()))
+
+    st.markdown("### H19 Scorecard (Driver Geometry)")
+    st.dataframe(payload.get("scorecard_h19_by_driver_geometry_adj", pd.DataFrame()), use_container_width=True)
 
     st.markdown("### H19 Recent 104w / 52w")
     col3, col4 = st.columns(2)
@@ -3546,14 +3594,23 @@ def run_tab_forward_overlay():
         st.dataframe(payload.get("scorecard_h19_recent52_raw", pd.DataFrame()))
         st.dataframe(payload.get("scorecard_h19_recent52_adj", pd.DataFrame()))
 
-    st.markdown("### Raw Regime Validation (TAILWIND/HEADWIND ì ì ê²ì¦ì©)")
+    st.markdown("### Legacy Raw Regime Validation (for back-compat audit)")
     col5, col6 = st.columns(2)
     with col5:
         st.caption("By raw regime - Adjusted H19 scorecard")
         st.dataframe(payload.get("scorecard_h19_by_raw_regime_adj", pd.DataFrame()))
     with col6:
-        st.caption("Regime diagnostic means")
+        st.caption("Driver geometry diagnostic means (Recent 104w)")
         st.dataframe(payload.get("regime_diag_recent104", pd.DataFrame()))
+
+    st.markdown("### Action Regime Diagnostics")
+    col7, col8 = st.columns(2)
+    with col7:
+        st.caption("Action regime diagnostic means (Full)")
+        st.dataframe(payload.get("action_regime_diag_full", pd.DataFrame()))
+    with col8:
+        st.caption("Action regime diagnostic means (Recent 52w)")
+        st.dataframe(payload.get("action_regime_diag_recent52", pd.DataFrame()))
 
     st.markdown("### Current Decision Audit")
     cur = payload.get("current_decision", {})
@@ -3565,6 +3622,7 @@ def run_tab_forward_overlay():
             "pred_px_19w_raw": cur.get("current_predicted_px_19w_raw"),
             "pred_px_19w_adj": cur.get("current_predicted_px_19w_adj"),
             "regime_state": cur.get("current_regime_state"),
+            "driver_geometry": cur.get("current_driver_geometry"),
             "confidence": cur.get("current_confidence_bucket"),
             "path_mult": cur.get("current_regime_path_multiplier", cur.get("current_path_multiplier")),
             "pos_mult": cur.get("current_regime_position_multiplier", cur.get("current_position_multiplier")),
@@ -3591,8 +3649,10 @@ def run_tab_forward_overlay():
         score_recent = payload.get("scorecard_h19_recent104_adj", pd.DataFrame())
         score_recent52 = payload.get("scorecard_h19_recent52_adj", pd.DataFrame())
         score_reg = payload.get("scorecard_h19_by_regime_adj", pd.DataFrame())
+        score_driver = payload.get("scorecard_h19_by_driver_geometry_adj", pd.DataFrame())
         score_reg_raw = payload.get("scorecard_h19_by_raw_regime_adj", pd.DataFrame())
         regime_diag_recent104 = payload.get("regime_diag_recent104", pd.DataFrame())
+        action_diag_recent52 = payload.get("action_regime_diag_recent52", pd.DataFrame())
         if score_full is not None and not score_full.empty:
             st.download_button(
                 "Download H19 Scorecard Full CSV",
@@ -3659,7 +3719,7 @@ def run_tab5_multiasset():
     horizon_w = int(min(int(horizon_w_sel), xx))
     fit_w = st.selectbox("Fit window (weeks)", [78, 104, 156], index=1)
 
-    st.markdown("### TAB5 í¬ì§ì ì¤ì  (ì¥ê¸° ì¶ì¸ í¬ìí)")
+    st.markdown("### TAB5 포지션 설정 (장기 추세 투자형)")
     mode = st.selectbox(
         "Strategy / Position mode",
         [
@@ -3695,7 +3755,7 @@ def run_tab5_multiasset():
 
     asset_wclose = s_close.resample(WEEK_RULE).last().dropna()
     if asset_wclose.empty or asset_wclose.shape[0] < (fit_w + horizon_w + 20):
-        st.warning("ìì° ì£¼ê° ë°ì´í°ê° ë¶ì¡±í©ëë¤. (ê¸°ê°/fit/horizon ì¡°ì  íì)")
+        st.warning("자산 주간 데이터가 부족합니다. (기간/fit/horizon 조정 필요)")
         return
 
     # Drivers on weekly axis (use latest-shifted drivers)
@@ -3720,7 +3780,7 @@ def run_tab5_multiasset():
         return
 
     st.caption(
-        f"Forecast anchor: requested end_dt={pd.Timestamp(end_dt_req).date()} â used end_dt_eff={pd.Timestamp(fc['end_dt_eff']).date()} "
+        f"Forecast anchor: requested end_dt={pd.Timestamp(end_dt_req).date()} → used end_dt_eff={pd.Timestamp(fc['end_dt_eff']).date()} "
         f"| drivers-max_h(at end_dt_eff)={fc.get('max_h', np.nan)}w | h_used={fc.get('h', np.nan)}w"
     )
 
@@ -3744,8 +3804,8 @@ def run_tab5_multiasset():
     fig.tight_layout()
     st.pyplot(fig)
 
-    st.markdown("### Walk-forward Backtest (drivers-only future; realized at tât+h)")
-    with st.spinner("Backtest ê³ì° ì¤..."):
+    st.markdown("### Walk-forward Backtest (drivers-only future; realized at t→t+h)")
+    with st.spinner("Backtest 계산 중..."):
         bt = walk_forward_backtest_overlapping_driversonly(
             px_wclose=asset_wclose,
             liq_shifted_full=liq_shifted_full,
@@ -3757,7 +3817,7 @@ def run_tab5_multiasset():
         )
 
     if bt is None or bt.empty:
-        st.warning("Backtest ê²°ê³¼ê° ë¹ì´ ììµëë¤. (ê³µíµêµ¬ê° ë¶ì¡±)")
+        st.warning("Backtest 결과가 비어 있습니다. (공통구간 부족)")
         return
 
     bt = bt.copy()
@@ -3798,7 +3858,7 @@ def run_tab5_multiasset():
     st.markdown("#### Backtest table (tail)")
     st.dataframe(bt2.tail(80))
 
-    st.markdown("### TAB5 One-file CSV ë¤ì´ë¡ë (bt + pos + trades-marks)")
+    st.markdown("### TAB5 One-file CSV 다운로드 (bt + pos + trades-marks)")
     try:
         df_u = bt2.copy()
         df_u["trade_flag_nonoverlap"] = 0
@@ -3815,7 +3875,7 @@ def run_tab5_multiasset():
             mime="text/csv",
         )
     except Exception as e:
-        st.warning(f"Unified CSV ìì± ì¤ ì¤ë¥: {e}")
+        st.warning(f"Unified CSV 생성 중 오류: {e}")
 
     st.download_button(
         "Download TAB5 backtest CSV",
@@ -3837,7 +3897,7 @@ def run_tab5_multiasset():
 # =========================
 tab_main, tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "MAIN (True-history + Spaghetti)",
-    "TAB1 DXY(ì­ì¶) vs BTC",
+    "TAB1 DXY(역축) vs BTC",
     "TAB2 Liquidity vs BTC",
     "TAB3 Combo + 2D Lag-Pair",
     "TAB4 Forward Overlay (LDLI vs BTC)",
