@@ -2,14 +2,9 @@ streamlit
 pandas
 numpy
 plotly
-yfinance
+yfinance>=1.2.1
 pandas_datareader
-streamlit
 Pillow
-numpy
-streamlit
-pandas
-numpy
 requests
 python-dateutil
 matplotlib
@@ -17,4 +12,8 @@ matplotlib
 scikit-learn
 xgboost
 
-yfinance>=1.2.1
+# v2.19 Patch v3: Alpha auto-fetch deps
+pyarrow
+lxml
+beautifulsoup4
+html5lib

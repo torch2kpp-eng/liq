@@ -875,22 +875,58 @@ def fetch_exchange_reserve_auto(week_rule: str = WEEK_RULE) -> pd.DataFrame:
     """
     거래소 BTC 보유량 자동 수집.
 
-    중요: 100% 무료 공식 API가 부재하므로 proxy를 적극 활용.
-    PIT T-7 규칙 하에서는 절대량보다 7일 변화 방향이 더 중요.
-
-    Fallback 체인:
-      1순위: BGeometrics 무료 (직접 reserve)
-      2순위: CoinMetrics SplyAct1yr proxy (1년 활동 공급량 → reserve trend proxy)
-      3순위: 디스크 캐시 (최대 14일된 데이터)
+    v2.19 Patch v3: Reorder fallback chain
+      1순위: CoinMetrics SplyAct1yr proxy (작동 확인됨)
+      2순위: BGeometrics 무료 (작동 미확인)
+      3순위: 디스크 캐시
 
     PIT 규칙: T-7일 컷오프
 
-    Returns:
-        pd.DataFrame with columns: ['exchange_reserve_btc', 'reserve_pct_change_4w', 'reserve_z']
+    중요: 절대량보다 7일 추세 방향이 alpha 신호로 더 의미있음.
     """
 
-    # ── 1순위: BGeometrics ────────────────────────────────
+    # ── 1순위: CoinMetrics SplyAct1yr proxy ────────────────────
     try:
+        LOG_ALPHA.info("[Reserve] CoinMetrics SplyAct1yr fetch start")
+        url = (
+            "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics"
+            "?assets=btc&metrics=SplyAct1yr&frequency=1d&page_size=10000"
+        )
+        rows = []
+        next_url = url
+        for _ in range(20):
+            r = requests.get(next_url, timeout=20)
+            r.raise_for_status()
+            j = r.json()
+            rows.extend(j.get("data", []))
+            next_url = j.get("next_page_url")
+            if not next_url:
+                break
+
+        if not rows:
+            raise RuntimeError("CoinMetrics SplyAct1yr empty")
+
+        df = pd.DataFrame(rows)
+        df["time"] = pd.to_datetime(df["time"]).dt.tz_localize(None).dt.normalize()
+        df = df.set_index("time").sort_index()
+        df["exchange_reserve_btc"] = pd.to_numeric(df["SplyAct1yr"], errors="coerce")
+        df = df[["exchange_reserve_btc"]].dropna()
+
+        out = apply_pit_cutoff(df, cutoff_days=7)
+        weekly = out.resample(week_rule).last().dropna()
+        weekly["reserve_pct_change_4w"] = weekly["exchange_reserve_btc"].pct_change(4)
+        weekly["reserve_z"] = rolling_zscore(weekly["exchange_reserve_btc"], window=104, min_periods=26)
+
+        _alpha_save_disk("exchange_reserve", weekly)
+        LOG_ALPHA.info(f"[Reserve] CoinMetrics SplyAct1yr OK ({len(weekly)} weekly samples)")
+        return weekly
+
+    except Exception as e:
+        LOG_ALPHA.warning(f"[Reserve] CoinMetrics primary failed: {e}")
+
+    # ── 2순위: BGeometrics ──────────────────────────────────────
+    try:
+        LOG_ALPHA.info("[Reserve] BGeometrics fallback start")
         candidate_urls = [
             "https://api.bgeometrics.com/v1/exchange-reserves",
             "https://api.bgeometrics.com/v1/exchange-reserve",
@@ -925,57 +961,16 @@ def fetch_exchange_reserve_auto(week_rule: str = WEEK_RULE) -> pd.DataFrame:
         weekly["reserve_z"] = rolling_zscore(weekly["exchange_reserve_btc"], window=104, min_periods=26)
 
         _alpha_save_disk("exchange_reserve", weekly)
-        LOG_ALPHA.info(f"[Reserve] BGeometrics OK ({len(weekly)} weekly samples)")
+        LOG_ALPHA.info(f"[Reserve] BGeometrics fallback OK ({len(weekly)} weekly samples)")
         return weekly
 
     except Exception as e:
         LOG_ALPHA.warning(f"[Reserve] BGeometrics failed: {e}")
 
-    # ── 2순위: CoinMetrics Proxy (SplyAct1yr) ────────────
-    try:
-        url = (
-            "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics"
-            "?assets=btc&metrics=SplyAct1yr&frequency=1d&page_size=10000"
-        )
-        rows = []
-        next_url = url
-        for _ in range(20):
-            r = requests.get(next_url, timeout=20)
-            r.raise_for_status()
-            j = r.json()
-            rows.extend(j.get("data", []))
-            next_url = j.get("next_page_url")
-            if not next_url:
-                break
-
-        if not rows:
-            raise RuntimeError("CoinMetrics SplyAct1yr empty")
-
-        df = pd.DataFrame(rows)
-        df["time"] = pd.to_datetime(df["time"]).dt.tz_localize(None).dt.normalize()
-        df = df.set_index("time").sort_index()
-        df["exchange_reserve_btc"] = pd.to_numeric(df["SplyAct1yr"], errors="coerce")
-        df = df[["exchange_reserve_btc"]].dropna()
-
-        out = apply_pit_cutoff(df, cutoff_days=7)
-        weekly = out.resample(week_rule).last().dropna()
-        weekly["reserve_pct_change_4w"] = weekly["exchange_reserve_btc"].pct_change(4)
-        weekly["reserve_z"] = rolling_zscore(weekly["exchange_reserve_btc"], window=104, min_periods=26)
-
-        _alpha_save_disk("exchange_reserve", weekly)
-        LOG_ALPHA.warning(
-            f"[Reserve] BGeometrics failed → CoinMetrics SplyAct1yr proxy used "
-            f"({len(weekly)} weekly samples). 절대량 아닌 추세 방향만 신뢰 가능."
-        )
-        return weekly
-
-    except Exception as e:
-        LOG_ALPHA.warning(f"[Reserve] CoinMetrics proxy failed: {e}")
-
-    # ── 3순위: 디스크 캐시 ─────────────────────────────────
+    # ── 3순위: 디스크 캐시 ───────────────────────────────────
     cached = _alpha_load_disk("exchange_reserve", max_age_hours=24 * 14)
     if cached is not None and not cached.empty:
-        LOG_ALPHA.warning(f"[Reserve] all live sources failed, using disk cache")
+        LOG_ALPHA.warning("[Reserve] all live sources failed, using disk cache")
         return cached
 
     LOG_ALPHA.error("[Reserve] all sources failed including disk cache")
@@ -990,12 +985,13 @@ def fetch_etf_netflow_auto(week_rule: str = WEEK_RULE) -> pd.DataFrame:
     """
     미국 스팟 BTC ETF 일일 net flow 자동 수집.
 
-    Fallback 체인:
-      1순위: Farside Investors HTML 스크래핑 (시장 표준)
-      2순위: SoSoValue Demo API (st.secrets["SOSO_API_KEY"] 필요, 선택사항)
-      3순위: 디스크 캐시 (최대 7일된 데이터)
+    v2.19 Patch v3: Add Yahoo Finance ETF proxy as new primary source (US-IP-friendly)
+      1순위: Yahoo Finance ETF dollar-volume proxy (무료, no auth, US OK)
+      2순위: Farside Investors HTML 스크래핑
+      3순위: SoSoValue Demo API
+      4순위: 디스크 캐시
 
-    PIT 규칙: T-2일 컷오프 (Farside는 evening US time T+1 발표)
+    PIT 규칙: T-2일 컷오프
 
     Returns:
         pd.DataFrame with columns: ['etf_netflow_usd_m', 'etf_4w_cumulative', 'etf_z', 'etf_available']
@@ -1006,9 +1002,63 @@ def fetch_etf_netflow_auto(week_rule: str = WEEK_RULE) -> pd.DataFrame:
         "User-Agent": "Mozilla/5.0 (compatible; BTCMacroPredictionEngine/2.19)"
     }
 
-    # ── 1순위: Farside Investors ──────────────────────────
+    # ── 1순위: Yahoo Finance ETF dollar-volume proxy ──────────
+    # Individual spot BTC ETF tickers via yfinance (US-IP-friendly).
+    # Net flow proxy = sum of daily dollar-volume changes across major spot ETFs.
     try:
-        LOG_ALPHA.info("[ETF] Farside HTTP 요청 시작")
+        LOG_ALPHA.info("[ETF] Yahoo Finance ETF proxy fetch start")
+        import yfinance as yf
+
+        etf_tickers = ["IBIT", "FBTC", "BITB", "ARKB", "BTCO", "EZBC", "BRRR", "HODL", "BTCW", "GBTC"]
+        all_etf_data = []
+
+        for ticker in etf_tickers:
+            try:
+                t = yf.Ticker(ticker)
+                hist = t.history(period="2y", interval="1d")
+                if hist.empty:
+                    continue
+                # net flow proxy = (close - prev_close) * volume / 1e6 (millions USD approximation)
+                # 더 정확한 net flow는 AUM 변화이지만 무료 데이터로는 제한적
+                # 대신: dollar volume change as proxy
+                hist["dollar_volume"] = hist["Close"] * hist["Volume"]
+                hist["dv_change"] = hist["dollar_volume"].diff() / 1e6  # millions
+                hist["ticker"] = ticker
+                all_etf_data.append(hist[["dv_change", "ticker"]].dropna())
+            except Exception as ee:
+                LOG_ALPHA.warning(f"[ETF] {ticker} failed: {ee}")
+                continue
+
+        if not all_etf_data:
+            raise RuntimeError("Yahoo Finance ETF all failed")
+
+        combined = pd.concat(all_etf_data)
+        # Aggregate per date
+        daily = combined.groupby(combined.index)["dv_change"].sum()
+        daily.index = pd.to_datetime(daily.index).tz_localize(None).normalize()
+        daily.name = "etf_netflow_usd_m"
+        df = daily.to_frame()
+
+        out = apply_pit_cutoff(df, cutoff_days=2)
+        weekly = out.resample(week_rule).sum().dropna(how="all")
+        weekly["etf_4w_cumulative"] = weekly["etf_netflow_usd_m"].rolling(4, min_periods=2).sum()
+        weekly["etf_z"] = rolling_zscore(weekly["etf_4w_cumulative"], window=52, min_periods=13)
+        weekly["etf_available"] = 1
+
+        _alpha_save_disk("etf_netflow", weekly)
+        LOG_ALPHA.info(f"[ETF] Yahoo Finance ETF proxy OK ({len(weekly)} weekly samples)")
+        LOG_ALPHA.warning(
+            "[ETF] Note: Yahoo proxy is dollar-volume-based, "
+            "not actual fund flow. Use as directional signal only."
+        )
+        return weekly
+
+    except Exception as e:
+        LOG_ALPHA.warning(f"[ETF] Yahoo proxy failed: {e}")
+
+    # ── 2순위: Farside Investors ──────────────────────────────
+    try:
+        LOG_ALPHA.info("[ETF] Farside scrape start")
         r = requests.get("https://farside.co.uk/btc/", headers=headers, timeout=20)
         LOG_ALPHA.info(f"[ETF] Farside HTTP status: {r.status_code}, content size: {len(r.text)}")
         r.raise_for_status()
@@ -1017,30 +1067,24 @@ def fetch_etf_netflow_auto(week_rule: str = WEEK_RULE) -> pd.DataFrame:
         if not tables:
             raise RuntimeError("Farside no tables found")
 
-        # 가장 큰 테이블이 일별 flow
         df_raw = max(tables, key=lambda t: t.shape[0])
         df = df_raw.copy()
 
-        # MultiIndex 컬럼 평탄화
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = [c[-1] if isinstance(c, tuple) else c for c in df.columns]
         df.columns = [str(c).strip() for c in df.columns]
 
-        # Date 컬럼과 Total 컬럼 찾기
         date_col = next((c for c in df.columns if "date" in c.lower()), df.columns[0])
         total_col = next((c for c in df.columns if c.lower().startswith("total")), df.columns[-1])
 
         df = df[[date_col, total_col]].copy()
         df.columns = ["date", "etf_netflow_usd_m"]
 
-        # 날짜 형식이 아닌 행 제거 (Average, Minimum, Maximum 등)
         date_pattern = r"\d{1,2}\s+\w+\s+\d{4}|\d{4}-\d{2}-\d{2}"
         df = df[df["date"].astype(str).str.contains(date_pattern, na=False, regex=True)]
         df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
         df = df.dropna(subset=["date"]).set_index("date").sort_index()
 
-        # 값 정규화: Farside는 '-' 또는 빈 셀을 0으로 처리
-        # 음수는 '(123.4)' 형태로 표시될 수 있음
         def _parse_flow(v):
             s = str(v).strip().replace(",", "")
             if s in ("-", "", "nan", "NaN"):
@@ -1055,10 +1099,7 @@ def fetch_etf_netflow_auto(week_rule: str = WEEK_RULE) -> pd.DataFrame:
         df["etf_netflow_usd_m"] = df["etf_netflow_usd_m"].apply(_parse_flow)
         df = df.dropna()
 
-        # PIT 컷오프 T-2
         out = apply_pit_cutoff(df, cutoff_days=2)
-
-        # 주간 집계 (sum)
         weekly = out.resample(week_rule).sum().dropna(how="all")
         weekly["etf_4w_cumulative"] = weekly["etf_netflow_usd_m"].rolling(4, min_periods=2).sum()
         weekly["etf_z"] = rolling_zscore(weekly["etf_4w_cumulative"], window=52, min_periods=13)
@@ -1071,11 +1112,11 @@ def fetch_etf_netflow_auto(week_rule: str = WEEK_RULE) -> pd.DataFrame:
     except Exception as e:
         LOG_ALPHA.warning(f"[ETF] Farside scrape failed: {e}")
 
-    # ── 2순위: SoSoValue Demo API ────────────────────────
+    # ── 3순위: SoSoValue Demo API ────────────────────────────
     try:
         api_key = st.secrets.get("SOSO_API_KEY", None) if hasattr(st, "secrets") else None
         if not api_key:
-            raise RuntimeError("SOSO_API_KEY not in st.secrets, skipping")
+            raise RuntimeError("SOSO_API_KEY not configured")
 
         url = "https://openapi.sosovalue.com/api/v1/etf/historicalInflowChart"
         r = requests.post(
@@ -1108,20 +1149,19 @@ def fetch_etf_netflow_auto(week_rule: str = WEEK_RULE) -> pd.DataFrame:
         weekly["etf_available"] = 1
 
         _alpha_save_disk("etf_netflow", weekly)
-        LOG_ALPHA.warning(f"[ETF] Farside failed → SoSoValue Demo API used ({len(weekly)} samples)")
+        LOG_ALPHA.warning(f"[ETF] SoSoValue Demo API used ({len(weekly)} samples)")
         return weekly
 
     except Exception as e:
         LOG_ALPHA.warning(f"[ETF] SoSoValue fallback failed: {e}")
 
-    # ── 3순위: 디스크 캐시 ─────────────────────────────────
+    # ── 4순위: 디스크 캐시 ───────────────────────────────────
     cached = _alpha_load_disk("etf_netflow", max_age_hours=24 * 7)
     if cached is not None and not cached.empty:
-        LOG_ALPHA.warning(f"[ETF] all live sources failed, using disk cache")
+        LOG_ALPHA.warning("[ETF] all live sources failed, using disk cache")
         return cached
 
     LOG_ALPHA.error("[ETF] all sources failed including disk cache")
-    # ETF 미가용 명시: etf_available=0
     return pd.DataFrame(columns=["etf_netflow_usd_m", "etf_4w_cumulative", "etf_z", "etf_available"])
 
 
@@ -1186,6 +1226,168 @@ def fetch_binance_funding_history(symbol: str = "BTCUSDT", start_date: str = STA
     s = s[~s.index.duplicated(keep="last")]
     s.name = "funding_rate"
     return s.dropna()
+
+
+# ============================================================
+# v2.19 Patch v3: Funding fetcher with US-IP-friendly fallback
+# Binance Futures (fapi.binance.com) returns HTTP 451 from
+# Streamlit Cloud (AWS US-East-1). Use Bybit/OKX instead.
+# ============================================================
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def fetch_funding_rate_universal(
+    symbol: str = "BTCUSDT",
+    start_date: str = START_DATE,
+) -> pd.Series:
+    """
+    Funding rate fetcher with US-IP-friendly fallback chain.
+
+    Fallback order:
+      1. Bybit (no US block, no auth required)
+      2. OKX (no US block, no auth required)
+      3. Binance (legacy, may fail with 451 from Streamlit Cloud)
+      4. Disk cache
+
+    Returns: pd.Series with raw funding rate (8h interval)
+    """
+
+    # ── 1순위: Bybit ──────────────────────────────────────────
+    try:
+        LOG_ALPHA.info("[Funding] Bybit fetch start")
+        all_rows = []
+        cursor = None
+        # Bybit returns max 200 rows per call, use pagination
+        for _ in range(50):  # max 50 pages = 10000 rows
+            params = {
+                "category": "linear",
+                "symbol": symbol.upper(),
+                "limit": 200,
+            }
+            if cursor:
+                params["cursor"] = cursor
+
+            r = requests.get(
+                "https://api.bybit.com/v5/market/funding/history",
+                params=params,
+                timeout=20,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            r.raise_for_status()
+            data = r.json()
+
+            if data.get("retCode") != 0:
+                raise RuntimeError(f"Bybit API error: {data.get('retMsg')}")
+
+            result = data.get("result", {})
+            rows = result.get("list", [])
+            if not rows:
+                break
+            all_rows.extend(rows)
+
+            cursor = result.get("nextPageCursor")
+            if not cursor:
+                break
+
+        if not all_rows:
+            raise RuntimeError("Bybit returned empty data")
+
+        df = pd.DataFrame(all_rows)
+        df["fundingRateTimestamp"] = pd.to_datetime(
+            pd.to_numeric(df["fundingRateTimestamp"], errors="coerce"),
+            unit="ms", utc=True
+        ).dt.tz_localize(None)
+        df["fundingRate"] = pd.to_numeric(df["fundingRate"], errors="coerce")
+        s = pd.Series(
+            df["fundingRate"].values,
+            index=df["fundingRateTimestamp"]
+        ).sort_index()
+        s = s[~s.index.duplicated(keep="last")].dropna()
+        s.name = "funding_rate"
+
+        LOG_ALPHA.info(f"[Funding] Bybit OK: {len(s)} rows")
+        return s
+
+    except Exception as e:
+        LOG_ALPHA.warning(f"[Funding] Bybit failed: {e}")
+
+    # ── 2순위: OKX ────────────────────────────────────────────
+    try:
+        LOG_ALPHA.info("[Funding] OKX fetch start")
+        # OKX uses BTC-USDT-SWAP for perpetual
+        okx_symbol = "BTC-USDT-SWAP"
+        all_rows = []
+        before_ts = None
+        for _ in range(50):
+            params = {
+                "instId": okx_symbol,
+                "limit": "100",
+            }
+            if before_ts:
+                params["before"] = str(before_ts)
+
+            r = requests.get(
+                "https://www.okx.com/api/v5/public/funding-rate-history",
+                params=params,
+                timeout=20,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            r.raise_for_status()
+            data = r.json()
+
+            if data.get("code") != "0":
+                raise RuntimeError(f"OKX error: {data.get('msg')}")
+
+            rows = data.get("data", [])
+            if not rows:
+                break
+            all_rows.extend(rows)
+
+            # OKX pagination: next page uses 'before' = oldest timestamp
+            before_ts = int(rows[-1]["fundingTime"])
+            if len(rows) < 100:
+                break
+
+        if not all_rows:
+            raise RuntimeError("OKX returned empty data")
+
+        df = pd.DataFrame(all_rows)
+        df["fundingTime"] = pd.to_datetime(
+            pd.to_numeric(df["fundingTime"], errors="coerce"),
+            unit="ms", utc=True
+        ).dt.tz_localize(None)
+        df["fundingRate"] = pd.to_numeric(df["fundingRate"], errors="coerce")
+        s = pd.Series(
+            df["fundingRate"].values,
+            index=df["fundingTime"]
+        ).sort_index()
+        s = s[~s.index.duplicated(keep="last")].dropna()
+        s.name = "funding_rate"
+
+        LOG_ALPHA.info(f"[Funding] OKX fallback OK: {len(s)} rows")
+        return s
+
+    except Exception as e:
+        LOG_ALPHA.warning(f"[Funding] OKX failed: {e}")
+
+    # ── 3순위: Binance (US block 가능성 높음) ─────────────────
+    try:
+        LOG_ALPHA.info("[Funding] Binance legacy fallback start")
+        s = fetch_binance_funding_history(symbol=symbol, start_date=start_date)
+        if not s.empty:
+            LOG_ALPHA.info(f"[Funding] Binance legacy OK: {len(s)} rows")
+            return s
+    except Exception as e:
+        LOG_ALPHA.warning(f"[Funding] Binance legacy failed: {e}")
+
+    # ── 4순위: 디스크 캐시 ────────────────────────────────────
+    cached = _alpha_load_disk("funding_raw", max_age_hours=24 * 7)
+    if cached is not None and not cached.empty:
+        LOG_ALPHA.warning("[Funding] all live sources failed, using disk cache")
+        s = cached.iloc[:, 0] if isinstance(cached, pd.DataFrame) else cached
+        s.name = "funding_rate"
+        return s
+
+    LOG_ALPHA.error("[Funding] all sources failed including disk cache")
+    return pd.Series(dtype=float, name="funding_rate")
 
 
 def build_funding_weekly_zscore(
@@ -1256,8 +1458,19 @@ def load_alpha_inputs_weekly(
 
     if use_binance_funding:
         try:
-            funding_raw = fetch_binance_funding_history(symbol=funding_symbol, start_date=START_DATE)
-            funding_w, funding_z = build_funding_weekly_zscore(funding_raw, week_rule=week_rule)
+            # v2.19 Patch v3: Use universal fetcher with Bybit→OKX→Binance fallback
+            funding_raw = fetch_funding_rate_universal(
+                symbol=funding_symbol,
+                start_date=START_DATE,
+            )
+            if not funding_raw.empty:
+                funding_w, funding_z = build_funding_weekly_zscore(
+                    funding_raw, week_rule=week_rule
+                )
+                # 성공한 경우 디스크 캐시에 저장
+                _alpha_save_disk("funding_raw", funding_raw.to_frame())
+            else:
+                funding_error = "all funding sources returned empty"
         except Exception as e:
             funding_error = str(e)
 
@@ -3828,15 +4041,43 @@ def plot_equity_curve(equity: pd.Series, title: str):
 def run_main_tab():
     st.subheader("MAIN) BTC vs LDLI (+ True-history predicted + Spaghetti)")
 
-    # === [DEBUG] Funding fetch 진단 ===
-    with st.expander("🔧 Debug: Funding fetch 직접 테스트", expanded=False):
-        if st.button("Funding API 직접 호출 테스트"):
-            try:
-                test_funding = fetch_binance_funding_history(symbol="BTCUSDT", start_date=START_DATE)
-                st.success(f"Funding fetch OK: {len(test_funding)} rows")
-                st.write(test_funding.tail(5))
-            except Exception as e:
-                st.error(f"Funding fetch 실패: {type(e).__name__}: {e}")
+    # === [DEBUG] 4개 alpha 신호 fetch 직접 테스트 ===
+    with st.expander("🔧 Debug: Alpha 신호 fetch 직접 테스트", expanded=False):
+        col1, col2 = st.columns(2)
+
+        with col1:
+            if st.button("Funding API 직접 호출"):
+                try:
+                    test_funding = fetch_funding_rate_universal(symbol="BTCUSDT", start_date=START_DATE)
+                    st.success(f"✅ Funding fetch OK: {len(test_funding)} rows")
+                    st.write(test_funding.tail(5))
+                except Exception as e:
+                    st.error(f"❌ Funding fetch 실패: {type(e).__name__}: {e}")
+
+            if st.button("MVRV API 직접 호출"):
+                try:
+                    test_mvrv = fetch_mvrv_zscore_auto()
+                    st.success(f"✅ MVRV fetch OK: {len(test_mvrv)} rows")
+                    st.write(test_mvrv.tail(5))
+                except Exception as e:
+                    st.error(f"❌ MVRV fetch 실패: {type(e).__name__}: {e}")
+
+        with col2:
+            if st.button("Reserve API 직접 호출"):
+                try:
+                    test_reserve = fetch_exchange_reserve_auto()
+                    st.success(f"✅ Reserve fetch OK: {len(test_reserve)} rows")
+                    st.write(test_reserve.tail(5))
+                except Exception as e:
+                    st.error(f"❌ Reserve fetch 실패: {type(e).__name__}: {e}")
+
+            if st.button("ETF API 직접 호출"):
+                try:
+                    test_etf = fetch_etf_netflow_auto()
+                    st.success(f"✅ ETF fetch OK: {len(test_etf)} rows")
+                    st.write(test_etf.tail(5))
+                except Exception as e:
+                    st.error(f"❌ ETF fetch 실패: {type(e).__name__}: {e}")
 
     try:
         payload = build_forward_overlay_payload(LIQ_SOURCE, ALPHA_MODE, FORECAST_MODEL, use_binance_funding=USE_BINANCE_FUNDING, funding_symbol=FUNDING_SYMBOL, mvrv_file_bytes=MVRV_FILE_BYTES, mvrv_file_name=MVRV_FILE_NAME, use_auto_mvrv=USE_AUTO_MVRV, use_auto_reserve=USE_AUTO_RESERVE, use_auto_etf=USE_AUTO_ETF)
