@@ -2408,6 +2408,87 @@ def compute_alpha_state_v219(
     return out
 
 
+# ============================================================
+# v2.19 Phase 1 — State × Regime Position Multiplier Override
+# ============================================================
+# OOS 분석(2026-05-01) 결과 기반 권장 multiplier
+# 산출 근거: sign_acc → multiplier 매핑
+#   sign_acc >= 70%: 1.30x (최강)
+#   sign_acc 65~70%: 1.30x
+#   sign_acc 60~65%: 1.20x
+#   sign_acc 55~60%: 1.10x
+#   sign_acc 50~55%: 1.00x (중립)
+#   sign_acc 45~50%: 0.85x
+#   sign_acc 40~45%: 0.60x (FOLLOW_LIGHT NEUTRAL)
+#   sign_acc < 40%:  0.40x
+
+STATE_REGIME_MULTIPLIER_TABLE = {
+    # (alpha_state, regime_state): position_multiplier
+    # 표본 수 5개 미만은 None (기존 multiplier 사용)
+
+    # NEUTRAL × 각 regime
+    ("NEUTRAL", "DEFENSIVE"):     1.10,  # n=43, sign_acc 53.5%
+    ("NEUTRAL", "FOLLOW"):        0.95,  # n=37, sign_acc 48.6%
+    ("NEUTRAL", "FOLLOW_LIGHT"):  0.60,  # n=57, sign_acc 42.1% ⚠️ 함정
+    ("NEUTRAL", "SHRINK"):        0.90,  # n=38, sign_acc 47.4%
+    ("NEUTRAL", "TRANSITION"):    0.92,  # n=163, sign_acc 48.5%
+
+    # BULLISH × 각 regime
+    ("BULLISH", "DEFENSIVE"):     1.20,  # n=17, sign_acc 58.8%
+    ("BULLISH", "FOLLOW"):        1.30,  # n=8, sign_acc 75.0% ⭐
+    ("BULLISH", "FOLLOW_LIGHT"):  None,  # n=3, 표본 부족
+    ("BULLISH", "SHRINK"):        1.30,  # n=7, sign_acc 71.4% ⭐
+    ("BULLISH", "TRANSITION"):    1.30,  # n=23, sign_acc 65.2% ⭐
+
+    # BEARISH/STRONG_BEAR/STRONG_BULL: 표본 부족 (n<5)
+    # → 기존 alpha_state position_multiplier 사용
+}
+
+
+def compute_state_regime_position_multiplier(
+    alpha_state: pd.Series,
+    regime_state: pd.Series,
+    base_position_multiplier: pd.Series,
+    blend_weight: float = 0.7,
+) -> Tuple[pd.Series, pd.Series]:
+    """
+    OOS 분석 기반으로 alpha_state × regime 조합별 position multiplier를 적용.
+
+    Args:
+        alpha_state: v2.19 alpha state 시리즈
+        regime_state: regime state 시리즈
+        base_position_multiplier: 기존 regime/alpha 기반 multiplier
+        blend_weight: 0~1, OOS 권장값과 기존값을 블렌드. 1.0이면 OOS 권장값 100% 사용.
+
+    Returns:
+        (final_multiplier, override_flag) — 두 시리즈 반환
+    """
+    final = base_position_multiplier.copy()
+    override_flag = pd.Series("base", index=base_position_multiplier.index, dtype="object")
+
+    for idx in base_position_multiplier.index:
+        a = alpha_state.get(idx, "NEUTRAL")
+        r = regime_state.get(idx, None)
+
+        if pd.isna(r) or pd.isna(a):
+            continue
+
+        rec = STATE_REGIME_MULTIPLIER_TABLE.get((a, r))
+        if rec is None:
+            continue
+
+        base_val = base_position_multiplier.loc[idx]
+        if pd.isna(base_val):
+            continue
+
+        # Blend: blend_weight * OOS권장 + (1-blend_weight) * 기존값
+        blended = blend_weight * rec + (1 - blend_weight) * base_val
+        final.loc[idx] = blended
+        override_flag.loc[idx] = f"oos:{a}x{r}"
+
+    return final, override_flag
+
+
 def classify_driver_geometry(
     z_liq_s: pd.Series,
     z_dxy_s: pd.Series,
@@ -3497,6 +3578,21 @@ def build_forward_overlay_payload(
     mult_df = compute_regime_multipliers(overlay_master_df["action_regime"])
     overlay_master_df = overlay_master_df.join(mult_df, how="left")
 
+    # === v2.19 Phase 1: State × Regime Position Multiplier Override ===
+    overlay_master_df["regime_position_multiplier_base"] = overlay_master_df["regime_position_multiplier"].copy()
+
+    phase1_mult, phase1_flag = compute_state_regime_position_multiplier(
+        alpha_state=overlay_master_df["alpha_state"],
+        regime_state=overlay_master_df["regime_state"],
+        base_position_multiplier=overlay_master_df["regime_position_multiplier"],
+        blend_weight=0.7,  # OOS 권장값을 70% 가중
+    )
+    overlay_master_df["regime_position_multiplier_oos"] = phase1_mult
+    overlay_master_df["position_multiplier_source"] = phase1_flag
+
+    # 기본 multiplier를 OOS 보정값으로 교체 (suggested_exposure 자동 반영)
+    overlay_master_df["regime_position_multiplier"] = phase1_mult
+
     overlay_master_df["predicted_fwd_ret_19w_adj"] = (
         pd.to_numeric(overlay_master_df["predicted_fwd_ret_19w"], errors="coerce") *
         pd.to_numeric(overlay_master_df["regime_path_multiplier"], errors="coerce")
@@ -4034,6 +4130,255 @@ def plot_equity_curve(equity: pd.Series, title: str):
     return fig
 
 
+# ============================================================
+# v2.19 Phase 1 — Validation Dashboard (TAB7)
+# ============================================================
+
+def render_phase1_validation_tab(payload: Dict):
+    """
+    Phase 1 acceptance criteria를 OOS 데이터로 자동 판정.
+
+    검증 항목:
+      1. WS-A: Path/Position multiplier 효과 (조건부 분리)
+      2. WS-D: State separation (alpha_state별 IC, sign_acc)
+      3. v2.19 acceptance criteria 자동 판정
+      4. 2D Matrix: alpha × regime
+      5. FOLLOW_LIGHT regime 진단
+      6. 권장 베팅 조합
+    """
+    st.subheader("Phase 1 Validation Dashboard")
+    st.caption("v2.19 acceptance criteria 자동 판정 — 매 실행 시 재계산")
+
+    overlay_df = payload.get("overlay_master_df")
+    if overlay_df is None or overlay_df.empty:
+        st.warning("Overlay 데이터가 없습니다.")
+        return
+
+    needed = ["realized_fwd_ret_19w", "predicted_fwd_ret_19w",
+              "predicted_fwd_ret_19w_adj", "alpha_state", "regime_state"]
+    if not all(c in overlay_df.columns for c in needed):
+        missing = [c for c in needed if c not in overlay_df.columns]
+        st.error(f"필수 컬럼 누락: {missing}")
+        return
+
+    v = overlay_df.dropna(subset=["realized_fwd_ret_19w", "predicted_fwd_ret_19w"]).copy()
+
+    if len(v) < 30:
+        st.warning(f"OOS 표본이 부족합니다 (n={len(v)}). 30 이상 필요.")
+        return
+
+    st.info(f"분석 표본: n = {len(v)}")
+
+    # === Section 1: WS-A Path Multiplier 효과 ===
+    st.markdown("### 1️⃣ WS-A: Path Multiplier 조건부 효과")
+
+    raw_pred = v["predicted_fwd_ret_19w"]
+    real = v["realized_fwd_ret_19w"]
+
+    base_correct_mask = np.sign(raw_pred) == np.sign(real)
+    base_correct = v[base_correct_mask]
+    base_wrong = v[~base_correct_mask]
+
+    mae_correct_raw = (base_correct["predicted_fwd_ret_19w"] - base_correct["realized_fwd_ret_19w"]).abs().mean()
+    mae_correct_adj = (base_correct["predicted_fwd_ret_19w_adj"] - base_correct["realized_fwd_ret_19w"]).abs().mean()
+    mae_wrong_raw = (base_wrong["predicted_fwd_ret_19w"] - base_wrong["realized_fwd_ret_19w"]).abs().mean()
+    mae_wrong_adj = (base_wrong["predicted_fwd_ret_19w_adj"] - base_wrong["realized_fwd_ret_19w"]).abs().mean()
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric(
+            "방향 적중 샘플 MAE 변화",
+            f"{(mae_correct_adj - mae_correct_raw)*100:+.2f}%p",
+            delta=f"n={len(base_correct)}",
+            delta_color="off"
+        )
+    with col2:
+        st.metric(
+            "방향 오적중 샘플 MAE 변화",
+            f"{(mae_wrong_adj - mae_wrong_raw)*100:+.2f}%p",
+            delta=f"n={len(base_wrong)}",
+            delta_color="off"
+        )
+
+    if (mae_correct_adj < mae_correct_raw) and (mae_wrong_adj < mae_wrong_raw):
+        st.success("✅ Path multiplier 양쪽 샘플 모두 개선 → 채택")
+    elif mae_wrong_adj < mae_wrong_raw:
+        st.info("⚠️ Path multiplier가 오적중 샘플만 개선 → 위험 완화 장치로 채택")
+    else:
+        st.warning("❌ Path multiplier 효과 검증 실패")
+
+    st.divider()
+
+    # === Section 2: WS-D State Separation ===
+    st.markdown("### 2️⃣ WS-D: Alpha State별 OOS 성과")
+
+    states_order = ["STRONG_BEAR", "BEARISH", "NEUTRAL", "BULLISH", "STRONG_BULL"]
+    state_rows = []
+
+    for state in states_order:
+        sub = v[v["alpha_state"] == state]
+        n = len(sub)
+        if n == 0:
+            state_rows.append({
+                "State": state, "n": 0, "Mean Real": None,
+                "Sign Acc": None, "IC": None
+            })
+            continue
+
+        mean_real = sub["realized_fwd_ret_19w"].mean()
+        sign_acc = (np.sign(sub["predicted_fwd_ret_19w"]) == np.sign(sub["realized_fwd_ret_19w"])).mean()
+        ic = sub["predicted_fwd_ret_19w"].corr(sub["realized_fwd_ret_19w"]) if n > 5 else None
+
+        state_rows.append({
+            "State": state, "n": n,
+            "Mean Real": f"{mean_real*100:+.1f}%",
+            "Sign Acc": f"{sign_acc*100:.1f}%",
+            "IC": f"{ic:+.3f}" if ic is not None else "N/A"
+        })
+
+    state_df = pd.DataFrame(state_rows)
+    st.dataframe(state_df, use_container_width=True, hide_index=True)
+
+    # === Section 3: Acceptance Criteria 자동 판정 ===
+    st.markdown("### 3️⃣ v2.19 Acceptance Criteria 판정")
+
+    neutral = v[v["alpha_state"] == "NEUTRAL"]
+    if len(neutral) >= 15:
+        neutral_ic = neutral["predicted_fwd_ret_19w"].corr(neutral["realized_fwd_ret_19w"])
+        neutral_sign = (np.sign(neutral["predicted_fwd_ret_19w"]) == np.sign(neutral["realized_fwd_ret_19w"])).mean()
+
+        st.caption(f"NEUTRAL baseline (n={len(neutral)}): IC={neutral_ic:+.3f}, sign_acc={neutral_sign*100:.1f}%")
+
+        verdicts = []
+        for state in ["BULLISH", "BEARISH", "STRONG_BULL", "STRONG_BEAR"]:
+            sub = v[v["alpha_state"] == state]
+            n = len(sub)
+
+            if n < 15:
+                verdicts.append({
+                    "State": state, "n": n,
+                    "ΔIC": "—", "Δsign_acc": "—",
+                    "Verdict": f"⚠️ 보류 (n<15)"
+                })
+                continue
+
+            state_ic = sub["predicted_fwd_ret_19w"].corr(sub["realized_fwd_ret_19w"])
+            state_sign = (np.sign(sub["predicted_fwd_ret_19w"]) == np.sign(sub["realized_fwd_ret_19w"])).mean()
+
+            d_ic = state_ic - neutral_ic
+            d_sign = state_sign - neutral_sign
+
+            pass_ic = abs(d_ic) > 0.05
+            pass_sign = abs(d_sign) > 0.05
+
+            if pass_ic or pass_sign:
+                verdict = "✅ PASS"
+            else:
+                verdict = "❌ FAIL"
+
+            verdicts.append({
+                "State": state, "n": n,
+                "ΔIC": f"{d_ic:+.3f}",
+                "Δsign_acc": f"{d_sign*100:+.1f}%p",
+                "Verdict": verdict
+            })
+
+        ver_df = pd.DataFrame(verdicts)
+        st.dataframe(ver_df, use_container_width=True, hide_index=True)
+
+        passed = sum(1 for v_ in verdicts if "PASS" in v_["Verdict"])
+        if passed >= 1:
+            st.success(f"✅ {passed}개 state PASS → Phase 1 통과 가능")
+        else:
+            st.warning(f"❌ PASS state 없음 → 추가 데이터 필요")
+    else:
+        st.warning(f"NEUTRAL 샘플 부족 (n={len(neutral)}). baseline 계산 불가.")
+
+    st.divider()
+
+    # === Section 4: 2D Matrix ===
+    st.markdown("### 4️⃣ Alpha State × Regime 2D Matrix (Sign Accuracy)")
+
+    regimes = sorted([r for r in v["regime_state"].dropna().unique()])
+    matrix_data = []
+
+    for state in states_order:
+        row = {"alpha_state": state}
+        for reg in regimes:
+            sub = v[(v["alpha_state"] == state) & (v["regime_state"] == reg)]
+            n = len(sub)
+            if n < 5:
+                row[reg] = f"(n={n})"
+            else:
+                sa = (np.sign(sub["predicted_fwd_ret_19w"]) == np.sign(sub["realized_fwd_ret_19w"])).mean()
+                row[reg] = f"{sa*100:.1f}% (n={n})"
+        matrix_data.append(row)
+
+    matrix_df = pd.DataFrame(matrix_data)
+    st.dataframe(matrix_df, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # === Section 5: FOLLOW_LIGHT 진단 ===
+    st.markdown("### 5️⃣ FOLLOW_LIGHT Regime 진단")
+
+    fl = v[v["regime_state"] == "FOLLOW_LIGHT"]
+    if len(fl) > 0:
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            sa = (np.sign(fl["predicted_fwd_ret_19w"]) == np.sign(fl["realized_fwd_ret_19w"])).mean()
+            st.metric("Sign Acc", f"{sa*100:.1f}%",
+                     delta=f"{(sa-0.5)*100:+.1f}%p vs 50%",
+                     delta_color="inverse" if sa < 0.5 else "normal")
+        with col2:
+            mean = fl["realized_fwd_ret_19w"].mean()
+            median = fl["realized_fwd_ret_19w"].median()
+            st.metric("Mean / Median", f"{mean*100:+.1f}% / {median*100:+.1f}%")
+        with col3:
+            loss_ratio = (fl["realized_fwd_ret_19w"] < 0).mean()
+            st.metric("Loss Ratio", f"{loss_ratio*100:.1f}%",
+                     delta="59% 이상이면 함정",
+                     delta_color="off")
+        with col4:
+            severe_loss = (fl["realized_fwd_ret_19w"] < -0.20).mean()
+            st.metric(">20% 폭락 비중", f"{severe_loss*100:.1f}%")
+
+        if sa < 0.45:
+            st.error(f"⚠️ FOLLOW_LIGHT는 구조적 함정 — 진입 회피 권고 (sign_acc {sa*100:.1f}%)")
+        elif sa < 0.50:
+            st.warning(f"⚠️ FOLLOW_LIGHT 적중률 미달 — 노출 축소 권고")
+        else:
+            st.info(f"FOLLOW_LIGHT 적중률 정상 ({sa*100:.1f}%)")
+
+    st.divider()
+
+    # === Section 6: 권장 조합 ===
+    st.markdown("### 6️⃣ 권장 베팅 조합 (sign_acc 기준)")
+
+    combos = []
+    for state in states_order:
+        for reg in regimes:
+            sub = v[(v["alpha_state"] == state) & (v["regime_state"] == reg)]
+            n = len(sub)
+            if n < 5:
+                continue
+            sa = (np.sign(sub["predicted_fwd_ret_19w"]) == np.sign(sub["realized_fwd_ret_19w"])).mean()
+            combos.append({"alpha": state, "regime": reg, "n": n,
+                          "sign_acc": sa, "score": (sa - 0.5) * np.sqrt(n)})
+
+    if combos:
+        combos_df = pd.DataFrame(combos).sort_values("score", ascending=False)
+        combos_df["sign_acc"] = combos_df["sign_acc"].apply(lambda x: f"{x*100:.1f}%")
+        combos_df["score"] = combos_df["score"].apply(lambda x: f"{x:+.2f}")
+
+        st.markdown("**Top 5 (적극 베팅)**")
+        st.dataframe(combos_df.head(5)[["alpha", "regime", "n", "sign_acc", "score"]],
+                     use_container_width=True, hide_index=True)
+        st.markdown("**Bottom 3 (회피)**")
+        st.dataframe(combos_df.tail(3)[["alpha", "regime", "n", "sign_acc", "score"]],
+                     use_container_width=True, hide_index=True)
+
+
 # =========================
 # MAIN TAB
 # =========================
@@ -4105,6 +4450,21 @@ def run_main_tab():
     )
     if alpha_meta.get("funding_error"):
         st.warning(ui_text(f"Funding auto-loader warning: {alpha_meta['funding_error']}"))
+
+    # === v2.19 Phase 1: Position Multiplier Override 표시 ===
+    _overlay_for_banner = payload.get("overlay_master_df", pd.DataFrame())
+    if isinstance(_overlay_for_banner, pd.DataFrame) and "position_multiplier_source" in _overlay_for_banner.columns:
+        _src_df = _overlay_for_banner.dropna(subset=["position_multiplier_source"])
+        if len(_src_df) > 0:
+            _last_valid = _src_df.iloc[-1]
+            _src = _last_valid.get("position_multiplier_source", "base")
+            _base_mult = _last_valid.get("regime_position_multiplier_base", None)
+            _oos_mult = _last_valid.get("regime_position_multiplier_oos", None)
+            if _src != "base" and _base_mult is not None and _oos_mult is not None and pd.notna(_base_mult) and pd.notna(_oos_mult):
+                st.info(
+                    f"**Phase 1 OOS 보정 적용 중**: "
+                    f"기존 multiplier {float(_base_mult):.2f}x → OOS 권장 {float(_oos_mult):.2f}x ({_src})"
+                )
 
     xx = int(payload["xx_latest"])
     st.info(
@@ -4254,6 +4614,10 @@ def run_main_tab():
             # v2.19 신규 alpha 컬럼 — Reserve & ETF
             "exchange_reserve_btc", "reserve_pct_change_4w", "reserve_z", "reserve_state",
             "etf_netflow_usd_m", "etf_4w_cumulative", "etf_z", "etf_state", "etf_available",
+            # v2.19 Phase 1 — State × Regime position multiplier override
+            "regime_position_multiplier_base",
+            "regime_position_multiplier_oos",
+            "position_multiplier_source",
         ]
         for c in enrich_cols:
             if c in master.columns:
@@ -4272,7 +4636,9 @@ def run_main_tab():
             "raw_regime_base", "raw_regime_rule_code", "raw_conflict_flag",
             "realized_fwd_ret_19w", "predicted_fwd_ret_19w", "predicted_fwd_ret_19w_adj",
             "realized_sign_19w", "predicted_sign_19w", "predicted_sign_19w_adj", "signal_hit_19w",
-            "regime_path_multiplier", "regime_position_multiplier", "confidence_bucket", "suggested_exposure",
+            "regime_path_multiplier", "regime_position_multiplier",
+            "regime_position_multiplier_base", "regime_position_multiplier_oos", "position_multiplier_source",
+            "confidence_bucket", "suggested_exposure",
             "funding_rate_w", "funding_8w_ma", "funding_z", "funding_state",
             "mvrv_z", "mvrv_state",
             "exchange_reserve_btc", "reserve_pct_change_4w", "reserve_z", "reserve_state",
@@ -4846,13 +5212,14 @@ def run_tab5_multiasset():
 # =========================
 # Tabs (keep all)
 # =========================
-tab_main, tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab_main, tab1, tab2, tab3, tab4, tab5, tab7 = st.tabs([
     "MAIN (True-history + Spaghetti)",
     "TAB1 DXY(역축) vs BTC",
     "TAB2 Liquidity vs BTC",
     "TAB3 Combo + 2D Lag-Pair",
     "TAB4 Forward Overlay (LDLI vs BTC)",
     "TAB5 Multi-Asset Forecast/Backtest",
+    "TAB7 Phase 1 Validation",
 ])
 
 with tab_main:
@@ -4872,3 +5239,15 @@ with tab4:
 
 with tab5:
     run_tab5_multiasset()
+
+with tab7:
+    try:
+        _phase1_payload = build_forward_overlay_payload(
+            LIQ_SOURCE, ALPHA_MODE, FORECAST_MODEL,
+            use_binance_funding=USE_BINANCE_FUNDING, funding_symbol=FUNDING_SYMBOL,
+            mvrv_file_bytes=MVRV_FILE_BYTES, mvrv_file_name=MVRV_FILE_NAME,
+            use_auto_mvrv=USE_AUTO_MVRV, use_auto_reserve=USE_AUTO_RESERVE, use_auto_etf=USE_AUTO_ETF,
+        )
+        render_phase1_validation_tab(_phase1_payload)
+    except Exception as _phase1_e:
+        st.error(f"Phase 1 Validation 로드 실패: {_phase1_e}")
