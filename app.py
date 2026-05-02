@@ -1000,6 +1000,7 @@ def fetch_etf_netflow_auto(week_rule: str = WEEK_RULE) -> pd.DataFrame:
     Returns:
         pd.DataFrame with columns: ['etf_netflow_usd_m', 'etf_4w_cumulative', 'etf_z', 'etf_available']
     """
+    LOG_ALPHA.info("[ETF] fetch_etf_netflow_auto 시작")
 
     headers = {
         "User-Agent": "Mozilla/5.0 (compatible; BTCMacroPredictionEngine/2.19)"
@@ -1007,7 +1008,9 @@ def fetch_etf_netflow_auto(week_rule: str = WEEK_RULE) -> pd.DataFrame:
 
     # ── 1순위: Farside Investors ──────────────────────────
     try:
+        LOG_ALPHA.info("[ETF] Farside HTTP 요청 시작")
         r = requests.get("https://farside.co.uk/btc/", headers=headers, timeout=20)
+        LOG_ALPHA.info(f"[ETF] Farside HTTP status: {r.status_code}, content size: {len(r.text)}")
         r.raise_for_status()
 
         tables = pd.read_html(r.text)
@@ -3825,6 +3828,16 @@ def plot_equity_curve(equity: pd.Series, title: str):
 def run_main_tab():
     st.subheader("MAIN) BTC vs LDLI (+ True-history predicted + Spaghetti)")
 
+    # === [DEBUG] Funding fetch 진단 ===
+    with st.expander("🔧 Debug: Funding fetch 직접 테스트", expanded=False):
+        if st.button("Funding API 직접 호출 테스트"):
+            try:
+                test_funding = fetch_binance_funding_history(symbol="BTCUSDT", start_date=START_DATE)
+                st.success(f"Funding fetch OK: {len(test_funding)} rows")
+                st.write(test_funding.tail(5))
+            except Exception as e:
+                st.error(f"Funding fetch 실패: {type(e).__name__}: {e}")
+
     try:
         payload = build_forward_overlay_payload(LIQ_SOURCE, ALPHA_MODE, FORECAST_MODEL, use_binance_funding=USE_BINANCE_FUNDING, funding_symbol=FUNDING_SYMBOL, mvrv_file_bytes=MVRV_FILE_BYTES, mvrv_file_name=MVRV_FILE_NAME, use_auto_mvrv=USE_AUTO_MVRV, use_auto_reserve=USE_AUTO_RESERVE, use_auto_etf=USE_AUTO_ETF)
     except Exception as e:
@@ -3996,7 +4009,10 @@ def run_main_tab():
             "current_anchor_dt", "current_predicted_ret_19w_raw", "current_predicted_ret_19w_adj",
             "current_predicted_px_19w_raw", "current_predicted_px_19w_adj",
             "current_regime_state", "current_driver_geometry", "current_confidence_bucket",
-            "current_regime_path_multiplier", "current_regime_position_multiplier", "current_suggested_exposure"
+            "current_regime_path_multiplier", "current_regime_position_multiplier", "current_suggested_exposure",
+            # v2.19 신규 alpha 컬럼 — Reserve & ETF
+            "exchange_reserve_btc", "reserve_pct_change_4w", "reserve_z", "reserve_state",
+            "etf_netflow_usd_m", "etf_4w_cumulative", "etf_z", "etf_state", "etf_available",
         ]
         for c in enrich_cols:
             if c in master.columns:
@@ -4017,7 +4033,10 @@ def run_main_tab():
             "realized_sign_19w", "predicted_sign_19w", "predicted_sign_19w_adj", "signal_hit_19w",
             "regime_path_multiplier", "regime_position_multiplier", "confidence_bucket", "suggested_exposure",
             "funding_rate_w", "funding_8w_ma", "funding_z", "funding_state",
-            "mvrv_z", "mvrv_state", "alpha_state",
+            "mvrv_z", "mvrv_state",
+            "exchange_reserve_btc", "reserve_pct_change_4w", "reserve_z", "reserve_state",
+            "etf_netflow_usd_m", "etf_4w_cumulative", "etf_z", "etf_state", "etf_available",
+            "alpha_state",
             "funding_available_flag", "funding_source", "funding_last_valid_dt", "funding_nonnull_count",
             "funding_weekly_mean_latest", "funding_8w_ma_latest", "funding_8w_ma_z_latest", "funding_state_latest",
             "mvrv_available_flag", "mvrv_source", "mvrv_last_valid_dt", "mvrv_nonnull_count", "alpha_inputs_ready_flag",
