@@ -369,9 +369,11 @@ with st.sidebar:
         "Liquidity Source",
         [
             "Fed Net Liquidity (FRED)",
-            "G2 M2 (US+EA, USD)",
+            "G3 Total Assets (USD)",
+            "G3 YoY Change (%)",
         ],
         index=0,
+        help="G3 = Fed + ECB + BOJ Total Assets (USD-converted). G3 YoY는 변화율 driver.",
     )
 
     ALPHA_MODE = st.selectbox(
@@ -609,6 +611,202 @@ def fetch_fred_fredgraph(series_id: str) -> pd.Series:
     s.index = df[date_col]
     s.name = series_id
     return s.dropna()
+
+
+# ============================================================
+# v2.19.1 Patch B: G3 Liquidity (US + EU + JP)
+# ============================================================
+# FRED 시리즈 (모두 무료, 인증 불필요):
+#   WALCL: Fed Total Assets (millions USD, weekly Wed)
+#   ECBASSETSW: ECB Total Assets (millions EUR, weekly Fri)
+#   JPNASSETS: BOJ Total Assets (100M JPY, monthly)
+#   DEXUSEU: USD per 1 EUR (daily)
+#   DEXJPUS: JPY per 1 USD (daily)
+
+FRED_ECBASSETSW = "ECBASSETSW"
+FRED_JPNASSETS = "JPNASSETS"
+FRED_DEXUSEU = "DEXUSEU"
+FRED_DEXJPUS = "DEXJPUS"
+
+G3_START_DATE = "2019-08-01"          # ECBASSETSW 데이터 시작 시점
+G3_INDEX_BASE_DATE = "2020-01-03"     # 정규화 인덱스 기준일 (코로나 직전)
+
+
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def _fetch_fred_with_retry(series_id: str, max_attempts: int = 3) -> pd.Series:
+    """FRED CSV API fetch with retry + exponential backoff."""
+    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+    last_err: Optional[Exception] = None
+    for attempt in range(max_attempts):
+        try:
+            r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+            r.raise_for_status()
+            df = pd.read_csv(io.StringIO(r.text))
+            date_col = df.columns[0]
+            val_col = df.columns[1]
+            df[date_col] = pd.to_datetime(df[date_col])
+            s = pd.to_numeric(df[val_col], errors="coerce")
+            s.index = df[date_col]
+            s.name = series_id
+            return s.dropna()
+        except Exception as e:
+            last_err = e
+            if attempt < max_attempts - 1:
+                time.sleep(2 ** attempt)  # 1s, 2s, 4s
+            continue
+    raise RuntimeError(
+        f"FRED fetch failed for {series_id} after {max_attempts} attempts: {last_err}"
+    )
+
+
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def fetch_g3_total_assets(week_rule: str = WEEK_RULE) -> pd.DataFrame:
+    """
+    G3 (US + EU + JP) Central Bank Total Assets fetch.
+
+    Returns:
+        pd.DataFrame with columns:
+            - g3_total_usd_m: Total Assets (USD millions)
+            - g3_index: Normalized index (2020-01-03 = 100)
+            - g3_yoy_pct: YoY change (%)
+            - g3_4w_change_pct: 4-week change (%)
+            - g3_13w_change_pct: 13-week change (%)
+            - fed_usd_m: Fed only (for comparison)
+            - ecb_usd_m: ECB in USD
+            - boj_usd_m: BOJ in USD
+
+    Notes:
+        - All data weekly W-FRI aligned
+        - JPNASSETS (monthly) is forward-filled to weekly (PIT-safe)
+        - Starts at G3_START_DATE (2019-08)
+        - Cache TTL 6 hours
+    """
+    LOG_ALPHA.info("[G3] fetch_g3_total_assets 시작")
+
+    # ── Step 1: FRED 데이터 fetch (with retry) ───────────
+    try:
+        walcl = _fetch_fred_with_retry(FRED_WALCL)
+        LOG_ALPHA.info(f"[G3] WALCL fetched: {len(walcl)} obs")
+    except Exception as e:
+        raise RuntimeError(f"[G3] WALCL fetch failed: {e}") from e
+
+    try:
+        ecb = _fetch_fred_with_retry(FRED_ECBASSETSW)
+        LOG_ALPHA.info(f"[G3] ECBASSETSW fetched: {len(ecb)} obs")
+    except Exception as e:
+        raise RuntimeError(f"[G3] ECBASSETSW fetch failed: {e}") from e
+
+    try:
+        boj = _fetch_fred_with_retry(FRED_JPNASSETS)
+        LOG_ALPHA.info(f"[G3] JPNASSETS fetched: {len(boj)} obs (monthly)")
+    except Exception as e:
+        raise RuntimeError(f"[G3] JPNASSETS fetch failed: {e}") from e
+
+    try:
+        eur_usd = _fetch_fred_with_retry(FRED_DEXUSEU)
+        LOG_ALPHA.info(f"[G3] DEXUSEU fetched: {len(eur_usd)} obs")
+    except Exception as e:
+        raise RuntimeError(f"[G3] DEXUSEU fetch failed: {e}") from e
+
+    try:
+        jpy_usd = _fetch_fred_with_retry(FRED_DEXJPUS)
+        LOG_ALPHA.info(f"[G3] DEXJPUS fetched: {len(jpy_usd)} obs")
+    except Exception as e:
+        raise RuntimeError(f"[G3] DEXJPUS fetch failed: {e}") from e
+
+    # ── Step 2: 모든 시리즈를 W-FRI 주간으로 정렬 ────────
+    # WALCL (Wed): 그 주 W-FRI에 forward fill
+    # ECBASSETSW (Fri): 자연스럽게 W-FRI
+    # JPNASSETS (월말): 다음 발표까지 forward fill (PIT-safe)
+    # 환율: W-FRI 값
+    walcl_w = walcl.resample(week_rule).last().ffill()
+    ecb_w = ecb.resample(week_rule).last().ffill()
+    boj_w = boj.resample(week_rule).last().ffill()  # 월간 → 주간 forward fill
+    eur_usd_w = eur_usd.resample(week_rule).last().ffill()
+    jpy_usd_w = jpy_usd.resample(week_rule).last().ffill()
+
+    # ── Step 3: USD 환산 ──────────────────────────────
+    # WALCL: 이미 USD millions
+    fed_usd_m = walcl_w.copy()
+
+    # ECBASSETSW: EUR millions × (USD/EUR) = USD millions
+    ecb_usd_m = (ecb_w * eur_usd_w).dropna()
+
+    # JPNASSETS: 100 million JPY 단위 → millions JPY = ×100 → ÷ DEXJPUS = millions USD
+    # DEXJPUS: JPY per 1 USD, 따라서 USD = JPY / DEXJPUS
+    boj_usd_m = (boj_w * 100 / jpy_usd_w).dropna()
+
+    # ── Step 4: 합성 ─────────────────────────────────
+    df = pd.DataFrame({
+        "fed_usd_m": fed_usd_m,
+        "ecb_usd_m": ecb_usd_m,
+        "boj_usd_m": boj_usd_m,
+    }).dropna()
+
+    df["g3_total_usd_m"] = df["fed_usd_m"] + df["ecb_usd_m"] + df["boj_usd_m"]
+
+    # ── Step 5: 시작점 cutoff ─────────────────────────
+    df = df[df.index >= pd.Timestamp(G3_START_DATE)]
+
+    # ── Step 6: 정규화 인덱스 ──────────────────────────
+    base_dt = pd.Timestamp(G3_INDEX_BASE_DATE)
+    if base_dt in df.index:
+        base_value = df.loc[base_dt, "g3_total_usd_m"]
+    else:
+        # 가장 가까운 (이후) 인덱스 fallback
+        future = df.index[df.index >= base_dt]
+        if len(future) > 0:
+            nearest = future[0]
+        else:
+            nearest = df.index[0]
+        base_value = df.loc[nearest, "g3_total_usd_m"]
+        LOG_ALPHA.info(f"[G3] index base date {base_dt.date()} not exact, using {nearest.date()}")
+
+    df["g3_index"] = df["g3_total_usd_m"] / base_value * 100
+
+    # ── Step 7: 변화율 계산 ────────────────────────────
+    df["g3_yoy_pct"] = df["g3_total_usd_m"].pct_change(52) * 100   # 52주 = 1년
+    df["g3_4w_change_pct"] = df["g3_total_usd_m"].pct_change(4) * 100   # 4주 (월간 근사)
+    df["g3_13w_change_pct"] = df["g3_total_usd_m"].pct_change(13) * 100  # 13주 (분기)
+
+    LOG_ALPHA.info(
+        f"[G3] G3 panel built: {len(df)} weekly obs, "
+        f"{df.index.min().date()} ~ {df.index.max().date()}"
+    )
+
+    return df
+
+
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def load_g3_total_assets_daily(metric: str = "level"):
+    """
+    G3 panel을 daily 시리즈 + snapshot 으로 변환 (load_*_daily 호환).
+
+    Args:
+        metric: "level" (g3_total_usd_m) 또는 "yoy" (g3_yoy_pct)
+
+    Returns:
+        (daily_series, snapshot_df) — load_g2_m2_usd_daily()와 동일 시그니처
+    """
+    g3_panel = fetch_g3_total_assets()
+    if g3_panel is None or g3_panel.empty:
+        raise RuntimeError("[G3] empty panel — fetch failed upstream")
+
+    if metric == "level":
+        weekly = g3_panel["g3_total_usd_m"].rename("G3_Total_Assets_USD_m")
+    elif metric == "yoy":
+        weekly = g3_panel["g3_yoy_pct"].rename("G3_YoY_pct")
+    else:
+        raise ValueError(f"Unknown G3 metric: {metric}")
+
+    # weekly → daily (forward-fill)
+    daily_idx = pd.date_range(start=START_DATE, end=END_DATE, freq="D")
+    daily = weekly.reindex(daily_idx).ffill()
+
+    # snapshot: 전체 G3 패널을 daily로
+    snap = g3_panel.reindex(daily_idx).ffill()
+
+    return daily.dropna(), snap
 
 
 # =========================
@@ -2150,9 +2348,17 @@ def load_liquidity_source_daily(liq_source: str):
     if liq_source == "Fed Net Liquidity (FRED)":
         s, snap = load_netliquidity_daily_millions()
         return s, snap, "Fed Net Liquidity (FRED)", "Millions USD"
-    if liq_source == "G2 M2 (US+EA, USD)":
-        s, snap = load_g2_m2_usd_daily()
-        return s, snap, "G2 M2 (US+EA, USD)", "Mixed (US billions + EA converted); level scale varies"
+    if liq_source == "G3 Total Assets (USD)":
+        # v2.19.1 Patch B: Fed + ECB + BOJ total assets, USD-converted
+        s, snap = load_g3_total_assets_daily(metric="level")
+        return s, snap, "G3 Total Assets (USD)", "Millions USD"
+    if liq_source == "G3 YoY Change (%)":
+        # v2.19.1 Patch B: G3 year-over-year change (driver-style)
+        s, snap = load_g3_total_assets_daily(metric="yoy")
+        return s, snap, "G3 YoY Change (%)", "Percent (YoY)"
+    # NOTE: "G2 M2 (US+EA, USD)" 옵션은 v2.19.1 Patch B에서 폐기됨 (ECB API 변경).
+    # load_g2_m2_usd_daily() 함수는 롤백 가능성을 위해 코드에 보존되어 있으나
+    # 사이드바 옵션에서는 더 이상 노출되지 않음.
     raise RuntimeError(f"Unknown liquidity source: {liq_source}")
 
 
@@ -4353,6 +4559,27 @@ def run_main_tab():
             if c in master.columns:
                 df_one[c] = master[c].reindex(full_idx)
 
+        # v2.19.1 Patch B: G3 Liquidity 컬럼 항상 출력 (LIQ_SOURCE 무관)
+        # 8 columns: g3_total_usd_m, g3_index, g3_yoy_pct, g3_4w_change_pct,
+        #            g3_13w_change_pct, fed_usd_m, ecb_usd_m, boj_usd_m
+        _g3_cols = [
+            "g3_total_usd_m", "g3_index", "g3_yoy_pct",
+            "g3_4w_change_pct", "g3_13w_change_pct",
+            "fed_usd_m", "ecb_usd_m", "boj_usd_m",
+        ]
+        try:
+            _g3_panel = fetch_g3_total_assets()
+            for _c in _g3_cols:
+                if _c in _g3_panel.columns:
+                    df_one[_c] = _g3_panel[_c].reindex(full_idx)
+                else:
+                    df_one[_c] = np.nan
+            LOG_ALPHA.info(f"[G3] columns merged into df_one ({len(_g3_panel)} weekly obs)")
+        except Exception as _g3_e:
+            LOG_ALPHA.warning(f"[G3] CSV merge failed: {_g3_e}, G3 columns will be NaN")
+            for _c in _g3_cols:
+                df_one[_c] = np.nan
+
         df_one["liq_source"] = payload["liq_source"]
         df_one["alpha_mode"] = payload.get("alpha_mode", "OLS (learn alpha)")
         df_one["combo_type"] = payload["chosen"]
@@ -4383,6 +4610,10 @@ def run_main_tab():
             "current_regime_path_multiplier", "current_regime_position_multiplier", "current_suggested_exposure",
             f"latest_forecast_path_raw_to_{xx}w", f"latest_forecast_path_adj_to_{xx}w",
             "liq_source", "alpha_mode", "combo_type", "xx_latest",
+            # v2.19.1 Patch B: G3 Liquidity columns
+            "g3_total_usd_m", "g3_index", "g3_yoy_pct",
+            "g3_4w_change_pct", "g3_13w_change_pct",
+            "fed_usd_m", "ecb_usd_m", "boj_usd_m",
         ]
         existing_cols = [c for c in preferred_cols if c in df_one.columns]
         other_cols = [c for c in df_one.columns if c not in existing_cols]
