@@ -2422,14 +2422,31 @@ def compute_alpha_state_v219(
 #   sign_acc 40~45%: 0.60x (FOLLOW_LIGHT NEUTRAL)
 #   sign_acc < 40%:  0.40x
 
-STATE_REGIME_MULTIPLIER_TABLE = {
+# ============================================================
+# v2.19.1 Patch A: 19w endpoint 기반 multiplier 비활성화 (2026-05-02)
+# ============================================================
+# 사유: 2026-05-02 path 분석 결과,
+#   - 실제 best_lag 19주 발생 = 414 anchor 중 단 3회 (0.7%)
+#   - Path 단위 평가에서 endpoint 결론과 정반대 결론 도출
+#   - 예: FOLLOW_LIGHT는 endpoint=함정 / path=정상 (over-corrected)
+#   - 예: SHRINK는 endpoint=평범 / path=함정 (under-corrected)
+# 따라서 현재 multiplier 방향이 잘못되어 있을 가능성 높음.
+# Path-based 재산출 전까지 비활성화 (빈 dict → .get() 모두 None → base 유지).
+#
+# 원본 multiplier는 코드 보존을 위해 _ARCHIVED_v2_18_5_19w_endpoint_MULTIPLIER_TABLE
+# 에 그대로 보존됨 (참조용, 실제 사용 안 함).
+
+PATCH_A_DISABLED_DATE = "2026-05-02"
+PATCH_A_REASON = "19w endpoint 평가 기반 → path 평가에서 잘못된 방향 입증"
+
+_ARCHIVED_v2_18_5_19w_endpoint_MULTIPLIER_TABLE = {
     # (alpha_state, regime_state): position_multiplier
     # 표본 수 5개 미만은 None (기존 multiplier 사용)
 
     # NEUTRAL × 각 regime
     ("NEUTRAL", "DEFENSIVE"):     1.10,  # n=43, sign_acc 53.5%
     ("NEUTRAL", "FOLLOW"):        0.95,  # n=37, sign_acc 48.6%
-    ("NEUTRAL", "FOLLOW_LIGHT"):  0.60,  # n=57, sign_acc 42.1% ⚠️ 함정
+    ("NEUTRAL", "FOLLOW_LIGHT"):  0.60,  # n=57, sign_acc 42.1% ⚠️ 함정 (endpoint)
     ("NEUTRAL", "SHRINK"):        0.90,  # n=38, sign_acc 47.4%
     ("NEUTRAL", "TRANSITION"):    0.92,  # n=163, sign_acc 48.5%
 
@@ -2443,6 +2460,10 @@ STATE_REGIME_MULTIPLIER_TABLE = {
     # BEARISH/STRONG_BEAR/STRONG_BULL: 표본 부족 (n<5)
     # → 기존 alpha_state position_multiplier 사용
 }
+
+# PATCH A: 모든 조합 비활성화 (빈 dict)
+# path 분석 검증 후 새 값으로 교체 예정
+STATE_REGIME_MULTIPLIER_TABLE: Dict[Tuple[str, str], Optional[float]] = {}
 
 
 def compute_state_regime_position_multiplier(
@@ -2466,6 +2487,10 @@ def compute_state_regime_position_multiplier(
     final = base_position_multiplier.copy()
     override_flag = pd.Series("base", index=base_position_multiplier.index, dtype="object")
 
+    # v2.19.1 Patch A 안전 가드: 비활성화 상태(빈 dict)면 즉시 반환 (모두 base)
+    if not STATE_REGIME_MULTIPLIER_TABLE:
+        return final, override_flag
+
     for idx in base_position_multiplier.index:
         a = alpha_state.get(idx, "NEUTRAL")
         r = regime_state.get(idx, None)
@@ -2479,6 +2504,10 @@ def compute_state_regime_position_multiplier(
 
         base_val = base_position_multiplier.loc[idx]
         if pd.isna(base_val):
+            continue
+
+        # v2.19.1 Patch A 추가 안전 가드: 비활성화 시 1.0 강제
+        if not STATE_REGIME_MULTIPLIER_TABLE:
             continue
 
         # Blend: blend_weight * OOS권장 + (1-blend_weight) * 기존값
@@ -3841,6 +3870,14 @@ def render_phase1_validation_tab(payload: Dict):
     """
     st.subheader("Phase 1 Validation Dashboard")
     st.caption("v2.19 acceptance criteria 자동 판정 — 매 실행 시 재계산")
+
+    # v2.19.1 Patch A: 안전 모드 알림
+    if not STATE_REGIME_MULTIPLIER_TABLE:
+        st.warning(
+            f"⚠️ STATE_REGIME_MULTIPLIER 비활성화 (Patch A, {PATCH_A_DISABLED_DATE}). "
+            f"사유: {PATCH_A_REASON}. "
+            f"path-based 재산출 전까지 보정 미적용 (모든 조합 = 1.0)."
+        )
 
     overlay_df = payload.get("overlay_master_df")
     if overlay_df is None or overlay_df.empty:
