@@ -600,17 +600,20 @@ def fetch_price_daily_multi(yahoo_candidates: List[str], stooq_candidates: Optio
 # =========================
 # FRED helper
 # =========================
-@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
 def fetch_fred_fredgraph(series_id: str) -> pd.Series:
-    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
-    df = pd.read_csv(url)
-    date_col = df.columns[0]
-    val_col = df.columns[1]
-    df[date_col] = pd.to_datetime(df[date_col])
-    s = pd.to_numeric(df[val_col], errors="coerce")
-    s.index = df[date_col]
-    s.name = series_id
-    return s.dropna()
+    """FRED CSV fetch with timeout/retry protection.
+
+    v2.19.1 Patch B-fix (2026-05-04):
+    Original implementation used pd.read_csv(url) with no timeout guard,
+    causing potential infinite hang on Streamlit Cloud → FRED slow connections.
+    Now delegates to _fetch_fred_with_retry which has timeout=(10, 60) and
+    3-attempt exponential backoff. Cache is held by _fetch_fred_with_retry
+    (single source of truth, no duplicate cache).
+
+    All existing call sites (Fed Net Liquidity, G2 M2 legacy, etc.) gain
+    timeout protection automatically.
+    """
+    return _fetch_fred_with_retry(series_id)
 
 
 # ============================================================
@@ -634,12 +637,23 @@ G3_INDEX_BASE_DATE = "2020-01-03"     # 정규화 인덱스 기준일 (코로나
 
 @st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
 def _fetch_fred_with_retry(series_id: str, max_attempts: int = 3) -> pd.Series:
-    """FRED CSV API fetch with retry + exponential backoff."""
+    """FRED CSV API fetch with retry + exponential backoff.
+
+    Timeout: tuple(connect=10s, read=60s) — Streamlit Cloud → FRED 환경에서
+    WALCL 같은 큰 시리즈(24년 weekly)는 read에 20s+ 걸릴 수 있음.
+    Connect 10s는 네트워크 도달성 빠른 판별용. Read 60s는 큰 페이로드 대비.
+
+    Worst case: 3 attempts × 60s = 180s + 7s backoff = ~187s.
+    """
     url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
     last_err: Optional[Exception] = None
     for attempt in range(max_attempts):
         try:
-            r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+            r = requests.get(
+                url,
+                timeout=(10, 60),
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
             r.raise_for_status()
             df = pd.read_csv(io.StringIO(r.text))
             date_col = df.columns[0]
