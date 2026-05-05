@@ -472,6 +472,51 @@ def fetch_fred_official(series_id: str, start_date: str = "1990-01-01") -> pd.Se
 
     raise RuntimeError(f"FRED API fetch failed for {series_id}: {last_err}")
 
+
+# ============================================================
+# v2.19.4 Migration wrapper: fetch_fred_with_fallback
+# ============================================================
+# v2.19.3 진단 결과 (2026-05-04):
+#   fred.stlouisfed.org/graph/fredgraph.csv — 60s timeout on Streamlit Cloud
+#   api.stlouisfed.org/fred/series/observations — 0.2s, all series OK
+#
+# 이 wrapper는 새 표준 fetch entry point. fallback 체인:
+#   1. api.stlouisfed.org (official, 빠르고 안정) — [fred] api_key 필요
+#   2. fred.stlouisfed.org/graph (기존 CSV path, key 없거나 official 실패 시)
+#
+# 기존 fetch_fred_fredgraph()는 보존 (롤백 가능성, fallback 경로용).
+
+def fetch_fred_with_fallback(series_id: str, start_date: str = "1990-01-01") -> pd.Series:
+    """FRED fetch with fallback chain.
+
+    Priority:
+      1. api.stlouisfed.org (official) — when [fred] api_key in Secrets
+      2. fred.stlouisfed.org/graph (CSV) — fallback (existing behavior)
+
+    Streamlit Cloud에서는 1순위만 작동 (CSV는 timeout).
+    로컬/Codespaces에서는 둘 다 작동 가능.
+
+    이 함수가 신규 코드의 표준 fetch 함수.
+
+    Args:
+        series_id: FRED series ID
+        start_date: ISO date for observation_start (only used by official API)
+
+    Returns:
+        pd.Series with date index
+    """
+    api_key = _get_fred_api_key()
+
+    if api_key:
+        try:
+            return fetch_fred_official(series_id, start_date)
+        except Exception as e:
+            LOG_ALPHA.warning(f"[FRED] Official API failed for {series_id}: {e}")
+            LOG_ALPHA.warning(f"[FRED] Falling back to CSV API...")
+
+    return fetch_fred_fredgraph(series_id)
+
+
 with st.sidebar:
     st.markdown("## Settings")
     LIQ_SOURCE = st.selectbox(
@@ -975,33 +1020,34 @@ def fetch_g3_total_assets(week_rule: str = WEEK_RULE) -> pd.DataFrame:
     """
     LOG_ALPHA.info("[G3] fetch_g3_total_assets 시작")
 
-    # ── Step 1: FRED 데이터 fetch (with retry) ───────────
+    # ── Step 1: FRED 데이터 fetch ────────────────────────
+    # v2.19.4: Migrated to fetch_fred_with_fallback (api.stlouisfed.org first).
     try:
-        walcl = _fetch_fred_with_retry(FRED_WALCL)
+        walcl = fetch_fred_with_fallback(FRED_WALCL, start_date="2002-01-01")
         LOG_ALPHA.info(f"[G3] WALCL fetched: {len(walcl)} obs")
     except Exception as e:
         raise RuntimeError(f"[G3] WALCL fetch failed: {e}") from e
 
     try:
-        ecb = _fetch_fred_with_retry(FRED_ECBASSETSW)
+        ecb = fetch_fred_with_fallback(FRED_ECBASSETSW, start_date="2019-08-01")
         LOG_ALPHA.info(f"[G3] ECBASSETSW fetched: {len(ecb)} obs")
     except Exception as e:
         raise RuntimeError(f"[G3] ECBASSETSW fetch failed: {e}") from e
 
     try:
-        boj = _fetch_fred_with_retry(FRED_JPNASSETS)
+        boj = fetch_fred_with_fallback(FRED_JPNASSETS, start_date="1998-04-01")
         LOG_ALPHA.info(f"[G3] JPNASSETS fetched: {len(boj)} obs (monthly)")
     except Exception as e:
         raise RuntimeError(f"[G3] JPNASSETS fetch failed: {e}") from e
 
     try:
-        eur_usd = _fetch_fred_with_retry(FRED_DEXUSEU)
+        eur_usd = fetch_fred_with_fallback(FRED_DEXUSEU, start_date="2000-01-01")
         LOG_ALPHA.info(f"[G3] DEXUSEU fetched: {len(eur_usd)} obs")
     except Exception as e:
         raise RuntimeError(f"[G3] DEXUSEU fetch failed: {e}") from e
 
     try:
-        jpy_usd = _fetch_fred_with_retry(FRED_DEXJPUS)
+        jpy_usd = fetch_fred_with_fallback(FRED_DEXJPUS, start_date="2000-01-01")
         LOG_ALPHA.info(f"[G3] DEXJPUS fetched: {len(jpy_usd)} obs")
     except Exception as e:
         raise RuntimeError(f"[G3] DEXJPUS fetch failed: {e}") from e
@@ -2556,9 +2602,10 @@ def load_dxy_close() -> Tuple[pd.Series, str]:
 
 @st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
 def load_netliquidity_daily_millions():
-    walcl = fetch_fred_fredgraph(FRED_WALCL).loc[START_DATE:END_DATE]  # Millions
-    tga = fetch_fred_fredgraph(FRED_TGA).loc[START_DATE:END_DATE]      # Millions
-    rrp = fetch_fred_fredgraph(FRED_RRP).loc[START_DATE:END_DATE]      # Billions daily
+    # v2.19.4: Migrated to fetch_fred_with_fallback (api.stlouisfed.org first).
+    walcl = fetch_fred_with_fallback(FRED_WALCL, start_date="2002-01-01").loc[START_DATE:END_DATE]  # Millions
+    tga = fetch_fred_with_fallback(FRED_TGA, start_date="2008-01-01").loc[START_DATE:END_DATE]      # Millions
+    rrp = fetch_fred_with_fallback(FRED_RRP, start_date="2013-01-01").loc[START_DATE:END_DATE]      # Billions daily
 
     rrp_m = rrp * 1000.0
     daily_idx = pd.date_range(start=START_DATE, end=END_DATE, freq="D")
@@ -2590,7 +2637,8 @@ def load_g2_m2_usd_daily():
     Output:
       g2_usd (float, level), snapshot_df (columns: us_m2, ea_m2_eur, eurusd, ea_m2_usd, g2_m2_usd)
     """
-    us_m2 = fetch_fred_fredgraph(FRED_US_M2SL)  # Billions USD
+    # v2.19.4: Migrated to fetch_fred_with_fallback (api.stlouisfed.org first).
+    us_m2 = fetch_fred_with_fallback(FRED_US_M2SL, start_date="1990-01-01")  # Billions USD
     us_m2.name = "US_M2SL_billions_usd"
 
     # ECB EA monetary aggregate
