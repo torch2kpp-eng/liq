@@ -635,41 +635,145 @@ G3_START_DATE = "2019-08-01"          # ECBASSETSW 데이터 시작 시점
 G3_INDEX_BASE_DATE = "2020-01-03"     # 정규화 인덱스 기준일 (코로나 직전)
 
 
+# FRED endpoint constants — used by both _fetch_fred_via_official_api and
+# _fetch_fred_via_graph_csv. graph endpoint is the legacy public CSV used by
+# the FRED website's chart download feature; api endpoint is the dedicated
+# programmatic API and is significantly faster + more reliable.
+FRED_API_OBSERVATIONS_URL = "https://api.stlouisfed.org/fred/series/observations"
+FRED_GRAPH_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+# Date filter for graph CSV path — reduces payload by limiting history.
+# WALCL since 1990s ~1300 weekly rows → since 2019 ~340 rows (~75% reduction).
+# G3 needs from 2019-08, but we keep some buffer for YoY (52w) computation.
+FRED_GRAPH_COSD = "2018-01-01"
+
+
+def _fetch_fred_via_official_api(
+    series_id: str,
+    api_key: str,
+    observation_start: str = "2018-01-01",
+    timeout: Tuple[int, int] = (10, 30),
+) -> pd.Series:
+    """Fetch FRED series via official API (api.stlouisfed.org).
+
+    Requires FRED_API_KEY (free, https://fredaccount.stlouisfed.org/apikey).
+    Different infrastructure than graph CSV — typically <1s response.
+    """
+    params = {
+        "series_id": series_id,
+        "api_key": api_key,
+        "file_type": "json",
+        "observation_start": observation_start,
+    }
+    r = requests.get(
+        FRED_API_OBSERVATIONS_URL,
+        params=params,
+        timeout=timeout,
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    r.raise_for_status()
+    payload = r.json()
+    obs = payload.get("observations", [])
+    if not obs:
+        raise RuntimeError(f"FRED API returned empty observations for {series_id}")
+    df = pd.DataFrame(obs)
+    df["date"] = pd.to_datetime(df["date"])
+    s = pd.to_numeric(df["value"], errors="coerce")
+    s.index = df["date"]
+    s.name = series_id
+    return s.dropna()
+
+
+def _fetch_fred_via_graph_csv(
+    series_id: str,
+    cosd: str = FRED_GRAPH_COSD,
+    timeout: Tuple[int, int] = (10, 60),
+) -> pd.Series:
+    """Fetch FRED series via legacy graph CSV endpoint with date filter.
+
+    cosd parameter limits history to reduce payload (75% smaller for WALCL).
+    Used as fallback when FRED_API_KEY is not configured.
+    """
+    url = f"{FRED_GRAPH_CSV_URL}?id={series_id}&cosd={cosd}"
+    r = requests.get(
+        url,
+        timeout=timeout,
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    r.raise_for_status()
+    df = pd.read_csv(io.StringIO(r.text))
+    date_col = df.columns[0]
+    val_col = df.columns[1]
+    df[date_col] = pd.to_datetime(df[date_col])
+    s = pd.to_numeric(df[val_col], errors="coerce")
+    s.index = df[date_col]
+    s.name = series_id
+    return s.dropna()
+
+
 @st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
 def _fetch_fred_with_retry(series_id: str, max_attempts: int = 3) -> pd.Series:
-    """FRED CSV API fetch with retry + exponential backoff.
+    """FRED fetch with two-tier fallback + retry.
 
-    Timeout: tuple(connect=10s, read=60s) — Streamlit Cloud → FRED 환경에서
-    WALCL 같은 큰 시리즈(24년 weekly)는 read에 20s+ 걸릴 수 있음.
-    Connect 10s는 네트워크 도달성 빠른 판별용. Read 60s는 큰 페이로드 대비.
+    v2.19.1 Patch B-fix-2 (2026-05-04): Streamlit Cloud reported repeated
+    Read timeouts on the legacy graph CSV endpoint, even with 60s timeout.
+    Likely cause: graph endpoint (designed for chart downloads) throttles
+    or is structurally slow from Cloud's egress IP range.
 
-    Worst case: 3 attempts × 60s = 180s + 7s backoff = ~187s.
+    Strategy:
+      1. If FRED_API_KEY in st.secrets → use api.stlouisfed.org (fast,
+         dedicated infrastructure, <1s response typical).
+      2. Otherwise → use graph CSV with cosd=2018-01-01 date filter
+         (75% smaller payload, may evade throttling).
+
+    Each tier is retried up to max_attempts with exponential backoff (1s/2s/4s).
+
+    Setup for FRED_API_KEY (recommended):
+      1. Get free key at https://fredaccount.stlouisfed.org/apikey (1 min).
+      2. Streamlit Cloud → app settings → secrets:
+           FRED_API_KEY = "your_32_char_key_here"
+      3. Redeploy. No code changes needed; this function auto-detects.
     """
-    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+    # Detect API key (graceful — no key means fallback to graph CSV)
+    api_key: Optional[str] = None
+    try:
+        if hasattr(st, "secrets"):
+            api_key = st.secrets.get("FRED_API_KEY", None)
+    except Exception:
+        # st.secrets may raise if no secrets.toml configured at all
+        api_key = None
+
     last_err: Optional[Exception] = None
+
+    # ── Tier 1: Official API (preferred) ───────────────────
+    if api_key:
+        for attempt in range(max_attempts):
+            try:
+                LOG_ALPHA.info(f"[FRED] {series_id} via official API (attempt {attempt+1})")
+                return _fetch_fred_via_official_api(series_id, api_key)
+            except Exception as e:
+                last_err = e
+                LOG_ALPHA.warning(f"[FRED] {series_id} API attempt {attempt+1} failed: {e}")
+                if attempt < max_attempts - 1:
+                    time.sleep(2 ** attempt)
+                continue
+        # API failed; fall through to graph CSV (don't give up yet)
+        LOG_ALPHA.warning(f"[FRED] {series_id} all API attempts failed, trying graph CSV")
+
+    # ── Tier 2: Graph CSV (fallback or default) ────────────
     for attempt in range(max_attempts):
         try:
-            r = requests.get(
-                url,
-                timeout=(10, 60),
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
-            r.raise_for_status()
-            df = pd.read_csv(io.StringIO(r.text))
-            date_col = df.columns[0]
-            val_col = df.columns[1]
-            df[date_col] = pd.to_datetime(df[date_col])
-            s = pd.to_numeric(df[val_col], errors="coerce")
-            s.index = df[date_col]
-            s.name = series_id
-            return s.dropna()
+            LOG_ALPHA.info(f"[FRED] {series_id} via graph CSV (attempt {attempt+1})")
+            return _fetch_fred_via_graph_csv(series_id)
         except Exception as e:
             last_err = e
+            LOG_ALPHA.warning(f"[FRED] {series_id} graph attempt {attempt+1} failed: {e}")
             if attempt < max_attempts - 1:
-                time.sleep(2 ** attempt)  # 1s, 2s, 4s
+                time.sleep(2 ** attempt)
             continue
+
     raise RuntimeError(
-        f"FRED fetch failed for {series_id} after {max_attempts} attempts: {last_err}"
+        f"FRED fetch failed for {series_id} after all attempts "
+        f"(API key {'configured' if api_key else 'NOT configured'}): {last_err}"
     )
 
 
