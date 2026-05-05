@@ -376,6 +376,70 @@ with st.sidebar:
         help="G3 = Fed + ECB + BOJ Total Assets (USD-converted). G3 YoY는 변화율 driver.",
     )
 
+    # v2.19.3 FRED API 진단 expander (additive only, doesn't affect normal flow)
+    with st.expander("🔬 FRED API 진단 (v2.19.3)", expanded=False):
+        st.caption("api.stlouisfed.org 작동 여부 확인 (graph endpoint timeout 시 대안)")
+
+        # API key 상태 (nested [fred] api_key 형식)
+        _diag_api_key_present = _get_fred_api_key() is not None
+        if _diag_api_key_present:
+            st.success("✅ API key 등록됨 (Secrets [fred] api_key)")
+        else:
+            st.error(
+                "❌ API key 없음.\n\nSecrets에 다음 추가 필요:\n"
+                "```toml\n[fred]\napi_key = \"your_key_here\"\n```"
+            )
+
+        if _diag_api_key_present:
+            st.caption("아래 버튼으로 시리즈별 작동 테스트:")
+
+            _diag_col1, _diag_col2 = st.columns(2)
+            with _diag_col1:
+                if st.button("Test WALCL", key="diag_walcl"):
+                    try:
+                        with st.spinner("api.stlouisfed.org → WALCL..."):
+                            _diag_t0 = time.time()
+                            _diag_s = fetch_fred_official("WALCL", start_date="2020-01-01")
+                            _diag_elapsed = time.time() - _diag_t0
+                        st.success(f"✅ WALCL ({_diag_elapsed:.1f}s, {len(_diag_s)} obs)")
+                        st.caption(f"Latest: ${_diag_s.iloc[-1]:,.0f}M ({_diag_s.index[-1].date()})")
+                    except Exception as _diag_e:
+                        st.error(f"❌ {type(_diag_e).__name__}: {str(_diag_e)[:200]}")
+
+                if st.button("Test ECBASSETSW", key="diag_ecb"):
+                    try:
+                        with st.spinner("api.stlouisfed.org → ECBASSETSW..."):
+                            _diag_t0 = time.time()
+                            _diag_s = fetch_fred_official("ECBASSETSW", start_date="2019-08-01")
+                            _diag_elapsed = time.time() - _diag_t0
+                        st.success(f"✅ ECBASSETSW ({_diag_elapsed:.1f}s, {len(_diag_s)} obs)")
+                        st.caption(f"Latest: €{_diag_s.iloc[-1]:,.0f}M ({_diag_s.index[-1].date()})")
+                    except Exception as _diag_e:
+                        st.error(f"❌ {type(_diag_e).__name__}: {str(_diag_e)[:200]}")
+
+            with _diag_col2:
+                if st.button("Test JPNASSETS", key="diag_boj"):
+                    try:
+                        with st.spinner("api.stlouisfed.org → JPNASSETS..."):
+                            _diag_t0 = time.time()
+                            _diag_s = fetch_fred_official("JPNASSETS", start_date="1998-04-01")
+                            _diag_elapsed = time.time() - _diag_t0
+                        st.success(f"✅ JPNASSETS ({_diag_elapsed:.1f}s, {len(_diag_s)} obs)")
+                        st.caption(f"Latest: ¥{_diag_s.iloc[-1]:,.0f}×100M ({_diag_s.index[-1].date()})")
+                    except Exception as _diag_e:
+                        st.error(f"❌ {type(_diag_e).__name__}: {str(_diag_e)[:200]}")
+
+                if st.button("Test DEXUSEU", key="diag_dexuseu"):
+                    try:
+                        with st.spinner("api.stlouisfed.org → DEXUSEU..."):
+                            _diag_t0 = time.time()
+                            _diag_s = fetch_fred_official("DEXUSEU", start_date="2020-01-01")
+                            _diag_elapsed = time.time() - _diag_t0
+                        st.success(f"✅ DEXUSEU ({_diag_elapsed:.1f}s, {len(_diag_s)} obs)")
+                        st.caption(f"Latest: {_diag_s.iloc[-1]:.4f} ({_diag_s.index[-1].date()})")
+                    except Exception as _diag_e:
+                        st.error(f"❌ {type(_diag_e).__name__}: {str(_diag_e)[:200]}")
+
     ALPHA_MODE = st.selectbox(
         "Alpha / intercept mode",
         [
@@ -775,6 +839,115 @@ def _fetch_fred_with_retry(series_id: str, max_attempts: int = 3) -> pd.Series:
         f"FRED fetch failed for {series_id} after all attempts "
         f"(API key {'configured' if api_key else 'NOT configured'}): {last_err}"
     )
+
+
+# ============================================================
+# v2.19.3 FRED Official API (Diagnostic) — additive only
+# ============================================================
+# 목적: Streamlit Cloud에서 fred.stlouisfed.org/graph 차단/timeout 시
+#       api.stlouisfed.org는 작동하는지 진단.
+#
+# 기존 함수 (_fetch_fred_via_official_api, _fetch_fred_via_graph_csv,
+# _fetch_fred_with_retry, fetch_fred_fredgraph) 변경 없음. 이 진단 함수
+# (fetch_fred_official)는 별도 이름이며 기존 fetch path를 건드리지 않는다.
+#
+# Secret 형식 차이 주의:
+#   - 기존 PR #9 (_fetch_fred_via_official_api): st.secrets.get("FRED_API_KEY")
+#   - 이번 진단 (_get_fred_api_key):              st.secrets["fred"]["api_key"]
+# 사용자가 어느 형식으로 등록했는지에 따라 어느 함수가 키를 찾는지 확인 가능.
+
+def _get_fred_api_key():
+    """Streamlit Secrets에서 [fred] api_key (nested) 가져오기.
+
+    secrets.toml 형식:
+        [fred]
+        api_key = "your_32_char_key_here"
+
+    Returns:
+        str | None — 키 발견 못하면 None
+    """
+    try:
+        return st.secrets["fred"]["api_key"]
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def fetch_fred_official(series_id: str, start_date: str = "1990-01-01") -> pd.Series:
+    """공식 FRED API (api.stlouisfed.org) 시리즈 fetch — 진단용.
+
+    https://fred.stlouisfed.org/docs/api/fred/series_observations.html
+
+    Args:
+        series_id: FRED series ID (e.g., "WALCL")
+        start_date: ISO date (default 1990-01-01)
+
+    Returns:
+        pd.Series with date index, sorted ascending
+
+    Raises:
+        RuntimeError if API key missing or fetch fails after 3 attempts
+    """
+    api_key = _get_fred_api_key()
+    if not api_key:
+        raise RuntimeError(
+            "FRED API key not in Streamlit Secrets. "
+            "Add: [fred] api_key = 'your_key_here'"
+        )
+
+    url = "https://api.stlouisfed.org/fred/series/observations"
+    params = {
+        "series_id": series_id,
+        "api_key": api_key,
+        "file_type": "json",
+        "observation_start": start_date,
+    }
+
+    last_err = None
+    for attempt in range(3):
+        r = None
+        try:
+            t0 = time.time()
+            r = requests.get(url, params=params, timeout=30)
+            elapsed = time.time() - t0
+            r.raise_for_status()
+            data = r.json()
+
+            if "observations" not in data:
+                raise ValueError(f"No observations in response: {str(data)[:200]}")
+
+            obs = data["observations"]
+            df = pd.DataFrame(obs)
+            df["date"] = pd.to_datetime(df["date"])
+            df["value"] = pd.to_numeric(df["value"], errors="coerce")
+            df = df.dropna(subset=["value"])
+
+            s = df.set_index("date")["value"]
+            s.name = series_id
+
+            LOG_ALPHA.info(
+                f"[FRED-API] {series_id} OK ({elapsed:.1f}s, {len(s)} obs, "
+                f"{s.index.min().date()}~{s.index.max().date()})"
+            )
+            return s.sort_index()
+
+        except requests.exceptions.Timeout as e:
+            last_err = f"Timeout after 30s: {e}"
+            LOG_ALPHA.warning(f"[FRED-API] {series_id} attempt {attempt+1} TIMEOUT")
+        except requests.exceptions.HTTPError as e:
+            status = r.status_code if r is not None else "?"
+            last_err = f"HTTP {status}: {e}"
+            LOG_ALPHA.warning(f"[FRED-API] {series_id} attempt {attempt+1} HTTP error: {status}")
+            if r is not None and r.status_code == 403:
+                raise RuntimeError(f"FRED API 403 (invalid key?): {e}") from e
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            LOG_ALPHA.warning(f"[FRED-API] {series_id} attempt {attempt+1} failed: {e}")
+
+        if attempt < 2:
+            time.sleep(2 ** attempt)  # 1s, 2s
+
+    raise RuntimeError(f"FRED API fetch failed for {series_id}: {last_err}")
 
 
 @st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
