@@ -525,9 +525,15 @@ with st.sidebar:
             "Fed Net Liquidity (FRED)",
             "G3 Total Assets (USD)",
             "G3 YoY Change (%)",
+            "G2M2 Total (USD)",
+            "G2M2 YoY Change (%)",
         ],
         index=0,
-        help="G3 = Fed + ECB + BOJ Total Assets (USD-converted). G3 YoY는 변화율 driver.",
+        help=(
+            "G3 = Fed + ECB + BOJ Total Assets (USD-converted). G3 YoY는 변화율 driver. "
+            "G2M2 = US M2 + EU M3 (Lyn Alden lite, FRED only). "
+            "JP/UK/CN M2 시리즈 stale로 G2 only."
+        ),
     )
 
     # v2.19.3 FRED API 진단 expander (additive only, doesn't affect normal flow)
@@ -1198,6 +1204,119 @@ def load_g3_total_assets_daily(metric: str = "level"):
     snap = g3_panel.reindex(daily_idx).ffill()
 
     return daily.dropna(), snap
+
+
+# ============================================================
+# v2.19.6 Global M2 lite (G2M2: US + EU)
+# ============================================================
+# v2.19.5 진단 결과: JP/UK/CN M2 시리즈는 FRED에서 stale (2017~2023 멈춤)
+# 또는 불가. Lyn Alden 5국 Global M2의 lite 버전: US + EU만.
+#
+# Data sources (all FRED):
+#   M2SL:            US M2, billions USD, monthly
+#   MABMM301EZM657S: EU M3 (M2 proxy), millions EUR, monthly
+#   DEXUSEU:         USD per 1 EUR, daily
+
+FRED_M2SL = "M2SL"
+FRED_EU_M3 = "MABMM301EZM657S"
+
+G2M2_START_DATE = "2015-01-01"
+G2M2_INDEX_BASE_DATE = "2020-01-01"
+
+
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def fetch_g2m2_total(week_rule: str = WEEK_RULE) -> pd.DataFrame:
+    """
+    G2M2 (Global M2 lite, US + EU) 합성.
+
+    Returns:
+        pd.DataFrame with columns:
+            - g2m2_total_usd_m: Total M2 (USD millions, weekly)
+            - g2m2_index: Normalized index (2020-01 = 100)
+            - g2m2_yoy_pct: YoY change (%)
+            - g2m2_4w_change_pct: 4-week change
+            - g2m2_13w_change_pct: 13-week change
+            - m2_us_usd_m: US M2 only
+            - m2_eu_usd_m: EU M3 in USD
+
+    Notes:
+        - US M2 (M2SL) is monthly, billions USD
+        - EU M3 (MABMM301EZM657S) is monthly, millions EUR
+        - DEXUSEU is daily, USD per 1 EUR
+        - All resampled to W-FRI, forward-fill (PIT-safe)
+        - Starts 2015-01-01
+    """
+    LOG_ALPHA.info("[G2M2] fetch_g2m2_total 시작")
+
+    # Step 1: FRED fetch (all via fetch_fred_with_fallback → api.stlouisfed.org)
+    try:
+        m2_us_b = fetch_fred_with_fallback(FRED_M2SL, start_date=G2M2_START_DATE)
+        LOG_ALPHA.info(f"[G2M2] M2SL fetched: {len(m2_us_b)} obs")
+    except Exception as e:
+        raise RuntimeError(f"[G2M2] M2SL fetch failed: {e}") from e
+
+    try:
+        m2_eu_em = fetch_fred_with_fallback(FRED_EU_M3, start_date=G2M2_START_DATE)
+        LOG_ALPHA.info(f"[G2M2] EU M3 fetched: {len(m2_eu_em)} obs")
+    except Exception as e:
+        raise RuntimeError(f"[G2M2] EU M3 fetch failed: {e}") from e
+
+    try:
+        eur_usd = fetch_fred_with_fallback(FRED_DEXUSEU, start_date=G2M2_START_DATE)
+        LOG_ALPHA.info(f"[G2M2] DEXUSEU fetched: {len(eur_usd)} obs")
+    except Exception as e:
+        raise RuntimeError(f"[G2M2] DEXUSEU fetch failed: {e}") from e
+
+    # Step 2: 단위 통일 (모두 USD millions)
+    # M2SL: billions USD → millions USD (×1000)
+    m2_us_usd_m = m2_us_b * 1000.0
+    m2_us_usd_m.name = "m2_us_usd_m"
+
+    # 환율 정렬 위해 W-FRI 주간으로 먼저 변환
+    m2_us_w = m2_us_usd_m.resample(week_rule).last().ffill()
+    m2_eu_w = m2_eu_em.resample(week_rule).last().ffill()
+    eur_usd_w = eur_usd.resample(week_rule).last().ffill()
+
+    # EU M3 (EUR M) × DEXUSEU (USD/EUR) = USD M
+    m2_eu_usd_m_w = (m2_eu_w * eur_usd_w).dropna()
+
+    # Step 3: 합성
+    df = pd.DataFrame({
+        "m2_us_usd_m": m2_us_w,
+        "m2_eu_usd_m": m2_eu_usd_m_w,
+    }).dropna()
+
+    df["g2m2_total_usd_m"] = df["m2_us_usd_m"] + df["m2_eu_usd_m"]
+
+    # Step 4: 시작일 cutoff
+    df = df[df.index >= pd.Timestamp(G2M2_START_DATE)]
+
+    # Step 5: 정규화 인덱스 (2020-01-01 = 100)
+    base_dt = pd.Timestamp(G2M2_INDEX_BASE_DATE)
+    if base_dt in df.index:
+        base_value = df.loc[base_dt, "g2m2_total_usd_m"]
+    else:
+        idx_after = df.index[df.index >= base_dt]
+        if len(idx_after) > 0:
+            base_value = df.loc[idx_after[0], "g2m2_total_usd_m"]
+            LOG_ALPHA.info(f"[G2M2] index base date adjusted to {idx_after[0].date()}")
+        else:
+            base_value = df["g2m2_total_usd_m"].iloc[0]
+            LOG_ALPHA.info(f"[G2M2] using first available date as base: {df.index[0].date()}")
+
+    df["g2m2_index"] = df["g2m2_total_usd_m"] / base_value * 100
+
+    # Step 6: 변화율 (weekly data, so 52w = YoY)
+    df["g2m2_yoy_pct"] = df["g2m2_total_usd_m"].pct_change(52) * 100   # 52주 = 1년
+    df["g2m2_4w_change_pct"] = df["g2m2_total_usd_m"].pct_change(4) * 100
+    df["g2m2_13w_change_pct"] = df["g2m2_total_usd_m"].pct_change(13) * 100
+
+    LOG_ALPHA.info(
+        f"[G2M2] panel built: {len(df)} weekly obs, "
+        f"{df.index.min().date()} ~ {df.index.max().date()}"
+    )
+
+    return df
 
 
 # =========================
@@ -2749,6 +2868,23 @@ def load_liquidity_source_daily(liq_source: str):
         # v2.19.1 Patch B: G3 year-over-year change (driver-style)
         s, snap = load_g3_total_assets_daily(metric="yoy")
         return s, snap, "G3 YoY Change (%)", "Percent (YoY)"
+    if liq_source == "G2M2 Total (USD)":
+        # v2.19.6: Lyn Alden Global M2 lite (US + EU only)
+        g2m2_df = fetch_g2m2_total()
+        # weekly DataFrame → daily ffill (downstream code expects daily series)
+        daily_idx = pd.date_range(start=START_DATE, end=END_DATE, freq="D")
+        s_daily = g2m2_df["g2m2_total_usd_m"].reindex(daily_idx).ffill().dropna()
+        s_daily.name = "G2M2_Total_USD_m"
+        snap_df = g2m2_df.reindex(daily_idx).ffill()
+        return s_daily, snap_df, "G2M2 Total (USD)", "Millions USD"
+    if liq_source == "G2M2 YoY Change (%)":
+        # v2.19.6: G2M2 year-over-year change (driver-style)
+        g2m2_df = fetch_g2m2_total()
+        daily_idx = pd.date_range(start=START_DATE, end=END_DATE, freq="D")
+        s_daily = g2m2_df["g2m2_yoy_pct"].reindex(daily_idx).ffill().dropna()
+        s_daily.name = "G2M2_YoY_pct"
+        snap_df = g2m2_df.reindex(daily_idx).ffill()
+        return s_daily, snap_df, "G2M2 YoY Change (%)", "Percent (YoY)"
     # NOTE: "G2 M2 (US+EA, USD)" 옵션은 v2.19.1 Patch B에서 폐기됨 (ECB API 변경).
     # load_g2_m2_usd_daily() 함수는 롤백 가능성을 위해 코드에 보존되어 있으나
     # 사이드바 옵션에서는 더 이상 노출되지 않음.
@@ -4973,6 +5109,27 @@ def run_main_tab():
             for _c in _g3_cols:
                 df_one[_c] = np.nan
 
+        # v2.19.6: G2M2 Liquidity 컬럼 항상 출력 (LIQ_SOURCE 무관)
+        # 7 columns: g2m2_total_usd_m, g2m2_index, g2m2_yoy_pct,
+        #            g2m2_4w_change_pct, g2m2_13w_change_pct, m2_us_usd_m, m2_eu_usd_m
+        _g2m2_cols = [
+            "g2m2_total_usd_m", "g2m2_index", "g2m2_yoy_pct",
+            "g2m2_4w_change_pct", "g2m2_13w_change_pct",
+            "m2_us_usd_m", "m2_eu_usd_m",
+        ]
+        try:
+            _g2m2_panel = fetch_g2m2_total()
+            for _c in _g2m2_cols:
+                if _c in _g2m2_panel.columns:
+                    df_one[_c] = _g2m2_panel[_c].reindex(full_idx)
+                else:
+                    df_one[_c] = np.nan
+            LOG_ALPHA.info(f"[G2M2] columns merged into df_one ({len(_g2m2_panel)} weekly obs)")
+        except Exception as _g2m2_e:
+            LOG_ALPHA.warning(f"[G2M2] CSV merge failed: {_g2m2_e}, G2M2 columns will be NaN")
+            for _c in _g2m2_cols:
+                df_one[_c] = np.nan
+
         df_one["liq_source"] = payload["liq_source"]
         df_one["alpha_mode"] = payload.get("alpha_mode", "OLS (learn alpha)")
         df_one["combo_type"] = payload["chosen"]
@@ -5007,6 +5164,10 @@ def run_main_tab():
             "g3_total_usd_m", "g3_index", "g3_yoy_pct",
             "g3_4w_change_pct", "g3_13w_change_pct",
             "fed_usd_m", "ecb_usd_m", "boj_usd_m",
+            # v2.19.6: G2M2 Liquidity columns
+            "g2m2_total_usd_m", "g2m2_index", "g2m2_yoy_pct",
+            "g2m2_4w_change_pct", "g2m2_13w_change_pct",
+            "m2_us_usd_m", "m2_eu_usd_m",
         ]
         existing_cols = [c for c in preferred_cols if c in df_one.columns]
         other_cols = [c for c in df_one.columns if c not in existing_cols]
