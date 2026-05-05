@@ -594,6 +594,59 @@ with st.sidebar:
                     except Exception as _diag_e:
                         st.error(f"❌ {type(_diag_e).__name__}: {str(_diag_e)[:200]}")
 
+            # v2.19.5: Global M2 series 가용성 진단
+            st.markdown("---")
+            st.caption("**Global M2 시리즈 진단:**")
+
+            _diag_m2_series_to_test = [
+                ("M2SL", "US M2 (Billions USD, monthly)"),
+                ("MABMM301EZM657S", "EU M3 (Millions EUR, monthly, M2 proxy)"),
+                ("MYAGM2JPM189S", "JP M2 (100M JPY, monthly, SA)"),
+                ("MYAGM2JPM189N", "JP M2 (NSA, fallback)"),
+                ("MABMM301GBM189S", "UK M3 (Millions GBP, monthly)"),
+                ("MABMM301CNM189N", "CN M3 (Billions CNY, monthly, NSA)"),
+                ("DEXCHUS", "CNY/USD exchange rate"),
+                ("DEXUSUK", "USD/GBP exchange rate"),
+            ]
+
+            if st.button("Test all M2 series", key="diag_m2_all"):
+                _diag_m2_results = []
+                for _diag_sid, _diag_desc in _diag_m2_series_to_test:
+                    try:
+                        _diag_t0 = time.time()
+                        _diag_s = fetch_fred_official(_diag_sid, start_date="2015-01-01")
+                        _diag_elapsed = time.time() - _diag_t0
+                        _diag_latest_val = _diag_s.iloc[-1] if len(_diag_s) > 0 else None
+                        _diag_latest_date = _diag_s.index[-1] if len(_diag_s) > 0 else None
+                        _diag_m2_results.append({
+                            "series": _diag_sid,
+                            "status": "✅ OK",
+                            "obs": len(_diag_s),
+                            "elapsed": f"{_diag_elapsed:.1f}s",
+                            "first": str(_diag_s.index[0].date()) if len(_diag_s) > 0 else "N/A",
+                            "last": str(_diag_latest_date.date()) if _diag_latest_date is not None else "N/A",
+                            "latest_val": f"{_diag_latest_val:,.1f}" if _diag_latest_val is not None else "N/A",
+                            "desc": _diag_desc,
+                        })
+                    except Exception as _diag_e:
+                        _diag_err_short = str(_diag_e)[:80]
+                        _diag_m2_results.append({
+                            "series": _diag_sid,
+                            "status": "❌ FAIL",
+                            "obs": 0,
+                            "elapsed": "-",
+                            "first": "-",
+                            "last": "-",
+                            "latest_val": "-",
+                            "desc": _diag_desc + f" | {_diag_err_short}",
+                        })
+
+                _diag_df_results = pd.DataFrame(_diag_m2_results)
+                st.dataframe(_diag_df_results, use_container_width=True)
+
+                _diag_ok_count = sum(1 for _r in _diag_m2_results if _r["status"] == "✅ OK")
+                st.info(f"성공: {_diag_ok_count} / {len(_diag_m2_results)}")
+
     ALPHA_MODE = st.selectbox(
         "Alpha / intercept mode",
         [
