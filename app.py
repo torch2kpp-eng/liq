@@ -527,12 +527,19 @@ with st.sidebar:
             "G3 YoY Change (%)",
             "G2M2 Total (USD)",
             "G2M2 YoY Change (%)",
+            # v2.19.8: 컴포넌트별 변화율 (BTC 상관 측정 결과 기반 추가)
+            "BOJ 13w Change (%)",
+            "BOJ YoY Change (%)",
+            "ECB 13w Change (%)",
+            "Fed YoY Change (%)",
         ],
         index=0,
         help=(
-            "G3 = Fed + ECB + BOJ Total Assets (USD-converted). G3 YoY는 변화율 driver. "
-            "G2M2 = US M2 + EU M3 (Lyn Alden lite, FRED only). "
-            "JP/UK/CN M2 시리즈 stale로 G2 only."
+            "Fed/G3/G2M2: 절대값 또는 YoY. "
+            "v2.19.8: 컴포넌트별 변화율 추가. 측정 결과 BTC 13w 상관: "
+            "BOJ 13w change=+0.573 (best), BOJ YoY=+0.495, ECB 13w=+0.430, Fed YoY=+0.302. "
+            "Fed level (-0.024)보다 압도적. "
+            "G3 = Fed + ECB + BOJ (USD-converted). G2M2 = US M2 + EU M3 (Lyn Alden lite)."
         ),
     )
 
@@ -1166,6 +1173,20 @@ def fetch_g3_total_assets(week_rule: str = WEEK_RULE) -> pd.DataFrame:
     df["g3_4w_change_pct"] = df["g3_total_usd_m"].pct_change(4) * 100   # 4주 (월간 근사)
     df["g3_13w_change_pct"] = df["g3_total_usd_m"].pct_change(13) * 100  # 13주 (분기)
 
+    # v2.19.8: 컴포넌트별 변화율 (BTC와 component-level 상관 측정 결과 BOJ가 가장 강함)
+    # 측정 결과 (416주, 2018-05~2026-05): BTC 13w return과의 상관
+    #   BOJ 13w change: +0.573 ⭐⭐⭐
+    #   BOJ YoY:        +0.495
+    #   ECB 13w change: +0.430 (best @ 26w horizon)
+    #   Fed YoY:        +0.302
+    df["fed_yoy_pct"] = df["fed_usd_m"].pct_change(52) * 100
+    df["ecb_yoy_pct"] = df["ecb_usd_m"].pct_change(52) * 100
+    df["boj_yoy_pct"] = df["boj_usd_m"].pct_change(52) * 100
+    df["fed_13w_change_pct"] = df["fed_usd_m"].pct_change(13) * 100
+    df["ecb_13w_change_pct"] = df["ecb_usd_m"].pct_change(13) * 100
+    df["boj_13w_change_pct"] = df["boj_usd_m"].pct_change(13) * 100
+    df["boj_4w_change_pct"] = df["boj_usd_m"].pct_change(4) * 100
+
     LOG_ALPHA.info(
         f"[G3] G3 panel built: {len(df)} weekly obs, "
         f"{df.index.min().date()} ~ {df.index.max().date()}"
@@ -1189,10 +1210,21 @@ def load_g3_total_assets_daily(metric: str = "level"):
     if g3_panel is None or g3_panel.empty:
         raise RuntimeError("[G3] empty panel — fetch failed upstream")
 
+    # v2.19.8: 컴포넌트별 변화율 옵션 추가
     if metric == "level":
         weekly = g3_panel["g3_total_usd_m"].rename("G3_Total_Assets_USD_m")
     elif metric == "yoy":
         weekly = g3_panel["g3_yoy_pct"].rename("G3_YoY_pct")
+    elif metric == "fed_yoy":
+        weekly = g3_panel["fed_yoy_pct"].rename("Fed_YoY_pct")
+    elif metric == "ecb_yoy":
+        weekly = g3_panel["ecb_yoy_pct"].rename("ECB_YoY_pct")
+    elif metric == "boj_yoy":
+        weekly = g3_panel["boj_yoy_pct"].rename("BOJ_YoY_pct")
+    elif metric == "ecb_13w":
+        weekly = g3_panel["ecb_13w_change_pct"].rename("ECB_13w_change_pct")
+    elif metric == "boj_13w":
+        weekly = g3_panel["boj_13w_change_pct"].rename("BOJ_13w_change_pct")
     else:
         raise ValueError(f"Unknown G3 metric: {metric}")
 
@@ -2868,6 +2900,25 @@ def load_liquidity_source_daily(liq_source: str):
         # v2.19.1 Patch B: G3 year-over-year change (driver-style)
         s, snap = load_g3_total_assets_daily(metric="yoy")
         return s, snap, "G3 YoY Change (%)", "Percent (YoY)"
+
+    # v2.19.8: 컴포넌트별 변화율 옵션 (BTC 상관 측정 결과 기반)
+    if liq_source == "BOJ 13w Change (%)":
+        # 측정 결과: BTC 13w corr=+0.573 (가장 강한 신호)
+        s, snap = load_g3_total_assets_daily(metric="boj_13w")
+        return s, snap, "BOJ 13w Change (%)", "Percent (13w change)"
+    if liq_source == "BOJ YoY Change (%)":
+        # 측정 결과: BTC 13w corr=+0.495
+        s, snap = load_g3_total_assets_daily(metric="boj_yoy")
+        return s, snap, "BOJ YoY Change (%)", "Percent (YoY)"
+    if liq_source == "ECB 13w Change (%)":
+        # 측정 결과: BTC 26w corr=+0.430
+        s, snap = load_g3_total_assets_daily(metric="ecb_13w")
+        return s, snap, "ECB 13w Change (%)", "Percent (13w change)"
+    if liq_source == "Fed YoY Change (%)":
+        # 측정 결과: BTC 13w corr=+0.302 (Fed level -0.024 대비 12배 개선)
+        s, snap = load_g3_total_assets_daily(metric="fed_yoy")
+        return s, snap, "Fed YoY Change (%)", "Percent (YoY)"
+
     if liq_source == "G2M2 Total (USD)":
         # v2.19.6: Lyn Alden Global M2 lite (US + EU only)
         g2m2_df = fetch_g2m2_total()
