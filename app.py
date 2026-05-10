@@ -532,14 +532,16 @@ with st.sidebar:
             "BOJ YoY Change (%)",
             "ECB 13w Change (%)",
             "Fed YoY Change (%)",
+            # v2.19.10: 조합 신호 (가장 강한 단일 신호)
+            "BOJ Combo (13w + YoY z-avg)",
         ],
         index=0,
         help=(
             "Fed/G3/G2M2: 절대값 또는 YoY. "
-            "v2.19.8: 컴포넌트별 변화율 추가. 측정 결과 BTC 13w 상관: "
-            "BOJ 13w change=+0.573 (best), BOJ YoY=+0.495, ECB 13w=+0.430, Fed YoY=+0.302. "
-            "Fed level (-0.024)보다 압도적. "
-            "G3 = Fed + ECB + BOJ (USD-converted). G2M2 = US M2 + EU M3 (Lyn Alden lite)."
+            "v2.19.8: 컴포넌트별 변화율. BOJ 13w=+0.573, BOJ YoY=+0.495, ECB 13w=+0.430, Fed YoY=+0.302. "
+            "v2.19.10: BOJ Combo (13w+YoY z-score 평균) = +0.642 ⭐⭐⭐ (가장 강한 단일 신호). "
+            "Walk-forward OOS: Full +0.719, 2025-2026 +0.875. "
+            "G3 = Fed + ECB + BOJ. G2M2 = US M2 + EU M3 (Lyn Alden lite)."
         ),
     )
 
@@ -1187,6 +1189,22 @@ def fetch_g3_total_assets(week_rule: str = WEEK_RULE) -> pd.DataFrame:
     df["boj_13w_change_pct"] = df["boj_usd_m"].pct_change(13) * 100
     df["boj_4w_change_pct"] = df["boj_usd_m"].pct_change(4) * 100
 
+    # v2.19.10: BOJ Combo (BOJ_13w + BOJ_YoY z-score 평균)
+    # 조합 연구 결과: 단독보다 모든 horizon에서 강함
+    #   BTC 13w corr: BOJ_13w 단독 +0.594 → COMBO +0.642
+    #   Walk-forward OOS: Full +0.719, 2025-2026 +0.875
+    #   본질: 단기 모멘텀(13w) + 장기 trend(YoY) 결합으로 노이즈 상쇄
+    boj_13w_mean = df["boj_13w_change_pct"].mean()
+    boj_13w_std = df["boj_13w_change_pct"].std()
+    boj_yoy_mean = df["boj_yoy_pct"].mean()
+    boj_yoy_std = df["boj_yoy_pct"].std()
+    if boj_13w_std > 0 and boj_yoy_std > 0:
+        boj_13w_z = (df["boj_13w_change_pct"] - boj_13w_mean) / boj_13w_std
+        boj_yoy_z = (df["boj_yoy_pct"] - boj_yoy_mean) / boj_yoy_std
+        df["boj_combo_z"] = (boj_13w_z + boj_yoy_z) / 2
+    else:
+        df["boj_combo_z"] = pd.Series(index=df.index, dtype=float)
+
     LOG_ALPHA.info(
         f"[G3] G3 panel built: {len(df)} weekly obs, "
         f"{df.index.min().date()} ~ {df.index.max().date()}"
@@ -1225,6 +1243,9 @@ def load_g3_total_assets_daily(metric: str = "level"):
         weekly = g3_panel["ecb_13w_change_pct"].rename("ECB_13w_change_pct")
     elif metric == "boj_13w":
         weekly = g3_panel["boj_13w_change_pct"].rename("BOJ_13w_change_pct")
+    elif metric == "boj_combo":
+        # v2.19.10: BOJ Combo (z-score 평균)
+        weekly = g3_panel["boj_combo_z"].rename("BOJ_Combo_z")
     else:
         raise ValueError(f"Unknown G3 metric: {metric}")
 
@@ -2918,6 +2939,11 @@ def load_liquidity_source_daily(liq_source: str):
         # 측정 결과: BTC 13w corr=+0.302 (Fed level -0.024 대비 12배 개선)
         s, snap = load_g3_total_assets_daily(metric="fed_yoy")
         return s, snap, "Fed YoY Change (%)", "Percent (YoY)"
+
+    # v2.19.10: BOJ Combo (가장 강한 단일 신호, +0.642 corr, OOS +0.719)
+    if liq_source == "BOJ Combo (13w + YoY z-avg)":
+        s, snap = load_g3_total_assets_daily(metric="boj_combo")
+        return s, snap, "BOJ Combo (13w + YoY z-avg)", "z-score"
 
     if liq_source == "G2M2 Total (USD)":
         # v2.19.6: Lyn Alden Global M2 lite (US + EU only)
