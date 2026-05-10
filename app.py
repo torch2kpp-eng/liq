@@ -3196,9 +3196,51 @@ _ARCHIVED_v2_18_5_19w_endpoint_MULTIPLIER_TABLE = {
     # → 기존 alpha_state position_multiplier 사용
 }
 
-# PATCH A: 모든 조합 비활성화 (빈 dict)
-# path 분석 검증 후 새 값으로 교체 예정
-STATE_REGIME_MULTIPLIER_TABLE: Dict[Tuple[str, str], Optional[float]] = {}
+# v2.19.7 Patch B-1 (2026-05-06): Path-based reconstruction
+# 산출 방식:
+#   - 5-source × 8년 walk-forward path 분석
+#   - Fed (414 anchors) 우선 + 5-src consistency 검증
+#   - 매 anchor: path_corr × end_sign_accuracy × severe_loss 종합
+#
+# 매핑 원칙:
+#   end_sa >= 0.65 → 1.20x base    end_sa < 0.40 → 0.25x base
+#   path_corr >= 0.20 → 1.10x adj   path_corr < -0.10 → 0.55x adj
+#   severe_loss > 20% → ×0.85 페널티
+#
+# 검증 (8년 시뮬레이션, $100K 시작):
+#   OLD (regime only):    $188K, Sharpe 0.53, MDD -25.3%
+#   NEW (alpha × regime): $227K, Sharpe 0.59, MDD -25.3%
+#   → +$39K with same MDD
+# 검증 (5년):
+#   OLD: $118K, Sharpe 0.30
+#   NEW: $146K, Sharpe 0.48 (Sharpe +0.18 큰 개선)
+
+PATCH_B1_DATE = "2026-05-06"
+PATCH_B1_RATIONALE = "5-source × 8년 walk-forward path 분석으로 산출 (Fed 414 anchors 우선)"
+
+STATE_REGIME_MULTIPLIER_TABLE: Dict[Tuple[str, str], Optional[float]] = {
+    # (alpha_state, regime_state): position_multiplier
+    # 표본 < 5 조합은 None (생략) → 기존 base multiplier 자동 사용
+
+    # NEUTRAL × 5 regimes (가장 풍부한 데이터)
+    ("NEUTRAL", "DEFENSIVE"): 1.02,    # n=46, path_corr=+0.20, end_sa=65%
+    ("NEUTRAL", "FOLLOW"): 0.60,       # n=37, path_corr=-0.15, end_sa=41% (trap)
+    ("NEUTRAL", "FOLLOW_LIGHT"): 0.64, # n=57, path_corr=+0.02, end_sa=53%
+    ("NEUTRAL", "SHRINK"): 0.80,       # n=39, path_corr=+0.05, end_sa=56%
+    ("NEUTRAL", "TRANSITION"): 0.60,   # n=171, path_corr=-0.02, end_sa=49%
+
+    # BULLISH × 4 regimes (FOLLOW_LIGHT n=3, 표본 부족)
+    ("BULLISH", "DEFENSIVE"): 1.00,    # n=18, path_corr=+0.07, end_sa=67%
+    ("BULLISH", "FOLLOW"): 0.25,       # n=8, path_corr=-0.19, end_sa=38% (강한 trap)
+    ("BULLISH", "SHRINK"): 1.00,       # n=7, path_corr=-0.11, end_sa=57%
+    ("BULLISH", "TRANSITION"): 0.70,   # n=26, path_corr=+0.02, end_sa=54%
+
+    # 표본 부족 (None, 생략):
+    #   ("BULLISH", "FOLLOW_LIGHT"): n=3
+    #   ("BEARISH", "FOLLOW_LIGHT"): n=1
+    #   ("BEARISH", "TRANSITION"):   n=1
+    # → 기존 regime base multiplier 사용
+}
 
 
 def compute_state_regime_position_multiplier(
